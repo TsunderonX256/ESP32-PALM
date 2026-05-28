@@ -1,0 +1,40 @@
+# Build outputs
+bin/
+obj/
+.vs/
+*.user
+*.suo
+*.cache
+NativeMusashi/build*/
+PalmDesktopHarness/bin/
+PalmDesktopHarness/obj/
+PalmRamProbe/bin/
+PalmRamProbe/obj/
+
+# Emulator runtime state and desktop sync data
+HotSync/
+StateBackup/
+*_state.bin
+palm_state.bin
+*.sav
+
+# ROMs, application packages, and disk images must not be published.
+*.rom
+*.ROM
+*.prc
+*.pdb
+*.pqa
+*.img
+*.bin
+
+# Local shortcuts and generated logs
+*.lnk
+*.log
+
+# Reference source trees kept locally for research.
+cloudpilot_ref/
+cyd_ref/
+
+# Musashi emulator tests/examples are not needed for this project build.
+Musashi-master/example/
+Musashi-master/test/

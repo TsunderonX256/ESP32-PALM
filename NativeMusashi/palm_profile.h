@@ -1,0 +1,57 @@
+#ifndef PALM_PROFILE_H
+#define PALM_PROFILE_H
+
+#define PALM_PROFILE_IIIX 1
+#define PALM_PROFILE_M100_EXPERIMENTAL 2
+
+#ifndef PALM_HARDWARE_PROFILE
+#define PALM_HARDWARE_PROFILE PALM_PROFILE_IIIX
+#endif
+
+#if PALM_HARDWARE_PROFILE == PALM_PROFILE_IIIX
+#define PALM_PROFILE_NAME "Palm IIIx"
+#define PALM_RAM_BASE 0x00000000u
+#define PALM_RAM_LOGICAL_SIZE (4u * 1024u * 1024u)
+#define PALM_RAM_TOP_ALIAS_END 0x01000000u
+#define PALM_ROM_BASE 0x10c08000u
+#define PALM_ROM_LOW_ALIAS_BASE 0x10c00000u
+#define PALM_ROM_CHIP_SELECT_SIZE (16u * 1024u * 1024u)
+#define PALM_ENABLE_24BIT_ALIASES 1
+#define PALM_DB_REG_BASE 0xfffff000u
+#define PALM_DB_REG_24BIT_BASE 0x00fff000u
+#define PALM_DB_REG_SIZE 0x1000u
+#define PALM_LCD_WIDTH 160u
+#define PALM_LCD_HEIGHT 160u
+#define PALM_SILKSCREEN_HEIGHT 60u
+
+#elif PALM_HARDWARE_PROFILE == PALM_PROFILE_M100_EXPERIMENTAL
+/*
+ * The m100 profile is a compile-time skeleton for future work. The display
+ * and digitizer dimensions match the m100 class, but the full device identity
+ * and peripheral behavior still need validation against an m100 ROM.
+ */
+#define PALM_PROFILE_NAME "Palm m100 experimental"
+#define PALM_RAM_BASE 0x00000000u
+#define PALM_RAM_LOGICAL_SIZE (2u * 1024u * 1024u)
+#define PALM_RAM_TOP_ALIAS_END 0x01000000u
+#define PALM_ROM_BASE 0x10c08000u
+#define PALM_ROM_LOW_ALIAS_BASE 0x10c00000u
+#define PALM_ROM_CHIP_SELECT_SIZE (16u * 1024u * 1024u)
+#define PALM_ENABLE_24BIT_ALIASES 1
+#define PALM_DB_REG_BASE 0xfffff000u
+#define PALM_DB_REG_24BIT_BASE 0x00fff000u
+#define PALM_DB_REG_SIZE 0x1000u
+#define PALM_LCD_WIDTH 160u
+#define PALM_LCD_HEIGHT 160u
+#define PALM_SILKSCREEN_HEIGHT 60u
+
+#else
+#error Unsupported PALM_HARDWARE_PROFILE
+#endif
+
+#define PALM_ROM_LOW_24BIT_ALIAS_BASE (PALM_ROM_LOW_ALIAS_BASE & 0x00ffffffu)
+#define PALM_ROM_24BIT_BASE (PALM_ROM_BASE & 0x00ffffffu)
+#define PALM_DIGITIZER_WIDTH PALM_LCD_WIDTH
+#define PALM_DIGITIZER_HEIGHT (PALM_LCD_HEIGHT + PALM_SILKSCREEN_HEIGHT)
+
+#endif
