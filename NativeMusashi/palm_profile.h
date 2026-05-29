@@ -26,9 +26,9 @@
 
 #elif PALM_HARDWARE_PROFILE == PALM_PROFILE_M100_EXPERIMENTAL
 /*
- * The m100 profile is a compile-time skeleton for future work. The display
- * and digitizer dimensions match the m100 class, but the full device identity
- * and peripheral behavior still need validation against an m100 ROM.
+ * The m100 profile uses Calvin/m100 identity bits, the m100 digitizer
+ * geometry, and m100-class LCD contrast/brightness behavior. Keep this
+ * compile-time selected with the matching VB profile and ROM.
  */
 #define PALM_PROFILE_NAME "Palm m100 experimental"
 #define PALM_RAM_BASE 0x00000000u

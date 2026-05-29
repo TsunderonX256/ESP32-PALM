@@ -71,6 +71,7 @@ PALM_EXPORT uint16_t palm_native_lcd_height(void);
 PALM_EXPORT uint16_t palm_native_lcd_pitch(void);
 PALM_EXPORT uint8_t palm_native_lcd_panel(void);
 PALM_EXPORT uint8_t palm_native_lcd_pan(void);
+PALM_EXPORT uint16_t palm_native_lcd_contrast(void);
 PALM_EXPORT int palm_native_lcd_dirty(void);
 PALM_EXPORT int palm_native_lcd_frame_ready(void);
 PALM_EXPORT void palm_native_lcd_mark_clean(void);
@@ -92,6 +93,7 @@ PALM_EXPORT uint32_t palm_native_uart_rx_count(void);
 PALM_EXPORT uint32_t palm_native_uart_tx_count(void);
 PALM_EXPORT uint32_t palm_native_uart_rx_overrun_count(void);
 PALM_EXPORT uint32_t palm_native_uart_tx_overrun_count(void);
+PALM_EXPORT uint16_t palm_native_uart_misc(void);
 
 PALM_EXPORT uint16_t palm_native_ads_channel_conversion(int channel);
 PALM_EXPORT uint32_t palm_native_ads_channel_count(int channel);

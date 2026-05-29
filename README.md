@@ -103,6 +103,26 @@ Short version:
 
 Rebuild both the native DLL and the VB harness after switching.
 
+The m100 profile includes the m100/Calvin hardware identity, 160x220 digitizer
+geometry, m100 key matrix, and LCD contrast PWM register. The m100 ROM shows
+Brightness rather than Contrast in the Pen shortcut list, but contrast writes
+are still modeled for display rendering. The IIIx profile keeps desktop LCD
+contrast fixed at maximum because its ROM does not normally expose that
+software control.
+
+The desktop LCD palette is also profile-owned in
+`PalmDesktopHarness/PalmConfig.vb`; see
+[HARDWARE_PROFILES.md](HARDWARE_PROFILES.md#desktop-lcd-palette) for the
+current normal LCD and inverted green backlight RGB values.
+
+## Serial Keyboard
+
+Serial Palm/Stowaway keyboard emulation is currently incomplete and disabled in
+the UI. The real keyboard shares the HotSync/DCD line and waits for an RTS
+low-to-high handshake before sending the `FA FD` ID bytes; the current emulator
+model can wake the HotSync app instead of the keyboard driver, so the feature is
+left in code only for future work.
+
 ## ESP32 / CYD Notes
 
 The Arduino sketch targets ESP32 CYD-style hardware with TFT and touch setup

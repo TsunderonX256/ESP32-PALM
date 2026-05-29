@@ -7,15 +7,22 @@ LCD geometry, digitizer geometry, and device identity.
 ## Supported Profile
 
 - `IIIX`: current working Palm IIIx profile.
-- `M100_EXPERIMENTAL`: boots and works well in early testing with
-  `Palm-m100-3.51-en.rom`, but keep it marked experimental until more apps,
-  sleep/wake, HotSync, and edge-case hardware behavior are checked.
+- `M100_EXPERIMENTAL`: current working Palm m100 profile for
+  `Palm-m100-3.51-en.rom`.
 
 ## Experimental Profile
 
 - `M100_EXPERIMENTAL`: uses the m100-class 160x160 LCD plus 60-pixel
-  silkscreen geometry. It currently shares the DragonBall EZ hardware behavior
-  used by the IIIx-oriented core.
+  silkscreen geometry, Calvin/m100 hardware ID bits, the m100 key matrix, and
+  DragonBall EZ LCD contrast PWM register `$A36`.
+- The m100 key matrix follows the Cloudpilot/POSE layout: row 0 is the four
+  app buttons, row 1 column 1 is Page Down, and row 2 contains Power, Page Up,
+  and app button 2.
+- The m100 ROM exposes **Brightness** in the Pen shortcut list. Contrast still
+  exists as a lower-level LCD/PWM register path and is used by the renderer
+  when the ROM writes it.
+- The IIIx profile keeps desktop contrast fixed at maximum because this ROM
+  does not expose a software brightness/contrast control in normal use.
 
 ## Switching Profiles
 
@@ -74,9 +81,8 @@ The VB harness currently selects its profile with a conditional constant in
 #Const PALM_PROFILE_M100_EXPERIMENTAL = False
 ```
 
-Keep this `False` for the working IIIx build. Set it to `True` only for the
-experimental m100 build, and make sure the matching ROM file exists beside the
-EXE.
+Keep this `False` for the IIIx build. Set it to `True` for the m100 build, and
+make sure the matching ROM file exists beside the EXE.
 
 Current desktop profile files:
 
@@ -85,6 +91,33 @@ Current desktop profile files:
 - m100 ROM: `Palm-m100-3.51-en.rom`
 - m100 state: `palm_m100_state.bin`
 
+## Desktop LCD Palette
+
+The desktop renderer keeps LCD colors in `PalmDesktopHarness/PalmConfig.vb` so
+each hardware profile can tune its own panel appearance. Current IIIx and m100
+profiles intentionally share the same passive LCD and green EL backlight
+palette:
+
+Profiles also choose whether the renderer follows the DragonBall EZ LCD
+contrast register. m100 enables it for the ROM's **Brightness** shortcut; IIIx
+uses a fixed maximum contrast value.
+
+| Purpose | RGB |
+| --- | --- |
+| Normal LCD background | `226, 230, 218` |
+| Normal silkscreen fill | `150, 160, 130` |
+| Sleep page background | `224, 228, 214` |
+| Sleep LCD background | `204, 211, 194` |
+| Sleep silkscreen fill | `134, 142, 116` |
+| Sleep line/pixel color | `90, 95, 80` |
+| Inverted backlight page background | `18, 38, 24` |
+| Inverted backlight LCD background | `10, 28, 14` |
+| Inverted backlight sleep LCD background | `10, 18, 12` |
+| Inverted backlight low pixel | `14, 42, 18` |
+| Inverted backlight high pixel | `172, 255, 146` |
+| Inverted backlight silkscreen fill | `118, 152, 102` |
+| Inverted backlight line/pixel color | `3, 14, 5` |
+
 m100 Note Pad data:
 
 - DB name: `npadDB`
@@ -92,6 +125,22 @@ m100 Note Pad data:
 - DB creator: `npad`
 - Current HotSync support exports records to 1-bit BMP files under
   `HotSync/NotePad`.
+
+## Serial Keyboard
+
+Serial Palm/Stowaway keyboard emulation is incomplete and disabled in the
+desktop UI. The experimental code is intentionally kept but hidden because the
+keyboard shares the HotSync/DCD signal on real hardware, and the current DCD
+model tends to start HotSync instead of letting the keyboard driver complete its
+RTS handshake. The intended protocol from Think Outside's hardware reference is:
+
+- `FA FD` keyboard ID
+- `0x00..0x7F` key-down scan codes
+- `0x80 | scanCode` key-up scan codes
+- final key-up is sent twice when no other keys are held
+
+Future work should model the shared DCD/HotSync edge and RTS low-to-high timing
+without causing the HotSync app to claim the event.
 
 ## ESP32 Build
 

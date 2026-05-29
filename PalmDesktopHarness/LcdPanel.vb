@@ -5,12 +5,19 @@ Namespace PalmDesktopHarness
     Friend NotInheritable Class LcdPanel
         Inherits Control
 
+        Public Enum DisplayRenderMode
+            NormalMono
+            InvertedGreenBacklight
+        End Enum
+
         Private frameBytes As Byte()
         Private frameWidth As Integer
         Private frameHeight As Integer
         Private framePitch As Integer
         Private frameBpp As Integer = 1
         Private framePan As Integer
+        Private frameContrast As UShort
+        Private displayMode As DisplayRenderMode = DisplayRenderMode.NormalMono
         Private lastPoint As Point
         Private isDisplayAsleep As Boolean
 
@@ -44,6 +51,28 @@ Namespace PalmDesktopHarness
             End Set
         End Property
 
+        Public Property ContrastValue As UShort
+            Get
+                Return frameContrast
+            End Get
+            Set(value As UShort)
+                If frameContrast = value Then Return
+                frameContrast = value
+                Invalidate()
+            End Set
+        End Property
+
+        Public Property RenderMode As DisplayRenderMode
+            Get
+                Return displayMode
+            End Get
+            Set(value As DisplayRenderMode)
+                If displayMode = value Then Return
+                displayMode = value
+                Invalidate()
+            End Set
+        End Property
+
         Protected Overrides Sub OnPaint(e As PaintEventArgs)
             MyBase.OnPaint(e)
 
@@ -53,12 +82,12 @@ Namespace PalmDesktopHarness
             Dim silkscreenTop = PalmConfig.LcdHeight * scaleY
             Dim lcdRect As New RectangleF(0, 0, PalmConfig.LcdWidth * scaleX, PalmConfig.LcdHeight * lcdScaleY)
 
-            e.Graphics.Clear(If(isDisplayAsleep, Color.FromArgb(224, 228, 214), Color.White))
+            e.Graphics.Clear(PageBackgroundColor())
             e.Graphics.InterpolationMode = Drawing2D.InterpolationMode.NearestNeighbor
             e.Graphics.PixelOffsetMode = Drawing2D.PixelOffsetMode.Half
 
             If isDisplayAsleep Then
-                Using bg As New SolidBrush(Color.FromArgb(204, 211, 194))
+                Using bg As New SolidBrush(SleepLcdBackgroundColor())
                     e.Graphics.FillRectangle(bg, lcdRect)
                 End Using
             ElseIf frameBytes IsNot Nothing AndAlso frameWidth > 0 AndAlso frameHeight > 0 AndAlso framePitch > 0 Then
@@ -68,9 +97,12 @@ Namespace PalmDesktopHarness
                 Dim brushes(maxValue) As SolidBrush
 
                 Try
+                    Using bg As New SolidBrush(LcdBackgroundColor())
+                        e.Graphics.FillRectangle(bg, lcdRect)
+                    End Using
+
                     For i = 1 To maxValue
-                        Dim shade = 255 - CInt(Math.Round(i * 255.0 / maxValue))
-                        brushes(i) = New SolidBrush(Color.FromArgb(shade, shade, shade))
+                        brushes(i) = New SolidBrush(PixelColor(i, maxValue))
                     Next
 
                     For y = 0 To drawHeight - 1
@@ -93,10 +125,91 @@ Namespace PalmDesktopHarness
 
         End Sub
 
+        Private Function PageBackgroundColor() As Color
+            If isDisplayAsleep Then Return ProfileColor(PalmConfig.SleepPageBackgroundR, PalmConfig.SleepPageBackgroundG, PalmConfig.SleepPageBackgroundB)
+
+            Select Case displayMode
+                Case DisplayRenderMode.InvertedGreenBacklight
+                    Return ProfileColor(PalmConfig.BacklightPageBackgroundR, PalmConfig.BacklightPageBackgroundG, PalmConfig.BacklightPageBackgroundB)
+                Case Else
+                    Return Color.White
+            End Select
+        End Function
+
+        Private Function LcdBackgroundColor() As Color
+            Select Case displayMode
+                Case DisplayRenderMode.InvertedGreenBacklight
+                    Return ProfileColor(PalmConfig.BacklightLcdBackgroundR, PalmConfig.BacklightLcdBackgroundG, PalmConfig.BacklightLcdBackgroundB)
+                Case Else
+                    Return ProfileColor(PalmConfig.NormalLcdBackgroundR, PalmConfig.NormalLcdBackgroundG, PalmConfig.NormalLcdBackgroundB)
+            End Select
+        End Function
+
+        Private Function SleepLcdBackgroundColor() As Color
+            Select Case displayMode
+                Case DisplayRenderMode.InvertedGreenBacklight
+                    Return ProfileColor(PalmConfig.BacklightSleepLcdBackgroundR, PalmConfig.BacklightSleepLcdBackgroundG, PalmConfig.BacklightSleepLcdBackgroundB)
+                Case Else
+                    Return ProfileColor(PalmConfig.SleepLcdBackgroundR, PalmConfig.SleepLcdBackgroundG, PalmConfig.SleepLcdBackgroundB)
+            End Select
+        End Function
+
+        Private Function PixelColor(value As Integer, maxValue As Integer) As Color
+            Dim level = Math.Max(0.0, Math.Min(1.0, value / CDbl(Math.Max(1, maxValue))))
+
+            Select Case displayMode
+                Case DisplayRenderMode.InvertedGreenBacklight
+                    Return Blend(
+                        ProfileColor(PalmConfig.BacklightPixelLowR, PalmConfig.BacklightPixelLowG, PalmConfig.BacklightPixelLowB),
+                        ProfileColor(PalmConfig.BacklightPixelHighR, PalmConfig.BacklightPixelHighG, PalmConfig.BacklightPixelHighB),
+                        level * BacklightInkBlend())
+                Case Else
+                    Dim shade = CInt(Math.Round(255.0 - level * MonoLcdInkLevel()))
+                    shade = Math.Max(0, Math.Min(255, shade))
+                    Return Color.FromArgb(shade, shade, shade)
+            End Select
+        End Function
+
+        Private Function MonoLcdInkLevel() As Double
+            Dim normalized = ContrastLevel()
+            Dim adjusted = Math.Min(1.0, normalized / 0.72)
+            Return 80.0 + 175.0 * Math.Pow(adjusted, 1.1)
+        End Function
+
+        Private Function BacklightInkBlend() As Double
+            Dim normalized = ContrastLevel()
+            Return Math.Max(0.04, Math.Pow(normalized, 1.35))
+        End Function
+
+        Private Function ContrastLevel() As Double
+            Return ContrastRegisterByte(frameContrast) / 255.0
+        End Function
+
+        Private Shared Function ContrastRegisterByte(registerValue As UShort) As Integer
+            If registerValue = 0US Then Return 255
+
+            Dim lowByte = registerValue And &HFF
+            If lowByte <> 0 Then Return lowByte
+
+            Return (registerValue >> 8) And &HFF
+        End Function
+
+        Private Shared Function Blend(a As Color, b As Color, amount As Double) As Color
+            Dim t = Math.Max(0.0, Math.Min(1.0, amount))
+            Dim r = CInt(Math.Round(CInt(a.R) + (CInt(b.R) - CInt(a.R)) * t))
+            Dim g = CInt(Math.Round(CInt(a.G) + (CInt(b.G) - CInt(a.G)) * t))
+            Dim blue = CInt(Math.Round(CInt(a.B) + (CInt(b.B) - CInt(a.B)) * t))
+            Return Color.FromArgb(r, g, blue)
+        End Function
+
+        Private Shared Function ProfileColor(r As Integer, g As Integer, b As Integer) As Color
+            Return Color.FromArgb(r, g, b)
+        End Function
+
         Private Sub DrawSilkscreen(g As Graphics, scaleX As Single, scaleY As Single, top As Single, asleep As Boolean)
             Dim h = PalmConfig.SilkscreenHeight * scaleY
-            Dim lineColor = If(asleep, Color.FromArgb(90, 95, 80), Color.Black)
-            Dim fillColor = If(asleep, Color.FromArgb(134, 142, 116), Color.FromArgb(150, 160, 130))
+            Dim lineColor = SilkscreenLineColor(asleep)
+            Dim fillColor = SilkscreenFillColor(asleep)
 
             Using bg As New SolidBrush(fillColor)
                 g.FillRectangle(bg, 0, top, PalmConfig.DigitizerWidth * scaleX, h)
@@ -122,6 +235,23 @@ Namespace PalmDesktopHarness
                 g.DrawString("123", font, brush, 92 * scaleX, top + 38 * scaleY)
             End Using
         End Sub
+
+        Private Function SilkscreenLineColor(asleep As Boolean) As Color
+            If asleep Then Return ProfileColor(PalmConfig.SleepLineR, PalmConfig.SleepLineG, PalmConfig.SleepLineB)
+            If displayMode = DisplayRenderMode.InvertedGreenBacklight Then Return ProfileColor(PalmConfig.BacklightLineR, PalmConfig.BacklightLineG, PalmConfig.BacklightLineB)
+            Return Color.Black
+        End Function
+
+        Private Function SilkscreenFillColor(asleep As Boolean) As Color
+            If asleep Then Return ProfileColor(PalmConfig.SleepSilkscreenFillR, PalmConfig.SleepSilkscreenFillG, PalmConfig.SleepSilkscreenFillB)
+
+            Select Case displayMode
+                Case DisplayRenderMode.InvertedGreenBacklight
+                    Return ProfileColor(PalmConfig.BacklightSilkscreenFillR, PalmConfig.BacklightSilkscreenFillG, PalmConfig.BacklightSilkscreenFillB)
+                Case Else
+                    Return ProfileColor(PalmConfig.NormalSilkscreenFillR, PalmConfig.NormalSilkscreenFillG, PalmConfig.NormalSilkscreenFillB)
+            End Select
+        End Function
 
         Private Function GetPixelValue(row As Integer, x As Integer) As Integer
             If frameBpp <> 1 AndAlso frameBpp <> 2 AndAlso frameBpp <> 4 AndAlso frameBpp <> 8 Then Return 0

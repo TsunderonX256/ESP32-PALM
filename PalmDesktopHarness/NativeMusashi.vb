@@ -108,6 +108,10 @@ Namespace PalmDesktopHarness
         Friend Shared Function palm_native_uart_tx_overrun_count() As UInteger
         End Function
 
+        <DllImport("PalmMusashi.dll", CallingConvention:=CallingConvention.Cdecl)>
+        Friend Shared Function palm_native_uart_misc() As UShort
+        End Function
+
         ' PWM buzzer state
         <DllImport("PalmMusashi.dll", CallingConvention:=CallingConvention.Cdecl)>
         Friend Shared Function palm_native_sound_enabled() As Integer
@@ -181,6 +185,10 @@ Namespace PalmDesktopHarness
 
         <DllImport("PalmMusashi.dll", CallingConvention:=CallingConvention.Cdecl)>
         Friend Shared Function palm_native_lcd_pan() As Byte
+        End Function
+
+        <DllImport("PalmMusashi.dll", CallingConvention:=CallingConvention.Cdecl)>
+        Friend Shared Function palm_native_lcd_contrast() As UShort
         End Function
 
         <DllImport("PalmMusashi.dll", CallingConvention:=CallingConvention.Cdecl)>

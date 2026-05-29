@@ -173,9 +173,15 @@ static bool keyRowB(uint8_t bit) {
 
 static uint8_t portDKeyBits() {
   uint8_t bits = 0;
+#if PALM_HARDWARE_PROFILE == PALM_PROFILE_M100_EXPERIMENTAL
+  bool row0 = keyRowB(0x01);
+  bool row1 = keyRowB(0x08);
+  bool row2 = keyRowB(0x40);
+#else
   bool row0 = keyRowF(0x10) || keyRowC(0x01) || keyRowB(0x01);
   bool row1 = keyRowF(0x20) || keyRowC(0x02) || keyRowB(0x08);
   bool row2 = keyRowF(0x40) || keyRowC(0x04) || keyRowB(0x40);
+#endif
 
   if (row0) {
       if (buttonBitsDown & KEY_BIT_HARD1) bits |= 0x01;
@@ -184,11 +190,18 @@ static uint8_t portDKeyBits() {
       if (buttonBitsDown & KEY_BIT_HARD4) bits |= 0x08;
   }
   if (row1) {
+#if PALM_HARDWARE_PROFILE == PALM_PROFILE_M100_EXPERIMENTAL
+      if (buttonBitsDown & KEY_BIT_PAGE_DOWN) bits |= 0x02;
+#else
       if (buttonBitsDown & KEY_BIT_PAGE_UP) bits |= 0x01;
       if (buttonBitsDown & KEY_BIT_PAGE_DOWN) bits |= 0x02;
+#endif
   }
   if (row2) {
       if (buttonBitsDown & KEY_BIT_POWER) bits |= 0x01;
+#if PALM_HARDWARE_PROFILE == PALM_PROFILE_M100_EXPERIMENTAL
+      if (buttonBitsDown & KEY_BIT_PAGE_UP) bits |= 0x02;
+#endif
       if (buttonBitsDown & KEY_BIT_HARD2) bits |= 0x04;
   }
   return bits;

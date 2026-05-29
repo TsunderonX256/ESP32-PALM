@@ -651,11 +651,35 @@ static int key_row_b(uint8_t bit) {
     return (g_regs[0x408] & bit) != 0 && (g_regs[0x409] & bit) == 0;
 }
 
+static int id_detect_asserted(void) {
+    const uint8_t mask = 0x04u;
+    return (g_regs[0x430] & mask) == mask &&
+           (g_regs[0x431] & mask) == 0 &&
+           (g_regs[0x432] & mask) == 0 &&
+           (g_regs[0x433] & mask) == mask;
+}
+
+static uint8_t hardware_id_key_state(void) {
+#if PALM_HARDWARE_PROFILE == PALM_PROFILE_M100_EXPERIMENTAL
+    /* Cloudpilot/POSE identify the Palm m100 as ID1 + ID3 asserted. */
+    return 0xfau;
+#else
+    /* Palm IIIx/Brad identifies as ID1 + ID3 + ID4 asserted. */
+    return 0xf2u;
+#endif
+}
+
 static uint8_t port_d_key_bits(void) {
     uint8_t bits = 0;
+#if PALM_HARDWARE_PROFILE == PALM_PROFILE_M100_EXPERIMENTAL
+    int row0 = key_row_b(0x01u);
+    int row1 = key_row_b(0x08u);
+    int row2 = key_row_b(0x40u);
+#else
     int row0 = key_row_f(0x10u) || key_row_c(0x01u) || key_row_b(0x01u);
     int row1 = key_row_f(0x20u) || key_row_c(0x02u) || key_row_b(0x08u);
     int row2 = key_row_f(0x40u) || key_row_c(0x04u) || key_row_b(0x40u);
+#endif
 
     if (row0) {
             if (g_button_bits_down & KEY_BIT_HARD1) bits |= 0x01u;
@@ -664,18 +688,25 @@ static uint8_t port_d_key_bits(void) {
             if (g_button_bits_down & KEY_BIT_HARD4) bits |= 0x08u;
     }
     if (row1) {
+#if PALM_HARDWARE_PROFILE == PALM_PROFILE_M100_EXPERIMENTAL
+            if (g_button_bits_down & KEY_BIT_PAGE_DOWN) bits |= 0x02u;
+#else
             if (g_button_bits_down & KEY_BIT_PAGE_UP) bits |= 0x01u;
             if (g_button_bits_down & KEY_BIT_PAGE_DOWN) bits |= 0x02u;
+#endif
     }
     if (row2) {
             if (g_button_bits_down & KEY_BIT_POWER) bits |= 0x01u;
+#if PALM_HARDWARE_PROFILE == PALM_PROFILE_M100_EXPERIMENTAL
+            if (g_button_bits_down & KEY_BIT_PAGE_UP) bits |= 0x02u;
+#endif
             if (g_button_bits_down & KEY_BIT_HARD2) bits |= 0x04u;
     }
     return bits;
 }
 
 static uint8_t port_input_value(char port) {
-    if (port == 'D') return port_d_key_bits();
+    if (port == 'D') return id_detect_asserted() ? hardware_id_key_state() : port_d_key_bits();
     if (port == 'F') return g_pen_down ? 0x00 : 0x02;  /* Sumo/Brad PenIO is active low. */
     return port == 'E' ? 0xff : 0x00;
 }
@@ -961,6 +992,7 @@ static void init_regs(void) {
     g_regs[0xa29] = 0xff;
     g_regs[0xa31] = 0xb9;
     g_regs[0xa33] = 0x84;
+    put16(0xa36, 0x0000);
     g_last_timer_status = 0;
     g_timer_ticks = 0;
     g_ads_bit_buffer_in = 0;
@@ -1108,7 +1140,7 @@ static void write8(uint32_t address, uint8_t value) {
         trace_reg_write(m68k_get_reg(0, M68K_REG_PC), address, (uint16_t)offset, value);
 
         if ((offset >= 0xa00 && offset <= 0xa0b) || offset == 0xa20 || offset == 0xa2d ||
-            offset == 0xa33) {
+            offset == 0xa33 || offset == 0xa36 || offset == 0xa37) {
             mark_lcd_dirty();
             ++g_debug.lcdWriteCount;
             g_debug.lastLcdWriteOffset = (uint16_t)offset;
@@ -1444,6 +1476,7 @@ PALM_EXPORT uint32_t palm_native_uart_rx_count(void) { return g_uart_rx_count; }
 PALM_EXPORT uint32_t palm_native_uart_tx_count(void) { return g_uart_tx_count; }
 PALM_EXPORT uint32_t palm_native_uart_rx_overrun_count(void) { return g_uart_rx_overrun_count; }
 PALM_EXPORT uint32_t palm_native_uart_tx_overrun_count(void) { return g_uart_tx_overrun_count; }
+PALM_EXPORT uint16_t palm_native_uart_misc(void) { return get16(0x908); }
 
 PALM_EXPORT int palm_native_execute(int cycles) {
     if (cycles > 0) g_system_cycles += (uint64_t)cycles;
@@ -1515,6 +1548,7 @@ PALM_EXPORT uint16_t palm_native_lcd_height(void) { return (uint16_t)(get16(0xa0
 PALM_EXPORT uint16_t palm_native_lcd_pitch(void) { return (uint16_t)(g_regs[0xa05] * 2); }
 PALM_EXPORT uint8_t palm_native_lcd_panel(void) { return g_regs[0xa20]; }
 PALM_EXPORT uint8_t palm_native_lcd_pan(void) { return g_regs[0xa2d]; }
+PALM_EXPORT uint16_t palm_native_lcd_contrast(void) { return get16(0xa36); }
 PALM_EXPORT int palm_native_lcd_dirty(void) { return g_lcd_dirty; }
 PALM_EXPORT int palm_native_lcd_frame_ready(void) { return g_lcd_dirty && g_lcd_frame_ready; }
 PALM_EXPORT void palm_native_lcd_mark_clean(void) {
