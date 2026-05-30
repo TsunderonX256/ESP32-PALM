@@ -7,8 +7,6 @@ Imports System.Media
 Imports System.Text
 Imports System.Windows.Forms
 
-#Const ENABLE_INCOMPLETE_SERIAL_KEYBOARD = False
-
 Namespace PalmDesktopHarness
     Friend NotInheritable Class MainForm
         Inherits Form
@@ -28,13 +26,9 @@ Namespace PalmDesktopHarness
         Private ReadOnly romBytes As Byte()
         Private ReadOnly statePath As String
         Private ReadOnly hotSyncPath As String
-#If ENABLE_INCOMPLETE_SERIAL_KEYBOARD Then
-        Private ReadOnly serialKeyboardLogPath As String
-#End If
+        Private ReadOnly hotSyncTracePath As String
+        Private cradleMenuItem As ToolStripMenuItem
         Private ReadOnly displayModeMenuItems As New List(Of ToolStripMenuItem)
-#If ENABLE_INCOMPLETE_SERIAL_KEYBOARD Then
-        Private serialKeyboardMenuItem As ToolStripMenuItem
-#End If
         Private nativeReady As Boolean
         Private nativeSlices As UInteger
         Private autoRunTicks As Integer
@@ -91,26 +85,7 @@ Namespace PalmDesktopHarness
         Private rxPadpTxId As Byte
         Private rxPadpExpectedSize As Integer
         Private ReadOnly rxPadpPayload As New List(Of Byte)
-#If ENABLE_INCOMPLETE_SERIAL_KEYBOARD Then
-        Private serialKeyboardEnabled As Boolean
-        Private serialKeyboardIdSent As Boolean
-        Private serialKeyboardDetectPending As Boolean
-        Private serialKeyboardDetectStartedTick As Long
-        Private serialKeyboardDetectInitialMisc As UShort
-        Private serialKeyboardSawRtsLow As Boolean
-        Private serialKeyboardLastPulseTick As Long
-        Private serialKeyboardPulseActive As Boolean
-        Private serialKeyboardPulseReleaseTick As Long
-        Private lastSerialKeyboardTick As Long
-        Private ReadOnly serialKeyboardPendingBytes As New Queue(Of Byte)
-        Private ReadOnly serialKeyboardDownCodes As New HashSet(Of Byte)
-#End If
         Private Const VerboseSerialLog As Boolean = False
-#If ENABLE_INCOMPLETE_SERIAL_KEYBOARD Then
-        Private Const SerialKeyboardRtsThroughFifo As UShort = &H80US
-        Private Const SerialKeyboardRtsOut As UShort = &H40US
-        Private Const SerialKeyboardPulseMs As Long = 5
-#End If
         Private Const PadpChunkSize As Integer = 200
         Private Const PalmMemoMaxBytes As Integer = 4096
         Private Const DlpCmdReadUserInfo As Byte = &H10
@@ -182,22 +157,18 @@ Namespace PalmDesktopHarness
         Private Const KeyBitHard2 As UShort = &H10US
         Private Const KeyBitHard3 As UShort = &H20US
         Private Const KeyBitHard4 As UShort = &H40US
+        Private Const KeyBitContrast As UShort = &H200US
 
         Public Sub New()
             Text = $"ESP32-PALM {PalmConfig.ProfileName}"
             StartPosition = FormStartPosition.CenterScreen
             Size = New Size(382, 660)
             MinimumSize = New Size(382, 620)
-#If ENABLE_INCOMPLETE_SERIAL_KEYBOARD Then
-            KeyPreview = True
-#End If
 
             Dim romPath = ResolveRuntimeFile(PalmConfig.RomFileName)
             statePath = Path.Combine(AppContext.BaseDirectory, PalmConfig.StateFileName)
             hotSyncPath = Path.Combine(AppContext.BaseDirectory, "HotSync")
-#If ENABLE_INCOMPLETE_SERIAL_KEYBOARD Then
-            serialKeyboardLogPath = Path.Combine(AppContext.BaseDirectory, "SerialKeyboard.log")
-#End If
+            hotSyncTracePath = Path.Combine(AppContext.BaseDirectory, "HotSyncTrace.log")
             romBytes = File.ReadAllBytes(romPath)
             memory = New PalmMemory(romPath, CInt(PalmConfig.RamLogicalSize))
 
@@ -239,10 +210,6 @@ Namespace PalmDesktopHarness
             hotSyncButtonReleaseTimer = New Timer With {.Interval = 650}
             AddHandler hotSyncButtonReleaseTimer.Tick, AddressOf HotSyncButtonReleaseTimer_Tick
             AddHandler FormClosing, AddressOf MainForm_FormClosing
-#If ENABLE_INCOMPLETE_SERIAL_KEYBOARD Then
-            AddHandler KeyDown, AddressOf MainForm_KeyDown
-            AddHandler KeyUp, AddressOf MainForm_KeyUp
-#End If
 
             PrintHeader()
             RefreshDebugStatus()
@@ -267,14 +234,11 @@ Namespace PalmDesktopHarness
             Dim menu As New MenuStrip()
             Dim deviceItem As New ToolStripMenuItem("Device")
             deviceItem.DropDownItems.Add(CreateMenuItem("Install PRC/PDB...", AddressOf InstallPrcButton_Click))
-            ' Incomplete: Palm/Stowaway serial keyboard detection shares the real
-            ' HotSync/DCD line and currently wakes HotSync instead of the keyboard
-            ' driver. Keep this hidden until the DCD/RTS handshake is modeled better.
-#If ENABLE_INCOMPLETE_SERIAL_KEYBOARD Then
-            serialKeyboardMenuItem = CreateMenuItem("Serial Keyboard", AddressOf SerialKeyboardMenuItem_Click)
-            serialKeyboardMenuItem.CheckOnClick = True
-            deviceItem.DropDownItems.Add(serialKeyboardMenuItem)
-#End If
+            If PalmConfig.ActiveHardwareProfile = PalmConfig.HardwareProfile.IIIcExperimental Then
+                cradleMenuItem = CreateMenuItem("In Cradle", AddressOf InCradleMenuItem_Click)
+                cradleMenuItem.CheckOnClick = True
+                deviceItem.DropDownItems.Add(cradleMenuItem)
+            End If
             deviceItem.DropDownItems.Add(BuildDisplayModeMenu())
             deviceItem.DropDownItems.Add(CreateMenuItem("Backup RAM State...", AddressOf BackupRamStateMenuItem_Click))
             deviceItem.DropDownItems.Add(CreateMenuItem("Restore RAM State...", AddressOf RestoreRamStateMenuItem_Click))
@@ -308,38 +272,6 @@ Namespace PalmDesktopHarness
             Return item
         End Function
 
-#If ENABLE_INCOMPLETE_SERIAL_KEYBOARD Then
-        Private Sub SerialKeyboardMenuItem_Click(sender As Object, e As EventArgs)
-            serialKeyboardEnabled = serialKeyboardMenuItem.Checked
-            ReleaseSerialKeyboardKeys()
-            ResetSerialKeyboardHandshake(True)
-            lastSerialKeyboardTick = 0
-            If serialKeyboardEnabled Then
-                ResetSerialKeyboardLog()
-                RequestSerialKeyboardDetect()
-                Append("Serial keyboard enabled.")
-            Else
-                Append("Serial keyboard disabled.")
-            End If
-        End Sub
-
-        Private Sub ReleaseSerialKeyboardKeys()
-            If Not nativeReady OrElse serialKeyboardDownCodes.Count = 0 Then
-                serialKeyboardDownCodes.Clear()
-                Return
-            End If
-
-            Dim held = serialKeyboardDownCodes.ToArray()
-            serialKeyboardDownCodes.Clear()
-            For Each scanCode In held
-                Dim releaseCode = CByte(scanCode Or &H80)
-                If serialKeyboardIdSent Then
-                    SendSerialKeyboardByte(releaseCode)
-                    SendSerialKeyboardByte(releaseCode)
-                End If
-            Next
-        End Sub
-#End If
 
         Private Sub DisplayModeMenuItem_Click(sender As Object, e As EventArgs)
             Dim item = TryCast(sender, ToolStripMenuItem)
@@ -375,6 +307,11 @@ Namespace PalmDesktopHarness
         End Function
 
         Private Sub TryRestorePersistentState()
+            If Not PalmConfig.AutoRestorePersistentState Then
+                Append($"Persistent state auto-restore disabled for {PalmConfig.ProfileName}.")
+                Return
+            End If
+
             If Not File.Exists(statePath) Then Return
 
             If Not nativeReady Then
@@ -432,7 +369,7 @@ Namespace PalmDesktopHarness
             hotSyncButtonReleaseTimer.Stop()
             NativeMusashi.palm_native_set_trace_enabled(0)
             NativeMusashi.palm_native_set_pen(0, 0, 0)
-            NativeMusashi.palm_native_set_hotsync_button(0)
+            NativeMusashi.palm_native_set_cradle_button(0)
 
             If SaveNativeStateTo(statePath, True) Then Append($"Persistent state saved: {statePath}")
         End Sub
@@ -503,7 +440,16 @@ Namespace PalmDesktopHarness
             Dim copied = NativeMusashi.palm_native_copy_memory(baseAddress, bytes, CUInt(byteCount))
             If copied <> CUInt(byteCount) Then Return
 
-            lcdPanel.UpdateFrame(bytes, width, height, pitch, bpp, pan)
+            Dim palette As UInteger() = Nothing
+            If PalmConfig.UseColorLcdPalette Then
+                Dim entries = Math.Max(1, 1 << Math.Min(bpp, 8))
+                ReDim palette(entries - 1)
+                For i = 0 To entries - 1
+                    palette(i) = NativeMusashi.palm_native_lcd_palette(CByte(i))
+                Next
+            End If
+
+            lcdPanel.UpdateFrame(bytes, width, height, pitch, bpp, pan, palette)
             NativeMusashi.palm_native_lcd_mark_clean()
         End Sub
 
@@ -663,7 +609,9 @@ Namespace PalmDesktopHarness
             NativeMusashi.palm_native_set_pen(0, 0, 0)
             NativeMusashi.palm_native_set_button_bits(&HFFFFUS, 0)
             NativeMusashi.palm_native_set_power_button(0)
-            NativeMusashi.palm_native_set_hotsync_button(0)
+            NativeMusashi.palm_native_set_cradle_button(0)
+            NativeMusashi.palm_native_set_in_cradle(0)
+            If cradleMenuItem IsNot Nothing Then cradleMenuItem.Checked = False
             NativeMusashi.palm_native_warm_reset()
             nativeSlices = 0UI
             autoRunTicks = 0
@@ -690,6 +638,10 @@ Namespace PalmDesktopHarness
         Private Sub InitCpuButton_Click(sender As Object, e As EventArgs)
             Try
                 nativeReady = NativeMusashi.palm_native_init(romBytes, CUInt(romBytes.Length), PalmConfig.RamLogicalSize) <> 0
+                If nativeReady AndAlso cradleMenuItem IsNot Nothing Then
+                    cradleMenuItem.Checked = False
+                    NativeMusashi.palm_native_set_in_cradle(0)
+                End If
                 nativeSlices = 0UI
                 lastAutoLcdTick = 0
                 Append(If(nativeReady, "Native Musashi initialized.", "Native Musashi init failed."))
@@ -729,277 +681,48 @@ Namespace PalmDesktopHarness
         End Sub
 
         Private Sub PowerMenuItem_Click(sender As Object, e As EventArgs)
+            If nativeReady AndAlso NativeMusashi.palm_native_is_asleep() <> 0 Then
+                WakeSleepingPalmWithPowerButton()
+                Return
+            End If
+
             SendButtonBitsToNative(KeyBitPower, True, "Power")
             SendButtonBitsToNative(KeyBitPower, False, "Power")
+        End Sub
+
+        Private Sub InCradleMenuItem_Click(sender As Object, e As EventArgs)
+            If Not nativeReady Then
+                InitCpuButton_Click(Me, EventArgs.Empty)
+                If Not nativeReady Then Return
+            End If
+
+            Dim inCradle = cradleMenuItem IsNot Nothing AndAlso cradleMenuItem.Checked
+            NativeMusashi.palm_native_set_in_cradle(If(inCradle, 1, 0))
+            Append(If(inCradle, "Palm IIIc placed in cradle.", "Palm IIIc removed from cradle."))
+        End Sub
+
+        Private Sub BrightnessMenuItem_Click(sender As Object, e As EventArgs)
+            If Not nativeReady Then
+                InitCpuButton_Click(Me, EventArgs.Empty)
+                If Not nativeReady Then Return
+            End If
+
+            NativeMusashi.palm_native_show_brightness_adjust()
+            If autoRunTimer.Enabled Then
+                For i = 1 To 12
+                    NativeMusashi.palm_native_execute(10000)
+                Next
+                nativeSlices += 12UI
+                UpdateNativeLcdPreview()
+            Else
+                RunNativeSlices(100, 2000, False)
+            End If
         End Sub
 
         Private Sub HardwareButtonPanel_ButtonChanged(bits As UShort, down As Boolean, label As String)
             SendButtonBitsToNative(bits, down, label)
         End Sub
 
-#If ENABLE_INCOMPLETE_SERIAL_KEYBOARD Then
-        Private Sub MainForm_KeyDown(sender As Object, e As KeyEventArgs)
-            If Not serialKeyboardEnabled OrElse SerialKeyboardBlocked() Then Return
-
-            Dim scanCode = PalmKeyboardScanCode(e.KeyCode)
-            If Not scanCode.HasValue Then Return
-
-            If serialKeyboardDownCodes.Count = 0 AndAlso SerialKeyboardIdleTimedOut() Then ResetSerialKeyboardHandshake(True)
-            EnsureSerialKeyboardReady()
-            If Not serialKeyboardDownCodes.Contains(scanCode.Value) Then
-                serialKeyboardDownCodes.Add(scanCode.Value)
-                QueueSerialKeyboardByte(scanCode.Value)
-            End If
-            e.Handled = True
-            e.SuppressKeyPress = True
-        End Sub
-
-        Private Sub MainForm_KeyUp(sender As Object, e As KeyEventArgs)
-            If Not serialKeyboardEnabled OrElse SerialKeyboardBlocked() Then Return
-
-            Dim scanCode = PalmKeyboardScanCode(e.KeyCode)
-            If Not scanCode.HasValue Then Return
-
-            EnsureSerialKeyboardReady()
-            If serialKeyboardDownCodes.Remove(scanCode.Value) Then
-                Dim releaseCode = CByte(scanCode.Value Or &H80)
-                QueueSerialKeyboardByte(releaseCode)
-                If serialKeyboardDownCodes.Count = 0 Then QueueSerialKeyboardByte(releaseCode)
-            End If
-            e.Handled = True
-            e.SuppressKeyPress = True
-        End Sub
-
-        Private Function SerialKeyboardBlocked() As Boolean
-            If installState <> HotSyncInstallState.Idle AndAlso installState <> HotSyncInstallState.Done AndAlso installState <> HotSyncInstallState.Failed Then Return True
-            If pendingInstall IsNot Nothing OrElse pendingInstalls.Count > 0 Then Return True
-            Return False
-        End Function
-
-        Private Sub EnsureSerialKeyboardReady()
-            If Not nativeReady Then
-                InitCpuButton_Click(Me, EventArgs.Empty)
-                If Not nativeReady Then Return
-            End If
-
-            If Not serialKeyboardIdSent Then RequestSerialKeyboardDetect()
-        End Sub
-
-        Private Sub RequestSerialKeyboardDetect()
-            If Not nativeReady OrElse serialKeyboardIdSent OrElse serialKeyboardDetectPending Then Return
-
-            serialKeyboardDetectPending = True
-            serialKeyboardDetectStartedTick = Environment.TickCount64
-            serialKeyboardDetectInitialMisc = NativeMusashi.palm_native_uart_misc()
-            serialKeyboardSawRtsLow = (serialKeyboardDetectInitialMisc And (SerialKeyboardRtsThroughFifo Or SerialKeyboardRtsOut)) = 0
-            PulseSerialKeyboardActiveSync($"detect pulse; initial uMisc ${serialKeyboardDetectInitialMisc:X4}; sawLow={serialKeyboardSawRtsLow}")
-        End Sub
-
-        Private Sub PulseSerialKeyboardActiveSync(logMessage As String)
-            AppendSerialKeyboardLog(logMessage)
-            serialKeyboardLastPulseTick = Environment.TickCount64
-            NativeMusashi.palm_native_set_hotsync_button(1)
-            serialKeyboardPulseActive = True
-            serialKeyboardPulseReleaseTick = serialKeyboardLastPulseTick + SerialKeyboardPulseMs
-        End Sub
-
-        Private Sub ResetSerialKeyboardHandshake(clearPendingBytes As Boolean)
-            serialKeyboardIdSent = False
-            serialKeyboardDetectPending = False
-            serialKeyboardDetectStartedTick = 0
-            serialKeyboardDetectInitialMisc = 0
-            serialKeyboardSawRtsLow = False
-            serialKeyboardLastPulseTick = 0
-            If serialKeyboardPulseActive AndAlso nativeReady Then NativeMusashi.palm_native_set_hotsync_button(0)
-            serialKeyboardPulseActive = False
-            serialKeyboardPulseReleaseTick = 0
-            If clearPendingBytes Then serialKeyboardPendingBytes.Clear()
-        End Sub
-
-        Private Sub ServiceSerialKeyboard()
-            If Not serialKeyboardEnabled OrElse Not nativeReady OrElse SerialKeyboardBlocked() Then Return
-            ServiceSerialKeyboardPulse()
-
-            If serialKeyboardIdSent Then
-                FlushSerialKeyboardPendingBytes()
-                Return
-            End If
-
-            If Not serialKeyboardDetectPending Then Return
-
-            Dim misc = NativeMusashi.palm_native_uart_misc()
-            Dim rtsMask = CUShort(SerialKeyboardRtsThroughFifo Or SerialKeyboardRtsOut)
-            Dim newRts = CUShort(misc And rtsMask)
-            If newRts = 0 Then
-                If Not serialKeyboardSawRtsLow Then AppendSerialKeyboardLog($"RTS low observed uMisc ${misc:X4}")
-                serialKeyboardSawRtsLow = True
-                Return
-            End If
-
-            If serialKeyboardSawRtsLow Then
-                SendSerialKeyboardId($"RTS low-to-high uMisc ${misc:X4}")
-                Return
-            End If
-
-            ' Do not keep pulsing: on Palm OS this line also resembles a cradle
-            ' HotSync button, so repeated/long pulses can start HotSync instead
-            ' of letting the serial keyboard driver claim the event.
-        End Sub
-
-        Private Sub ServiceSerialKeyboardPulse()
-            If Not serialKeyboardPulseActive Then Return
-            If Environment.TickCount64 < serialKeyboardPulseReleaseTick Then Return
-
-            NativeMusashi.palm_native_set_hotsync_button(0)
-            serialKeyboardPulseActive = False
-            AppendSerialKeyboardLog($"detect pulse released after {SerialKeyboardPulseMs}ms; uMisc ${NativeMusashi.palm_native_uart_misc():X4}")
-        End Sub
-
-        Private Sub SendSerialKeyboardId(reason As String)
-            If Not nativeReady Then Return
-
-            ' Palm/Stowaway keyboards identify only after the driver opens the serial port
-            ' and asserts RTS; answering before that can be missed by Palm OS.
-            Dim idBytes As Byte() = {&HFA, &HFD}
-            Dim written = NativeMusashi.palm_native_uart_write_rx(idBytes, CUInt(idBytes.Length))
-            serialKeyboardIdSent = True
-            serialKeyboardDetectPending = False
-            lastSerialKeyboardTick = Environment.TickCount64
-            AppendSerialKeyboardLog($"ID sent ({reason}); written={written} rx={NativeMusashi.palm_native_uart_rx_count()} queued={serialKeyboardPendingBytes.Count}")
-            ServiceSerialKeyboardCycles()
-            AppendSerialKeyboardLog($"after ID service rx={NativeMusashi.palm_native_uart_rx_count()} uMisc=${NativeMusashi.palm_native_uart_misc():X4}")
-            FlushSerialKeyboardPendingBytes()
-        End Sub
-
-        Private Sub QueueSerialKeyboardByte(value As Byte)
-            If Not nativeReady Then Return
-
-            If serialKeyboardIdSent Then
-                PulseSerialKeyboardActiveSync($"key line pulse before byte ${value:X2}")
-                SendSerialKeyboardByte(value)
-            Else
-                serialKeyboardPendingBytes.Enqueue(value)
-                RequestSerialKeyboardDetect()
-            End If
-        End Sub
-
-        Private Sub FlushSerialKeyboardPendingBytes()
-            While serialKeyboardPendingBytes.Count > 0
-                SendSerialKeyboardByte(serialKeyboardPendingBytes.Dequeue())
-            End While
-        End Sub
-
-        Private Sub SendSerialKeyboardByte(value As Byte)
-            If Not nativeReady Then Return
-
-            Dim bytes As Byte() = {value}
-            Dim written = NativeMusashi.palm_native_uart_write_rx(bytes, 1UI)
-            lastSerialKeyboardTick = Environment.TickCount64
-            AppendSerialKeyboardLog($"byte ${value:X2} sent written={written} rx={NativeMusashi.palm_native_uart_rx_count()}")
-            ServiceSerialKeyboardCycles()
-            AppendSerialKeyboardLog($"after byte ${value:X2} service rx={NativeMusashi.palm_native_uart_rx_count()} uMisc=${NativeMusashi.palm_native_uart_misc():X4}")
-        End Sub
-
-        Private Sub ServiceSerialKeyboardCycles()
-            If Not autoRunTimer.Enabled Then Return
-
-            For i = 1 To 6
-                NativeMusashi.palm_native_execute(8000)
-            Next
-            nativeSlices += 6UI
-        End Sub
-
-        Private Function SerialKeyboardIdleTimedOut() As Boolean
-            Return lastSerialKeyboardTick <> 0 AndAlso Environment.TickCount64 - lastSerialKeyboardTick > 5000
-        End Function
-
-        Private Sub ResetSerialKeyboardLog()
-            Try
-                File.WriteAllText(serialKeyboardLogPath, $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} Serial keyboard enabled{Environment.NewLine}")
-            Catch
-            End Try
-        End Sub
-
-        Private Sub AppendSerialKeyboardLog(message As String)
-            Try
-                File.AppendAllText(serialKeyboardLogPath, $"{DateTime.Now:HH:mm:ss.fff} {message}{Environment.NewLine}")
-            Catch
-            End Try
-        End Sub
-
-        Private Shared Function PalmKeyboardScanCode(keyCode As Keys) As Byte?
-            Select Case keyCode
-                Case Keys.D1 : Return &H0
-                Case Keys.D2 : Return &H1
-                Case Keys.D3 : Return &H2
-                Case Keys.Z : Return &H3
-                Case Keys.D4 : Return &H4
-                Case Keys.D5 : Return &H5
-                Case Keys.D6 : Return &H6
-                Case Keys.D7 : Return &H7
-                Case Keys.LWin, Keys.RWin : Return &H8
-                Case Keys.Q : Return &H9
-                Case Keys.W : Return &HA
-                Case Keys.E : Return &HB
-                Case Keys.R : Return &HC
-                Case Keys.T : Return &HD
-                Case Keys.Y : Return &HE
-                Case Keys.Oemtilde : Return &HF
-                Case Keys.X : Return &H10
-                Case Keys.A : Return &H11
-                Case Keys.S : Return &H12
-                Case Keys.D : Return &H13
-                Case Keys.F : Return &H14
-                Case Keys.G : Return &H15
-                Case Keys.H : Return &H16
-                Case Keys.Space : Return &H17
-                Case Keys.CapsLock : Return &H18
-                Case Keys.Tab : Return &H19
-                Case Keys.ControlKey, Keys.LControlKey, Keys.RControlKey : Return &H1A
-                Case Keys.Menu, Keys.LMenu, Keys.RMenu : Return &H23
-                Case Keys.C : Return &H2C
-                Case Keys.V : Return &H2D
-                Case Keys.B : Return &H2E
-                Case Keys.N : Return &H2F
-                Case Keys.OemMinus, Keys.Subtract : Return &H30
-                Case Keys.Oemplus, Keys.Add : Return &H31
-                Case Keys.Back : Return &H32
-                Case Keys.Home : Return &H33
-                Case Keys.D8 : Return &H34
-                Case Keys.D9 : Return &H35
-                Case Keys.D0 : Return &H36
-                Case Keys.OemOpenBrackets : Return &H38
-                Case Keys.OemCloseBrackets : Return &H39
-                Case Keys.OemPipe : Return &H3A
-                Case Keys.End : Return &H3B
-                Case Keys.U : Return &H3C
-                Case Keys.I : Return &H3D
-                Case Keys.O : Return &H3E
-                Case Keys.P : Return &H3F
-                Case Keys.OemQuotes : Return &H40
-                Case Keys.Enter : Return &H41
-                Case Keys.PageUp : Return &H42
-                Case Keys.J : Return &H44
-                Case Keys.K : Return &H45
-                Case Keys.L : Return &H46
-                Case Keys.OemSemicolon : Return &H47
-                Case Keys.OemQuestion, Keys.Divide : Return &H48
-                Case Keys.Up : Return &H49
-                Case Keys.PageDown : Return &H4A
-                Case Keys.M : Return &H4C
-                Case Keys.Oemcomma : Return &H4D
-                Case Keys.OemPeriod, Keys.Decimal : Return &H4E
-                Case Keys.Insert : Return &H4F
-                Case Keys.Delete : Return &H50
-                Case Keys.Left : Return &H51
-                Case Keys.Down : Return &H52
-                Case Keys.Right : Return &H53
-                Case Keys.ShiftKey, Keys.LShiftKey : Return &H58
-                Case Keys.RShiftKey : Return &H59
-                Case Else : Return Nothing
-            End Select
-        End Function
-#End If
 
         Private Sub AutoRunTimer_Tick(sender As Object, e As EventArgs)
             If Not nativeReady Then
@@ -1007,26 +730,22 @@ Namespace PalmDesktopHarness
                 Return
             End If
 
-            Dim sleepWakePending = AdvanceSleepingClock()
-            Dim skipSleepingCpu = NativeMusashi.palm_native_is_asleep() <> 0 AndAlso Not sleepWakePending
+            Dim sleepWakePending = If(PalmConfig.PauseCpuWhileSleeping, AdvanceSleepingClock(), False)
+            Dim skipSleepingCpu = PalmConfig.PauseCpuWhileSleeping AndAlso
+                                  NativeMusashi.palm_native_is_asleep() <> 0 AndAlso
+                                  Not sleepWakePending
 
             If Not skipSleepingCpu Then
-                For i = 1 To 20
-                    NativeMusashi.palm_native_execute(20000)
+                For i = 1 To PalmConfig.NativeAutoRunSlicesPerTick
+                    NativeMusashi.palm_native_execute(PalmConfig.NativeAutoRunCyclesPerSlice)
                     PollNativeUart(False)
                     ServiceHotSyncHost()
-#If ENABLE_INCOMPLETE_SERIAL_KEYBOARD Then
-                    ServiceSerialKeyboard()
-#End If
                 Next
-                nativeSlices += 20UI
+                nativeSlices += CUInt(PalmConfig.NativeAutoRunSlicesPerTick)
             End If
             autoRunTicks += 1
             PollNativeUart(True)
             ServiceHotSyncHost()
-#If ENABLE_INCOMPLETE_SERIAL_KEYBOARD Then
-            ServiceSerialKeyboard()
-#End If
             UpdateSound()
             UpdateSleepVisualState()
 
@@ -1149,15 +868,22 @@ Namespace PalmDesktopHarness
 
         Private Sub PollNativeUart(forceLog As Boolean)
             Dim pending = NativeMusashi.palm_native_uart_tx_count()
+            Dim hotSyncRouteEnabled = NativeMusashi.palm_native_uart_is_irda() = 0UI
             If pending > 0UI Then
                 Dim buffer(CInt(Math.Min(256UI, pending)) - 1) As Byte
                 Dim read = NativeMusashi.palm_native_uart_read_tx(buffer, CUInt(buffer.Length))
                 For i = 0 To CInt(read) - 1
                     Dim value = buffer(i)
                     uartTxLogBuffer.Add(value)
-                    uartSlpRxBuffer.Add(value)
+                    If hotSyncRouteEnabled Then
+                        uartSlpRxBuffer.Add(value)
+                    End If
                 Next
-                ProcessPalmSerialFrames()
+                If Not hotSyncRouteEnabled Then
+                    uartSlpRxBuffer.Clear()
+                Else
+                    ProcessPalmSerialFrames()
+                End If
             End If
 
             Dim nowTick = Environment.TickCount64
@@ -1439,6 +1165,7 @@ Namespace PalmDesktopHarness
         End Sub
 
         Private Sub HandleDlpPayload(txId As Byte, payload As Byte())
+            payload = NormalizeDlpPayload(txId, payload)
             If payload.Length < 4 Then
                 Append($"HotSync short DLP payload tx ${txId:X2}")
                 Return
@@ -1446,6 +1173,9 @@ Namespace PalmDesktopHarness
 
             Dim cmd = CByte(payload(0) And &H7F)
             If (payload(0) And &H80) = 0 Then
+                If payload(0) < &H10 Then
+                    AppendHotSyncTrace($"RX ambiguous DLP tx=${txId:X2} len={payload.Length} bytes={FormatBytes(payload.Take(Math.Min(payload.Length, 96)).ToArray())}")
+                End If
                 HandleDlpRequestFromPalm(txId, payload)
                 Return
             End If
@@ -1453,6 +1183,7 @@ Namespace PalmDesktopHarness
             Dim argc = payload(1)
             Dim err = ReadU16(payload, 2)
             Dim quietWriteResource = installState = HotSyncInstallState.WritingResource AndAlso (cmd = DlpCmdWriteResource OrElse cmd = DlpCmdWriteRecord)
+            AppendHotSyncTrace($"RX response tx=${txId:X2} cmd=${cmd:X2} argc={argc} err=${err:X4} state={installState} item={installResourceIndex}")
             If VerboseSerialLog AndAlso Not quietWriteResource Then
                 Append($"DLP RX resp cmd ${cmd:X2} argc {argc} err ${err:X4} tx ${txId:X2}")
             End If
@@ -1478,23 +1209,37 @@ Namespace PalmDesktopHarness
             End If
         End Sub
 
+        Private Function NormalizeDlpPayload(txId As Byte, payload As Byte()) As Byte()
+            If payload.Length >= 6 Then
+                Dim prefixedLength = ReadU16(payload, 0)
+                If prefixedLength = payload.Length - 2 AndAlso ((payload(2) And &H80) <> 0 OrElse payload(2) >= &H10) Then
+                    Dim normalized(prefixedLength - 1) As Byte
+                    Array.Copy(payload, 2, normalized, 0, normalized.Length)
+                    AppendHotSyncTrace($"RX DLP length prefix stripped tx=${txId:X2} prefix={prefixedLength}")
+                    Return normalized
+                End If
+            End If
+            Return payload
+        End Function
+
         Private Sub HandleDlpRequestFromPalm(txId As Byte, payload As Byte())
             Dim cmd = payload(0)
             Dim argc = payload(1)
+            AppendHotSyncTrace($"RX request tx=${txId:X2} cmd=${cmd:X2} argc={argc} len={payload.Length} state={installState}")
             If VerboseSerialLog Then Append($"DLP RX req cmd ${cmd:X2} argc {argc} tx ${txId:X2} data {FormatBytes(payload)}")
             Select Case cmd
                 Case DlpCmdReadSysInfo
-                    SendDlpResponse(hostPadpTxId, cmd, Array.Empty(Of Byte)(), "DLP ReadSysInfo empty")
-                    hostPadpTxId = NextPadpTxId(hostPadpTxId)
+                    SendDlpResponseArgs(txId, cmd, "DLP ReadSysInfo",
+                                        BuildDlpArg(DlpArgFirstId, BuildReadSysInfoArg()),
+                                        BuildDlpArg(DlpArgFirstId + 1, BuildReadSysInfoVersionArg()))
                 Case DlpCmdReadStorageInfo
-                    SendDlpResponse(hostPadpTxId, cmd, Array.Empty(Of Byte)(), "DLP ReadStorageInfo empty")
-                    hostPadpTxId = NextPadpTxId(hostPadpTxId)
+                    SendDlpResponseArgs(txId, cmd, "DLP ReadStorageInfo",
+                                        BuildDlpArg(DlpArgFirstId, BuildReadStorageInfoArg()),
+                                        BuildDlpArg(DlpArgFirstId + 1, BuildReadStorageInfoExArg()))
                 Case DlpCmdEndOfSync
-                    SendDlpResponse(hostPadpTxId, cmd, Array.Empty(Of Byte)(), "DLP EndOfSync")
-                    hostPadpTxId = NextPadpTxId(hostPadpTxId)
+                    SendDlpResponseArgs(txId, cmd, "DLP EndOfSync")
                 Case Else
-                    SendDlpResponse(hostPadpTxId, cmd, Array.Empty(Of Byte)(), $"DLP cmd ${cmd:X2} empty")
-                    hostPadpTxId = NextPadpTxId(hostPadpTxId)
+                    SendDlpResponseArgs(txId, cmd, $"DLP cmd ${cmd:X2} empty")
             End Select
         End Sub
 
@@ -1584,17 +1329,18 @@ Namespace PalmDesktopHarness
         Private Sub PulseCradleHotSync()
             If Not nativeReady Then Return
 
-            NativeMusashi.palm_native_set_hotsync_button(1)
+            NativeMusashi.palm_native_set_cradle_button(1)
             hotSyncButtonReleaseTimer.Stop()
             hotSyncButtonReleaseTimer.Start()
         End Sub
 
         Private Sub HotSyncButtonReleaseTimer_Tick(sender As Object, e As EventArgs)
             hotSyncButtonReleaseTimer.Stop()
-            If nativeReady Then NativeMusashi.palm_native_set_hotsync_button(0)
+            If nativeReady Then NativeMusashi.palm_native_set_cradle_button(0)
         End Sub
 
         Private Sub HandleInstallResponse(payload As Byte(), err As Integer)
+            AppendHotSyncTrace($"Install response state={installState} err=${err:X4} db=${installDbId:X2} item={installResourceIndex}/{If(pendingInstall Is Nothing, 0, pendingInstall.ItemCount)}")
             Select Case installState
                 Case HotSyncInstallState.DeleteSent
                     If err <> 0 AndAlso err <> 5 Then
@@ -1661,6 +1407,7 @@ Namespace PalmDesktopHarness
         End Sub
 
         Private Sub FailInstall(message As String)
+            AppendHotSyncTrace($"FAIL {message}; state={installState}; db=${installDbId:X2}; item={installResourceIndex}; pending={If(pendingInstall Is Nothing, "(none)", pendingInstall.Name)}")
             Append(message)
             installState = HotSyncInstallState.Failed
             installAppBlockDone = False
@@ -2408,6 +2155,10 @@ Namespace PalmDesktopHarness
                 Return
             End If
 
+            If label.StartsWith("DLP", StringComparison.Ordinal) Then
+                AppendHotSyncTrace($"TX {label} tx=${txId:X2} len={payload.Length} state={installState}")
+            End If
+
             pendingPadpPayload = payload
             pendingPadpLabel = label
             pendingPadpTxId = txId
@@ -2464,6 +2215,133 @@ Namespace PalmDesktopHarness
                 Array.Copy(args, 0, payload, 4, args.Length)
             End If
             SendPadpData(txId, payload, label)
+        End Sub
+
+        Private Sub SendDlpResponseArgs(txId As Byte, cmd As Byte, label As String, ParamArray args As Byte()())
+            Dim payloadLength = 4 + args.Sum(Function(arg) arg.Length)
+            Dim payload(payloadLength - 1) As Byte
+            payload(0) = CByte(cmd Or &H80)
+            payload(1) = CByte(args.Length)
+            payload(2) = 0
+            payload(3) = 0
+
+            Dim cursor = 4
+            For Each arg In args
+                Array.Copy(arg, 0, payload, cursor, arg.Length)
+                cursor += arg.Length
+            Next
+
+            SendPadpData(txId, payload, label)
+        End Sub
+
+        Private Shared Function BuildDlpArg(argId As Integer, data As Byte()) As Byte()
+            If data.Length > &HFE Then Throw New InvalidOperationException($"DLP response arg too large: {data.Length} bytes")
+
+            Dim arg(2 + data.Length - 1) As Byte
+            arg(0) = CByte(argId And &HFF)
+            arg(1) = CByte(data.Length)
+            Array.Copy(data, 0, arg, 2, data.Length)
+            Return arg
+        End Function
+
+        Private Function BuildReadSysInfoArg() As Byte()
+            Dim data(13) As Byte
+            WriteU32(data, 0, PalmOsVersionForProfile())
+            WriteU32(data, 4, 0UI)
+            data(8) = 0
+            data(9) = 4
+            WriteU32(data, 10, ProductIdForProfile())
+            Return data
+        End Function
+
+        Private Function BuildReadSysInfoVersionArg() As Byte()
+            Dim data(11) As Byte
+            WriteU16(data, 0, 1US)
+            WriteU16(data, 2, 2US)
+            WriteU16(data, 4, 1US)
+            WriteU16(data, 6, 2US)
+            WriteU32(data, 8, &HFFFFFFFFUI)
+            Return data
+        End Function
+
+        Private Function BuildReadStorageInfoArg() As Byte()
+            Dim cardName = Encoding.ASCII.GetBytes(PalmConfig.ProfileName & ChrW(0))
+            Dim manufName = Encoding.ASCII.GetBytes("Palm" & ChrW(0))
+            Dim cardInfoSize = 26 + cardName.Length + manufName.Length
+            If (cardInfoSize And 1) <> 0 Then cardInfoSize += 1
+
+            Dim data(4 + cardInfoSize - 1) As Byte
+            data(0) = 0
+            data(1) = 0
+            data(2) = 0
+            data(3) = 1
+
+            Dim cursor = 4
+            data(cursor) = CByte(cardInfoSize)
+            data(cursor + 1) = 0
+            WriteU16(data, cursor + 2, 1US)
+            WritePalmDateTime(data, cursor + 4, New DateTime(2026, 1, 1, 0, 0, 0))
+            WriteU32(data, cursor + 12, RomSizeForProfile())
+            WriteU32(data, cursor + 16, PalmConfig.RamActivePreset)
+            WriteU32(data, cursor + 20, Math.Max(0UI, PalmConfig.RamActivePreset \ 2UI))
+            data(cursor + 24) = CByte(cardName.Length)
+            data(cursor + 25) = CByte(manufName.Length)
+            Array.Copy(cardName, 0, data, cursor + 26, cardName.Length)
+            Array.Copy(manufName, 0, data, cursor + 26 + cardName.Length, manufName.Length)
+            Return data
+        End Function
+
+        Private Shared Function BuildReadStorageInfoExArg() As Byte()
+            Dim data(19) As Byte
+            Return data
+        End Function
+
+        Private Shared Sub WritePalmDateTime(buffer As Byte(), offset As Integer, value As DateTime)
+            WriteU16(buffer, offset, CUShort(value.Year))
+            buffer(offset + 2) = CByte(value.Month)
+            buffer(offset + 3) = CByte(value.Day)
+            buffer(offset + 4) = CByte(value.Hour)
+            buffer(offset + 5) = CByte(value.Minute)
+            buffer(offset + 6) = CByte(value.Second)
+            buffer(offset + 7) = 0
+        End Sub
+
+        Private Shared Function PalmOsVersionForProfile() As UInteger
+            Select Case PalmConfig.ActiveHardwareProfile
+                Case PalmConfig.HardwareProfile.IIIcExperimental
+                    Return &H04100000UI
+                Case PalmConfig.HardwareProfile.M100Experimental
+                    Return &H03510000UI
+                Case Else
+                    Return &H03300000UI
+            End Select
+        End Function
+
+        Private Shared Function ProductIdForProfile() As UInteger
+            Select Case PalmConfig.ActiveHardwareProfile
+                Case PalmConfig.HardwareProfile.IIIcExperimental
+                    Return &H49494963UI ' "IIIc"
+                Case PalmConfig.HardwareProfile.M100Experimental
+                    Return &H6D313030UI ' "m100"
+                Case Else
+                    Return &H49494978UI ' "IIIx"
+            End Select
+        End Function
+
+        Private Shared Function RomSizeForProfile() As UInteger
+            Select Case PalmConfig.ActiveHardwareProfile
+                Case PalmConfig.HardwareProfile.IIIcExperimental
+                    Return 2097152UI
+                Case Else
+                    Return 1048576UI
+            End Select
+        End Function
+
+        Private Sub AppendHotSyncTrace(message As String)
+            Try
+                File.AppendAllText(hotSyncTracePath, $"{DateTime.Now:HH:mm:ss.fff} {message}{Environment.NewLine}")
+            Catch
+            End Try
         End Sub
 
         Private Shared Function NextPadpTxId(value As Byte) As Byte
@@ -3004,13 +2882,7 @@ Namespace PalmDesktopHarness
             Dim startA2 = NativeMusashi.palm_native_get_a(2)
             For i = 1 To sliceCount
                 NativeMusashi.palm_native_execute(cyclesPerSlice)
-#If ENABLE_INCOMPLETE_SERIAL_KEYBOARD Then
-                If i Mod 20 = 0 Then ServiceSerialKeyboard()
-#End If
             Next
-#If ENABLE_INCOMPLETE_SERIAL_KEYBOARD Then
-            ServiceSerialKeyboard()
-#End If
             NativeMusashi.palm_native_set_trace_enabled(0)
 
             nativeSlices += CUInt(sliceCount)
@@ -3037,7 +2909,9 @@ Namespace PalmDesktopHarness
                 penUpTimer.Stop()
                 NativeMusashi.palm_native_set_pen(0, 0, 0)
                 powerWakeTouchActive = down
-                SendButtonBitsToNative(KeyBitPower, down, "Power")
+                If down Then
+                    WakeSleepingPalmWithPowerButton()
+                End If
                 Return
             End If
 
@@ -3167,6 +3041,85 @@ Namespace PalmDesktopHarness
             Else
                 RunNativeSlices(100, 2000, False)
             End If
+        End Sub
+
+        Private Sub WakeSleepingPalmWithPowerButton()
+            If Not nativeReady Then Return
+
+            penUpTimer.Stop()
+            NativeMusashi.palm_native_set_pen(0, 0, 0)
+            AppendWakeDebug("before")
+            NativeMusashi.palm_native_set_button_bits(KeyBitPower, 1)
+            AppendWakeDebug("power-down")
+
+            Dim wakeCycles As UInteger = 0UI
+            For i = 1 To 160
+                Dim ran = NativeMusashi.palm_native_service_wake(10000)
+                wakeCycles += CUInt(Math.Max(0, ran))
+                If i = 1 OrElse i = 8 OrElse i = 40 OrElse i = 160 OrElse NativeMusashi.palm_native_is_asleep() = 0 Then
+                    AppendWakeDebug($"service-{i}", ran)
+                End If
+                If NativeMusashi.palm_native_is_asleep() = 0 Then Exit For
+            Next
+
+            NativeMusashi.palm_native_set_button_bits(KeyBitPower, 0)
+            AppendWakeDebug("power-up")
+
+            For i = 1 To 24
+                NativeMusashi.palm_native_execute(10000)
+            Next
+
+            nativeSlices += 184UI
+            AppendWakeDebug($"after-settle/{wakeCycles}")
+            UpdateNativeLcdPreview()
+        End Sub
+
+        Private Function NativeReg16(offset As UInteger) As UShort
+            Dim aligned = offset And Not 3UI
+            Dim value = NativeMusashi.palm_native_probe32(&HFFFFF000UI + aligned)
+            If (offset And 2UI) = 0UI Then
+                Return CUShort((value >> 16) And &HFFFFUI)
+            End If
+            Return CUShort(value And &HFFFFUI)
+        End Function
+
+        Private Function NativeReg8(offset As UInteger) As Byte
+            Return NativeMusashi.palm_native_peek8(&HFFFFF000UI + offset)
+        End Function
+
+        Private Function SedReg8(offset As UInteger) As Byte
+            Return NativeMusashi.palm_native_peek8(&H1F01FFE0UI + offset)
+        End Function
+
+        Private Sub AppendWakeDebug(label As String, Optional ran As Integer = -1)
+            If Not nativeReady OrElse PalmConfig.ActiveHardwareProfile <> PalmConfig.HardwareProfile.IIIcExperimental Then Return
+
+            Dim pc = NativeMusashi.palm_native_get_pc()
+            Dim sr = NativeMusashi.palm_native_get_sr()
+            Dim pll = NativeReg16(&H200UI)
+            Dim imrHi = NativeReg16(&H304UI)
+            Dim imrLo = NativeReg16(&H306UI)
+            Dim isrHi = NativeReg16(&H30CUI)
+            Dim isrLo = NativeReg16(&H30EUI)
+            Dim iprHi = NativeReg16(&H310UI)
+            Dim iprLo = NativeReg16(&H312UI)
+            Dim pcDir = NativeReg8(&H410UI)
+            Dim pcData = NativeReg8(&H411UI)
+            Dim pcSel = NativeReg8(&H413UI)
+            Dim pdDir = NativeReg8(&H418UI)
+            Dim pdData = NativeReg8(&H419UI)
+            Dim pdPol = NativeReg8(&H41CUI)
+            Dim pdReq = NativeReg8(&H41DUI)
+            Dim pdKbd = NativeReg8(&H41EUI)
+            Dim pdEdge = NativeReg8(&H41FUI)
+            Dim pfDir = NativeReg8(&H428UI)
+            Dim pfData = NativeReg8(&H429UI)
+            Dim pfSel = NativeReg8(&H42BUI)
+            Dim sed03 = SedReg8(&H03UI)
+            Dim sed04 = SedReg8(&H04UI)
+            Dim sed05 = SedReg8(&H05UI)
+
+            Append($"Wake {label}: ran={ran} asleep={NativeMusashi.palm_native_is_asleep()} PC=${pc:X8} SR=${sr:X4} PLL=${pll:X4} IMR=${imrHi:X4}/{imrLo:X4} ISR=${isrHi:X4}/{isrLo:X4} IPR=${iprHi:X4}/{iprLo:X4} PC=${pcDir:X2}/{pcData:X2}/{pcSel:X2} PD=${pdDir:X2}/{pdData:X2}/{pdPol:X2}/{pdReq:X2}/{pdKbd:X2}/{pdEdge:X2} PF=${pfDir:X2}/{pfData:X2}/{pfSel:X2} SED03=${sed03:X2} SED04=${sed04:X2} SED05=${sed05:X2}")
         End Sub
 
         Private Function ToAdcRaw(x As Integer, y As Integer) As (RawX As UShort, RawY As UShort)

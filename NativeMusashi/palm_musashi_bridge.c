@@ -15,6 +15,8 @@
 #define SYS_TRAP_MEM_PTR_NEW 0xa013u
 #define SYS_TRAP_MEM_PTR_FREE 0xa012u
 #define SYS_TRAP_DM_CREATE_DATABASE_FROM_IMAGE 0xa07fu
+#define SYS_TRAP_EVT_WAKEUP 0xa12fu
+#define SYS_TRAP_UI_BRIGHTNESS_ADJUST 0xa3abu
 #define UART_CONTROL_ENABLE 0x8000u
 #define UART_CONTROL_RX_ENABLE 0x4000u
 #define UART_CONTROL_TX_ENABLE 0x2000u
@@ -31,6 +33,7 @@
 #define UART_TX_FIFO_HALF 0x4000u
 #define UART_TX_AVAILABLE 0x2000u
 #define UART_TX_IGNORE_CTS 0x0800u
+#define UART_MISC_IRDA_ENABLE 0x0020u
 #define UART_FIFO_SIZE 4096u
 #define RAM_TRACK_PAGE_SIZE 4096u
 #define RAM_TRACK_PAGE_COUNT (PALM_RAM_LOGICAL_SIZE / RAM_TRACK_PAGE_SIZE)
@@ -125,12 +128,24 @@ static uint32_t g_uart_tx_overrun_count;
 static int g_pwm_sound_enabled;
 static double g_pwm_sound_frequency;
 static double g_pwm_sound_duty;
+static int g_cradle_button_line_low;
+static int g_iiic_in_cradle;
+#if PALM_HAS_SED1375
+static uint8_t g_sed1375_regs[PALM_SED1375_REG_SIZE];
+static uint8_t g_sed1375_vram[PALM_SED1375_VRAM_SIZE];
+static uint32_t g_sed1375_clut[256];
+static uint8_t g_sed1375_lut_entry;
+static uint8_t g_sed1375_lut_color;
+static uint16_t g_iiic_lcd_brightness;
+#endif
 
 static void update_interrupt_status(void);
+static void update_cradle_irq1_level(void);
 static void update_timer(void);
 static void update_rtc_time(void);
 static void update_uart_regs(void);
 static double system_clock_frequency(void);
+static int enqueue_uart_rx_byte(uint8_t value);
 
 #define PORT_D_POWER_FAIL 0x80u
 #define INT_HI_PEN 0x0010u
@@ -140,6 +155,8 @@ static double system_clock_frequency(void);
 #define INT_HI_IRQ1 0x0001u
 #define INT_HI_EMU 0x0080u
 #define INT_HI_SAMPLE_TIMER 0x0040u
+#define ICR_POL1 0x8000u
+#define ICR_ET1 0x0800u
 #define INT_LO_SPIM 0x0001u
 #define INT_LO_TIMER 0x0002u
 #define INT_LO_UART 0x0004u
@@ -174,6 +191,7 @@ static double system_clock_frequency(void);
 #define KEY_BIT_HARD2 0x0010u
 #define KEY_BIT_HARD3 0x0020u
 #define KEY_BIT_HARD4 0x0040u
+#define KEY_BIT_CONTRAST 0x0200u
 #define PEN_RAW_BASE 500u
 #define PEN_DIGITIZER_MAX_X 159u
 #define PEN_DIGITIZER_MAX_Y 219u
@@ -181,6 +199,7 @@ static double system_clock_frequency(void);
 #define LCD_FRAME_CYCLES 320000ull
 
 static uint16_t read16(uint32_t address, int instruction_fetch);
+static uint32_t read32(uint32_t address, int instruction_fetch);
 
 static void mark_lcd_dirty(void) {
     if (!g_lcd_dirty || g_lcd_frame_ready) {
@@ -361,6 +380,92 @@ static int ram_logical_offset(uint32_t address, uint32_t *offset) {
     return 0;
 }
 
+#if PALM_HAS_SED1375
+static int sed1375_reg_offset(uint32_t address, uint32_t *offset) {
+    if (address >= PALM_SED1375_REG_BASE && address < PALM_SED1375_REG_BASE + PALM_SED1375_REG_SIZE) {
+        *offset = address - PALM_SED1375_REG_BASE;
+        return 1;
+    }
+    return 0;
+}
+
+static int sed1375_vram_offset(uint32_t address, uint32_t *offset) {
+    if (address >= PALM_SED1375_BASE && address < PALM_SED1375_BASE + PALM_SED1375_VRAM_SIZE) {
+        *offset = address - PALM_SED1375_BASE;
+        return 1;
+    }
+    return 0;
+}
+
+static void init_sed1375(void) {
+    memset(g_sed1375_regs, 0, sizeof(g_sed1375_regs));
+    memset(g_sed1375_vram, 0, sizeof(g_sed1375_vram));
+    g_sed1375_regs[0x00] = 0x24; /* Product code 6, revision 0. */
+    g_sed1375_regs[0x04] = 19;   /* 160 pixels: (19 + 1) * 8. */
+    g_sed1375_regs[0x05] = 159;  /* 160 lines: value + 1. */
+    g_sed1375_regs[0x12] = 20;   /* Default byte pitch for 1bpp 160-wide. */
+    g_sed1375_lut_entry = 0;
+    g_sed1375_lut_color = 0;
+    g_iiic_lcd_brightness = 0xffu;
+    for (uint32_t i = 0; i < 256u; ++i) {
+        uint8_t level = (uint8_t)i;
+        g_sed1375_clut[i] = 0xff000000u | ((uint32_t)level << 16) | ((uint32_t)level << 8) | level;
+    }
+}
+
+static void update_iiic_lcd_brightness(void) {
+    uint16_t brightness = 0xffu;
+    if ((g_regs[0x411] & 0x10u) == 0) brightness = 0x70u; /* Backlight disabled. */
+    if ((g_sed1375_regs[0x03] & 0x04u) != 0) brightness = 0x40u; /* SED power-save. */
+    g_iiic_lcd_brightness = brightness;
+    mark_lcd_dirty();
+}
+
+static uint8_t sed1375_read_reg(uint32_t offset) {
+    if (offset == 0x0a) return (uint8_t)(g_sed1375_regs[offset] | 0x80u);
+    if (offset == 0x17) {
+        uint32_t entry = g_sed1375_clut[g_sed1375_lut_entry];
+        uint8_t value = 0;
+        if (g_sed1375_lut_color == 0) value = (uint8_t)((entry >> 16) & 0xf0u);
+        else if (g_sed1375_lut_color == 1) value = (uint8_t)((entry >> 8) & 0xf0u);
+        else value = (uint8_t)((entry >> 0) & 0xf0u);
+        g_sed1375_lut_color = (uint8_t)((g_sed1375_lut_color + 1u) % 3u);
+        if (g_sed1375_lut_color == 0) g_sed1375_lut_entry++;
+        return value;
+    }
+    return g_sed1375_regs[offset];
+}
+
+static void sed1375_write_reg(uint32_t offset, uint8_t value) {
+    if (offset == 0x00) return;
+    g_sed1375_regs[offset] = value;
+
+    if (offset == 0x15) {
+        g_sed1375_lut_entry = value;
+        g_sed1375_lut_color = 0;
+        return;
+    }
+
+    if (offset == 0x17) {
+        uint32_t expanded = (uint32_t)(((value & 0xf0u) >> 4) * 0x11u);
+        uint32_t *entry = &g_sed1375_clut[g_sed1375_lut_entry];
+        if (g_sed1375_lut_color == 0) {
+            *entry = (*entry & 0xff00ffffu) | (expanded << 16);
+        } else if (g_sed1375_lut_color == 1) {
+            *entry = (*entry & 0xffff00ffu) | (expanded << 8);
+        } else {
+            *entry = (*entry & 0xffffff00u) | expanded;
+        }
+        g_sed1375_lut_color = (uint8_t)((g_sed1375_lut_color + 1u) % 3u);
+        if (g_sed1375_lut_color == 0) g_sed1375_lut_entry++;
+        mark_lcd_dirty();
+    }
+
+    if (offset == 0x03) update_iiic_lcd_brightness();
+    if (offset >= 0x01 && offset <= 0x1c) mark_lcd_dirty();
+}
+#endif
+
 static void track_ram_write(uint32_t address) {
     uint32_t logical_offset;
     if (!ram_logical_offset(address, &logical_offset)) return;
@@ -423,12 +528,12 @@ static uint32_t call_palm_trap(uint16_t trap, const uint32_t *params, int param_
     }
 
     uint32_t stub_offset;
-    if (!ram_offset(PALM_CALL_STUB_ADDRESS, &stub_offset) || stub_offset + 4u > g_ram_size) {
+    if (!ram_offset(PALM_CALL_STUB_ADDRESS, &stub_offset) || stub_offset + 6u > g_ram_size) {
         if (a0_out) *a0_out = 0;
         return 0;
     }
 
-    uint8_t saved_stub[4];
+    uint8_t saved_stub[6];
     memcpy(saved_stub, g_ram + stub_offset, sizeof(saved_stub));
 
     uint32_t old_pc = m68k_get_reg(0, M68K_REG_PC);
@@ -443,8 +548,9 @@ static uint32_t call_palm_trap(uint16_t trap, const uint32_t *params, int param_
         old_a[i] = m68k_get_reg(0, M68K_REG_A0 + i);
     }
 
-    if (!ram_put16(PALM_CALL_STUB_ADDRESS, trap) ||
-        !ram_put16(PALM_CALL_STUB_ADDRESS + 2, 0x60feu)) {
+    if (!ram_put16(PALM_CALL_STUB_ADDRESS, 0x4e4fu) ||
+        !ram_put16(PALM_CALL_STUB_ADDRESS + 2, trap) ||
+        !ram_put16(PALM_CALL_STUB_ADDRESS + 4, 0x60feu)) {
         memcpy(g_ram + stub_offset, saved_stub, sizeof(saved_stub));
         if (a0_out) *a0_out = 0;
         return 0;
@@ -465,7 +571,80 @@ static uint32_t call_palm_trap(uint16_t trap, const uint32_t *params, int param_
         update_rtc_time();
         update_interrupt_status();
         uint32_t pc = m68k_get_reg(0, M68K_REG_PC);
-        if (pc == PALM_CALL_STUB_ADDRESS + 2 || pc == PALM_CALL_STUB_ADDRESS + 4) break;
+        if (pc == PALM_CALL_STUB_ADDRESS + 4 || pc == PALM_CALL_STUB_ADDRESS + 6) break;
+    }
+
+    uint32_t d0 = m68k_get_reg(0, M68K_REG_D0);
+    uint32_t a0 = m68k_get_reg(0, M68K_REG_A0);
+
+    memcpy(g_ram + stub_offset, saved_stub, sizeof(saved_stub));
+    for (int i = 0; i < 8; ++i) {
+        m68k_set_reg(M68K_REG_D0 + i, old_d[i]);
+        m68k_set_reg(M68K_REG_A0 + i, old_a[i]);
+    }
+    m68k_set_reg(M68K_REG_SR, old_sr);
+    m68k_set_reg(M68K_REG_USP, old_usp);
+    m68k_set_reg(M68K_REG_ISP, old_isp);
+    m68k_set_reg(M68K_REG_SP, old_sp);
+    m68k_set_reg(M68K_REG_PC, old_pc);
+
+    if (a0_out) *a0_out = a0;
+    return d0;
+}
+
+static uint32_t call_palm_trap_stack(uint16_t trap, const uint8_t *stack_bytes,
+                                     uint32_t stack_byte_count, uint32_t *a0_out) {
+    if (!g_ram || !g_cpu_initialized) {
+        if (a0_out) *a0_out = 0;
+        return 0;
+    }
+
+    uint32_t stub_offset;
+    if (!ram_offset(PALM_CALL_STUB_ADDRESS, &stub_offset) || stub_offset + 6u > g_ram_size) {
+        if (a0_out) *a0_out = 0;
+        return 0;
+    }
+
+    uint8_t saved_stub[6];
+    memcpy(saved_stub, g_ram + stub_offset, sizeof(saved_stub));
+
+    uint32_t old_pc = m68k_get_reg(0, M68K_REG_PC);
+    uint32_t old_sp = m68k_get_reg(0, M68K_REG_SP);
+    uint32_t old_sr = m68k_get_reg(0, M68K_REG_SR);
+    uint32_t old_usp = m68k_get_reg(0, M68K_REG_USP);
+    uint32_t old_isp = m68k_get_reg(0, M68K_REG_ISP);
+    uint32_t old_d[8];
+    uint32_t old_a[8];
+    for (int i = 0; i < 8; ++i) {
+        old_d[i] = m68k_get_reg(0, M68K_REG_D0 + i);
+        old_a[i] = m68k_get_reg(0, M68K_REG_A0 + i);
+    }
+
+    uint32_t call_sp = old_sp - stack_byte_count;
+    uint32_t stack_offset;
+    if (!ram_offset(call_sp, &stack_offset) || stack_offset + stack_byte_count > g_ram_size ||
+        !ram_put16(PALM_CALL_STUB_ADDRESS, 0x4e4fu) ||
+        !ram_put16(PALM_CALL_STUB_ADDRESS + 2, trap) ||
+        !ram_put16(PALM_CALL_STUB_ADDRESS + 4, 0x60feu)) {
+        memcpy(g_ram + stub_offset, saved_stub, sizeof(saved_stub));
+        if (a0_out) *a0_out = 0;
+        return 0;
+    }
+
+    if (stack_byte_count > 0 && stack_bytes) {
+        memcpy(g_ram + stack_offset, stack_bytes, stack_byte_count);
+    }
+
+    m68k_set_reg(M68K_REG_SP, call_sp);
+    m68k_set_reg(M68K_REG_PC, PALM_CALL_STUB_ADDRESS);
+
+    for (int i = 0; i < 2000; ++i) {
+        m68k_execute(2000);
+        update_timer();
+        update_rtc_time();
+        update_interrupt_status();
+        uint32_t pc = m68k_get_reg(0, M68K_REG_PC);
+        if (pc == PALM_CALL_STUB_ADDRESS + 4 || pc == PALM_CALL_STUB_ADDRESS + 6) break;
     }
 
     uint32_t d0 = m68k_get_reg(0, M68K_REG_D0);
@@ -523,7 +702,41 @@ static int has_wake_source(void) {
     return ((hi_pending & wake_hi) != 0) || ((lo_pending & wake_lo) != 0);
 }
 
+static int irq1_is_edge_triggered(void) {
+    return (get16(0x302) & ICR_ET1) != 0;
+}
+
+static int cradle_button_irq1_asserted(void) {
+    int active_high = (get16(0x302) & ICR_POL1) != 0;
+    return active_high ? !g_cradle_button_line_low : g_cradle_button_line_low;
+}
+
+static void update_cradle_irq1_level(void) {
+    if (irq1_is_edge_triggered()) return;
+    if (cradle_button_irq1_asserted()) {
+        put16(0x310, (uint16_t)(get16(0x310) | INT_HI_IRQ1));
+    } else {
+        put16(0x310, (uint16_t)(get16(0x310) & (uint16_t)~INT_HI_IRQ1));
+    }
+}
+
+static void set_cradle_button_line(int down) {
+    int old_asserted = cradle_button_irq1_asserted();
+    g_cradle_button_line_low = down != 0;
+    int new_asserted = cradle_button_irq1_asserted();
+
+    if (irq1_is_edge_triggered()) {
+        if (!old_asserted && new_asserted) {
+            put16(0x310, (uint16_t)(get16(0x310) | INT_HI_IRQ1));
+        }
+    } else {
+        update_cradle_irq1_level();
+    }
+    update_interrupt_status();
+}
+
 static void update_interrupt_status(void) {
+    update_cradle_irq1_level();
     put16(0x30c, (uint16_t)(get16(0x310) & ~get16(0x304)));
     put16(0x30e, (uint16_t)(get16(0x312) & ~get16(0x306)));
 
@@ -531,6 +744,9 @@ static void update_interrupt_status(void) {
 }
 
 static double system_clock_frequency(void) {
+#if PALM_HARDWARE_PROFILE == PALM_PROFILE_IIIC_EXPERIMENTAL
+    return PALM_SYSTEM_CLOCK_HZ;
+#else
     uint16_t pll_control = get16(0x200);
     uint16_t pll_freq_sel = get16(0x202);
     uint16_t pc = (uint16_t)(pll_freq_sel & 0x00ff);
@@ -548,6 +764,7 @@ static double system_clock_frequency(void) {
     }
 
     return result;
+#endif
 }
 
 static void update_pwm_sound(void) {
@@ -663,6 +880,9 @@ static uint8_t hardware_id_key_state(void) {
 #if PALM_HARDWARE_PROFILE == PALM_PROFILE_M100_EXPERIMENTAL
     /* Cloudpilot/POSE identify the Palm m100 as ID1 + ID3 asserted. */
     return 0xfau;
+#elif PALM_HARDWARE_PROFILE == PALM_PROFILE_IIIC_EXPERIMENTAL
+    /* Palm IIIc/Austin identifies as ID1 + ID4 asserted. */
+    return 0xf6u;
 #else
     /* Palm IIIx/Brad identifies as ID1 + ID3 + ID4 asserted. */
     return 0xf2u;
@@ -675,6 +895,10 @@ static uint8_t port_d_key_bits(void) {
     int row0 = key_row_b(0x01u);
     int row1 = key_row_b(0x08u);
     int row2 = key_row_b(0x40u);
+#elif PALM_HARDWARE_PROFILE == PALM_PROFILE_IIIC_EXPERIMENTAL
+    int row0 = key_row_c(0x01u);
+    int row1 = key_row_c(0x02u);
+    int row2 = key_row_c(0x04u);
 #else
     int row0 = key_row_f(0x10u) || key_row_c(0x01u) || key_row_b(0x01u);
     int row1 = key_row_f(0x20u) || key_row_c(0x02u) || key_row_b(0x08u);
@@ -699,19 +923,42 @@ static uint8_t port_d_key_bits(void) {
             if (g_button_bits_down & KEY_BIT_POWER) bits |= 0x01u;
 #if PALM_HARDWARE_PROFILE == PALM_PROFILE_M100_EXPERIMENTAL
             if (g_button_bits_down & KEY_BIT_PAGE_UP) bits |= 0x02u;
+#elif PALM_HARDWARE_PROFILE == PALM_PROFILE_IIIC_EXPERIMENTAL
+            if (g_button_bits_down & KEY_BIT_CONTRAST) bits |= 0x02u;
 #endif
             if (g_button_bits_down & KEY_BIT_HARD2) bits |= 0x04u;
     }
     return bits;
 }
 
+static uint8_t sleeping_key_edge_columns(uint16_t bits) {
+#if PALM_HARDWARE_PROFILE == PALM_PROFILE_IIIC_EXPERIMENTAL
+    uint8_t columns = 0;
+    if (bits & (KEY_BIT_HARD1 | KEY_BIT_PAGE_UP | KEY_BIT_POWER)) columns |= 0x01u;
+    if (bits & (KEY_BIT_HARD2 | KEY_BIT_PAGE_DOWN | KEY_BIT_CONTRAST)) columns |= 0x02u;
+    if (bits & KEY_BIT_HARD3) columns |= 0x04u;
+    if (bits & KEY_BIT_HARD4) columns |= 0x08u;
+    return columns;
+#else
+    (void)bits;
+    return 0;
+#endif
+}
+
 static uint8_t port_input_value(char port) {
+#if PALM_HARDWARE_PROFILE == PALM_PROFILE_IIIC_EXPERIMENTAL
+    if (port == 'C') return g_iiic_in_cradle ? 0x00u : 0x08u; /* Charging is active-low. */
+    if (port == 'F') return 0x82u; /* FIXTRNL2 + LCD powered. */
+#endif
     if (port == 'D') return id_detect_asserted() ? hardware_id_key_state() : port_d_key_bits();
     if (port == 'F') return g_pen_down ? 0x00 : 0x02;  /* Sumo/Brad PenIO is active low. */
     return port == 'E' ? 0xff : 0x00;
 }
 
 static uint8_t port_internal_value(char port) {
+#if PALM_HARDWARE_PROFILE == PALM_PROFILE_IIIC_EXPERIMENTAL
+    if (port == 'D') return (uint8_t)(PORT_D_POWER_FAIL | (g_iiic_in_cradle ? 0x00u : 0x40u));
+#endif
     return port == 'D' ? PORT_D_POWER_FAIL : 0x00;
 }
 
@@ -743,7 +990,18 @@ static uint8_t read_port_data(uint16_t offset) {
     internal &= (uint8_t)~sel;
     output &= (uint8_t)(sel & dir);
     input &= (uint8_t)(sel & ~dir);
-    return (uint8_t)(output | input | internal);
+    uint8_t value = (uint8_t)(output | input | internal);
+#if PALM_HARDWARE_PROFILE == PALM_PROFILE_IIIC_EXPERIMENTAL
+    if (port == 'F') {
+        /*
+         * Austin's ROM waits for the SED1375 LCD-powered input during display wake.
+         * POSE/Cloudpilot force this bit high; if the GPIO select/dir state hides it,
+         * HwrDisplayWake can spin forever with the panel half-powered.
+         */
+        value |= 0x81u;
+    }
+#endif
+    return value;
 }
 
 static void update_port_d_interrupts(void) {
@@ -758,11 +1016,7 @@ static void update_port_d_interrupts(void) {
 
     bits |= (uint8_t)(~edge) & data & polarity;
     bits |= (uint8_t)(~edge) & (uint8_t)(~data) & (uint8_t)(~polarity);
-    if (!is_asleep()) {
-        bits |= edge & g_port_d_edge & polarity;
-    } else {
-        bits |= edge & g_port_d_edge & polarity & 0xf0u;
-    }
+    bits |= edge & g_port_d_edge & polarity;
     bits &= request & (uint8_t)(~dir);
 
     if ((data & (uint8_t)(~dir) & kbd_enable) != 0) {
@@ -855,6 +1109,18 @@ static void update_uart_regs(void) {
         put16(0x312, (uint16_t)(get16(0x312) & (uint16_t)~INT_LO_UART));
     }
     update_interrupt_status();
+}
+
+static int enqueue_uart_rx_byte(uint8_t value) {
+    if (g_uart_rx_count >= UART_FIFO_SIZE) {
+        g_uart_rx_overrun_count++;
+        return 0;
+    }
+
+    g_uart_rx_fifo[g_uart_rx_head] = value;
+    g_uart_rx_head = (g_uart_rx_head + 1u) % UART_FIFO_SIZE;
+    g_uart_rx_count++;
+    return 1;
 }
 
 static void complete_spi_exchange(void) {
@@ -1005,6 +1271,8 @@ static void init_regs(void) {
     g_pen_x_raw = 0;
     g_pen_y_raw = 0;
     g_button_bits_down = 0;
+    g_cradle_button_line_low = 0;
+    g_iiic_in_cradle = 0;
     g_port_d_edge = 0;
     g_system_cycles = 0;
     g_timer_last_cycles = 0;
@@ -1021,6 +1289,9 @@ static void init_regs(void) {
     g_uart_rx_overrun_count = 0;
     g_uart_tx_overrun_count = 0;
     put16(0x906, (uint16_t)(UART_TX_FIFO_EMPTY | UART_TX_FIFO_HALF | UART_TX_AVAILABLE | UART_TX_IGNORE_CTS));
+#if PALM_HAS_SED1375
+    init_sed1375();
+#endif
 }
 
 static uint8_t read8(uint32_t address, int instruction_fetch) {
@@ -1031,6 +1302,18 @@ static uint8_t read8(uint32_t address, int instruction_fetch) {
         ++g_debug.romReadCount;
         return g_rom[offset];
     }
+
+#if PALM_HAS_SED1375
+    if (sed1375_reg_offset(address, &offset)) {
+        ++g_debug.regReadCount;
+        return sed1375_read_reg(offset);
+    }
+
+    if (sed1375_vram_offset(address, &offset)) {
+        ++g_debug.ramReadCount;
+        return g_sed1375_vram[offset];
+    }
+#endif
 
     if (reg_offset(address, &offset)) {
         ++g_debug.regReadCount;
@@ -1059,7 +1342,8 @@ static uint8_t read8(uint32_t address, int instruction_fetch) {
             update_timer();
             g_last_timer_status |= get16(0x60a);
         }
-        return g_regs[offset];
+        uint8_t value = g_regs[offset];
+        return value;
     }
 
     if (ram_offset(address, &offset)) {
@@ -1087,12 +1371,46 @@ static void write8(uint32_t address, uint8_t value) {
     uint32_t offset;
     g_debug.lastWriteAddress = address;
 
+#if PALM_HAS_SED1375
+    if (sed1375_reg_offset(address, &offset)) {
+        sed1375_write_reg(offset, value);
+        ++g_debug.regWriteCount;
+        g_debug.lastRegWriteOffset = (uint16_t)offset;
+        g_debug.lastRegWriteValue = value;
+        if (offset >= 0x01 && offset <= 0x1c) {
+            ++g_debug.lcdWriteCount;
+            g_debug.lastLcdWriteOffset = (uint16_t)offset;
+            g_debug.lastLcdWriteValue = value;
+        }
+        return;
+    }
+
+    if (sed1375_vram_offset(address, &offset)) {
+        g_sed1375_vram[offset] = value;
+        mark_lcd_dirty();
+        ++g_debug.ramWriteCount;
+        return;
+    }
+#endif
+
     if (reg_offset(address, &offset)) {
         if (offset == 0xb0e || offset == 0xb0f) {
             uint16_t status = get16(0xb0e);
             uint16_t clear_mask = offset == 0xb0e ? (uint16_t)(value << 8) : value;
             put16(0xb0e, (uint16_t)(status & ~clear_mask));
             update_rtc_interrupts();
+            ++g_debug.regWriteCount;
+            g_debug.lastRegWriteOffset = (uint16_t)offset;
+            g_debug.lastRegWriteValue = value;
+            trace_reg_write(m68k_get_reg(0, M68K_REG_PC), address, (uint16_t)offset, value);
+            return;
+        }
+
+        if (offset == 0x30c || offset == 0x30d) {
+            if (offset == 0x30d && (value & (uint8_t)INT_HI_IRQ1) != 0 && irq1_is_edge_triggered()) {
+                put16(0x310, (uint16_t)(get16(0x310) & (uint16_t)~INT_HI_IRQ1));
+            }
+            update_interrupt_status();
             ++g_debug.regWriteCount;
             g_debug.lastRegWriteOffset = (uint16_t)offset;
             g_debug.lastRegWriteValue = value;
@@ -1114,6 +1432,9 @@ static void write8(uint32_t address, uint8_t value) {
             } else {
                 g_uart_tx_overrun_count++;
             }
+            if ((get16(0x908) & UART_MISC_IRDA_ENABLE) != 0u) {
+                enqueue_uart_rx_byte(value);
+            }
             update_uart_regs();
         }
         if (offset >= 0x900 && offset <= 0x909) update_uart_regs();
@@ -1128,11 +1449,14 @@ static void write8(uint32_t address, uint8_t value) {
                 update_interrupt_status();
             }
         }
-        if (offset >= 0x304 && offset <= 0x313) update_interrupt_status();
+        if ((offset >= 0x302 && offset <= 0x313)) update_interrupt_status();
         if ((offset >= 0x418 && offset <= 0x41f) || offset == 0x408 || offset == 0x409 ||
             offset == 0x410 || offset == 0x411 || offset == 0x428 || offset == 0x429) {
             update_port_d_interrupts();
         }
+#if PALM_HAS_SED1375
+        if (offset == 0x411) update_iiic_lcd_brightness();
+#endif
         if (offset >= 0xb0c && offset <= 0xb11) update_rtc_interrupts();
         ++g_debug.regWriteCount;
         g_debug.lastRegWriteOffset = (uint16_t)offset;
@@ -1288,7 +1612,12 @@ PALM_EXPORT void palm_native_warm_reset(void) {
 }
 
 PALM_EXPORT uint32_t palm_native_state_size(void) {
-    return (uint32_t)(sizeof(PalmNativeStateHeader) + PALM_DB_REG_SIZE + g_ram_size);
+    uint32_t size = (uint32_t)(sizeof(PalmNativeStateHeader) + PALM_DB_REG_SIZE + g_ram_size);
+#if PALM_HAS_SED1375
+    size += PALM_SED1375_REG_SIZE + PALM_SED1375_VRAM_SIZE +
+            (uint32_t)sizeof(g_sed1375_clut) + 4u;
+#endif
+    return size;
 }
 
 PALM_EXPORT int palm_native_save_state(uint8_t *buffer, uint32_t buffer_size) {
@@ -1344,9 +1673,25 @@ PALM_EXPORT int palm_native_save_state(uint8_t *buffer, uint32_t buffer_size) {
     header.uartRxOverrunCount = g_uart_rx_overrun_count;
     header.uartTxOverrunCount = g_uart_tx_overrun_count;
 
-    memcpy(buffer, &header, sizeof(header));
-    memcpy(buffer + sizeof(header), g_regs, PALM_DB_REG_SIZE);
-    memcpy(buffer + sizeof(header) + PALM_DB_REG_SIZE, g_ram, g_ram_size);
+    uint8_t *cursor = buffer;
+    memcpy(cursor, &header, sizeof(header));
+    cursor += sizeof(header);
+    memcpy(cursor, g_regs, PALM_DB_REG_SIZE);
+    cursor += PALM_DB_REG_SIZE;
+    memcpy(cursor, g_ram, g_ram_size);
+    cursor += g_ram_size;
+#if PALM_HAS_SED1375
+    memcpy(cursor, g_sed1375_regs, PALM_SED1375_REG_SIZE);
+    cursor += PALM_SED1375_REG_SIZE;
+    memcpy(cursor, g_sed1375_vram, PALM_SED1375_VRAM_SIZE);
+    cursor += PALM_SED1375_VRAM_SIZE;
+    memcpy(cursor, g_sed1375_clut, sizeof(g_sed1375_clut));
+    cursor += sizeof(g_sed1375_clut);
+    cursor[0] = g_sed1375_lut_entry;
+    cursor[1] = g_sed1375_lut_color;
+    cursor[2] = (uint8_t)(g_iiic_lcd_brightness >> 8);
+    cursor[3] = (uint8_t)(g_iiic_lcd_brightness & 0xffu);
+#endif
     return 1;
 }
 
@@ -1357,11 +1702,25 @@ PALM_EXPORT int palm_native_load_state(const uint8_t *buffer, uint32_t buffer_si
     memcpy(&header, buffer, sizeof(header));
     if (header.magic != PALM_STATE_MAGIC || header.version != PALM_STATE_VERSION) return 0;
     if (header.ramSize != g_ram_size || header.regSize != PALM_DB_REG_SIZE || header.romSize != g_rom_size) return 0;
-    if (header.totalSize != sizeof(PalmNativeStateHeader) + PALM_DB_REG_SIZE + g_ram_size) return 0;
+    if (header.totalSize != palm_native_state_size()) return 0;
     if (buffer_size < header.totalSize) return 0;
 
-    memcpy(g_regs, buffer + sizeof(header), PALM_DB_REG_SIZE);
-    memcpy(g_ram, buffer + sizeof(header) + PALM_DB_REG_SIZE, g_ram_size);
+    const uint8_t *cursor = buffer + sizeof(header);
+    memcpy(g_regs, cursor, PALM_DB_REG_SIZE);
+    cursor += PALM_DB_REG_SIZE;
+    memcpy(g_ram, cursor, g_ram_size);
+    cursor += g_ram_size;
+#if PALM_HAS_SED1375
+    memcpy(g_sed1375_regs, cursor, PALM_SED1375_REG_SIZE);
+    cursor += PALM_SED1375_REG_SIZE;
+    memcpy(g_sed1375_vram, cursor, PALM_SED1375_VRAM_SIZE);
+    cursor += PALM_SED1375_VRAM_SIZE;
+    memcpy(g_sed1375_clut, cursor, sizeof(g_sed1375_clut));
+    cursor += sizeof(g_sed1375_clut);
+    g_sed1375_lut_entry = cursor[0];
+    g_sed1375_lut_color = cursor[1] % 3u;
+    g_iiic_lcd_brightness = (uint16_t)(((uint16_t)cursor[2] << 8) | cursor[3]);
+#endif
 
     g_debug = header.debug;
     g_last_timer_status = header.lastTimerStatus;
@@ -1449,12 +1808,11 @@ PALM_EXPORT uint32_t palm_native_uart_write_rx(const uint8_t *buffer, uint32_t c
     if (!buffer || count == 0) return 0;
 
     uint32_t written = 0;
-    while (written < count && g_uart_rx_count < UART_FIFO_SIZE) {
-        g_uart_rx_fifo[g_uart_rx_head] = buffer[written++];
-        g_uart_rx_head = (g_uart_rx_head + 1u) % UART_FIFO_SIZE;
-        g_uart_rx_count++;
+    while (written < count) {
+        if (!enqueue_uart_rx_byte(buffer[written])) break;
+        written++;
     }
-    if (written < count) g_uart_rx_overrun_count += count - written;
+    if (written < count) g_uart_rx_overrun_count += count - written - 1u;
     update_uart_regs();
     return written;
 }
@@ -1477,6 +1835,15 @@ PALM_EXPORT uint32_t palm_native_uart_tx_count(void) { return g_uart_tx_count; }
 PALM_EXPORT uint32_t palm_native_uart_rx_overrun_count(void) { return g_uart_rx_overrun_count; }
 PALM_EXPORT uint32_t palm_native_uart_tx_overrun_count(void) { return g_uart_tx_overrun_count; }
 PALM_EXPORT uint16_t palm_native_uart_misc(void) { return get16(0x908); }
+PALM_EXPORT uint32_t palm_native_uart_is_irda(void) { return (get16(0x908) & UART_MISC_IRDA_ENABLE) != 0u ? 1u : 0u; }
+
+PALM_EXPORT uint32_t palm_native_event_wakeup(void) {
+    return call_palm_trap_stack(SYS_TRAP_EVT_WAKEUP, NULL, 0, NULL);
+}
+
+PALM_EXPORT uint32_t palm_native_show_brightness_adjust(void) {
+    return call_palm_trap_stack(SYS_TRAP_UI_BRIGHTNESS_ADJUST, NULL, 0, NULL);
+}
 
 PALM_EXPORT int palm_native_execute(int cycles) {
     if (cycles > 0) g_system_cycles += (uint64_t)cycles;
@@ -1517,6 +1884,7 @@ PALM_EXPORT int palm_native_service_wake(int cycles) {
 
 PALM_EXPORT uint32_t palm_native_get_pc(void) { return m68k_get_reg(0, M68K_REG_PC); }
 PALM_EXPORT uint32_t palm_native_get_sp(void) { return m68k_get_reg(0, M68K_REG_SP); }
+PALM_EXPORT uint32_t palm_native_get_sr(void) { return m68k_get_reg(0, M68K_REG_SR); }
 PALM_EXPORT uint32_t palm_native_get_d0(void) { return m68k_get_reg(0, M68K_REG_D0); }
 PALM_EXPORT uint32_t palm_native_get_a0(void) { return m68k_get_reg(0, M68K_REG_A0); }
 PALM_EXPORT uint32_t palm_native_get_d(int index) {
@@ -1542,21 +1910,86 @@ PALM_EXPORT uint32_t palm_native_ads_channel_count(int channel) {
     return g_debug.adsChannelCounts[channel];
 }
 
-PALM_EXPORT uint32_t palm_native_lcd_start(void) { return get32(0xa00) & 0x1ffffffeu; }
-PALM_EXPORT uint16_t palm_native_lcd_width(void) { return get16(0xa08); }
-PALM_EXPORT uint16_t palm_native_lcd_height(void) { return (uint16_t)(get16(0xa0a) + 1); }
-PALM_EXPORT uint16_t palm_native_lcd_pitch(void) { return (uint16_t)(g_regs[0xa05] * 2); }
-PALM_EXPORT uint8_t palm_native_lcd_panel(void) { return g_regs[0xa20]; }
-PALM_EXPORT uint8_t palm_native_lcd_pan(void) { return g_regs[0xa2d]; }
-PALM_EXPORT uint16_t palm_native_lcd_contrast(void) { return get16(0xa36); }
+PALM_EXPORT uint32_t palm_native_lcd_start(void) {
+#if PALM_HAS_SED1375
+    uint32_t offset = ((uint32_t)(g_sed1375_regs[0x11] & 0x03u) << 17) |
+                      ((uint32_t)g_sed1375_regs[0x0d] << 9) |
+                      ((uint32_t)g_sed1375_regs[0x0c] << 1);
+    if (offset >= PALM_SED1375_VRAM_SIZE) offset = 0;
+    return PALM_SED1375_BASE + offset;
+#else
+    return get32(0xa00) & 0x1ffffffeu;
+#endif
+}
+PALM_EXPORT uint16_t palm_native_lcd_width(void) {
+#if PALM_HAS_SED1375
+    uint16_t width = (uint16_t)((g_sed1375_regs[0x04] + 1u) * 8u);
+    return width == 0 ? PALM_LCD_WIDTH : width;
+#else
+    return get16(0xa08);
+#endif
+}
+PALM_EXPORT uint16_t palm_native_lcd_height(void) {
+#if PALM_HAS_SED1375
+    uint16_t height = (uint16_t)(((uint16_t)g_sed1375_regs[0x06] << 8) | g_sed1375_regs[0x05]);
+    return (uint16_t)(height + 1u);
+#else
+    return (uint16_t)(get16(0xa0a) + 1);
+#endif
+}
+PALM_EXPORT uint16_t palm_native_lcd_pitch(void) {
+#if PALM_HAS_SED1375
+    uint16_t width = palm_native_lcd_width();
+    uint8_t bpp = (uint8_t)(1u << ((g_sed1375_regs[0x02] & 0xc0u) >> 6));
+    return (uint16_t)((width * bpp + 7u) / 8u);
+#else
+    return (uint16_t)(g_regs[0xa05] * 2);
+#endif
+}
+PALM_EXPORT uint8_t palm_native_lcd_panel(void) {
+#if PALM_HAS_SED1375
+    return (uint8_t)((g_sed1375_regs[0x02] & 0xc0u) >> 6);
+#else
+    return g_regs[0xa20];
+#endif
+}
+PALM_EXPORT uint8_t palm_native_lcd_pan(void) {
+#if PALM_HAS_SED1375
+    return 0;
+#else
+    return g_regs[0xa2d];
+#endif
+}
+PALM_EXPORT uint16_t palm_native_lcd_contrast(void) {
+#if PALM_HAS_SED1375
+    return g_iiic_lcd_brightness;
+#else
+    return get16(0xa36);
+#endif
+}
+PALM_EXPORT uint32_t palm_native_lcd_palette(uint8_t index) {
+#if PALM_HAS_SED1375
+    return g_sed1375_clut[index];
+#else
+    uint32_t level = index;
+    return 0xff000000u | (level << 16) | (level << 8) | level;
+#endif
+}
 PALM_EXPORT int palm_native_lcd_dirty(void) { return g_lcd_dirty; }
 PALM_EXPORT int palm_native_lcd_frame_ready(void) { return g_lcd_dirty && g_lcd_frame_ready; }
 PALM_EXPORT void palm_native_lcd_mark_clean(void) {
     g_lcd_dirty = 0;
     g_lcd_frame_ready = 0;
 }
-PALM_EXPORT uint32_t palm_native_probe32(uint32_t address) { return read32(address, 0); }
-PALM_EXPORT uint8_t palm_native_peek8(uint32_t address) { return read8(address, 0); }
+PALM_EXPORT uint32_t palm_native_probe32(uint32_t address) {
+    uint32_t value = read32(address, 0);
+    return value;
+}
+
+PALM_EXPORT uint8_t palm_native_peek8(uint32_t address) {
+    uint8_t value = read8(address, 0);
+    return value;
+}
 PALM_EXPORT uint32_t palm_native_copy_memory(uint32_t address, uint8_t *buffer, uint32_t count) {
     if (!buffer || count == 0) return 0;
 
@@ -1574,6 +2007,15 @@ PALM_EXPORT uint32_t palm_native_copy_memory(uint32_t address, uint8_t *buffer, 
         memcpy(buffer, g_rom + offset, copied);
         return copied;
     }
+
+#if PALM_HAS_SED1375
+    if (sed1375_vram_offset(address, &offset)) {
+        uint32_t available = PALM_SED1375_VRAM_SIZE - offset;
+        uint32_t copied = count < available ? count : available;
+        memcpy(buffer, g_sed1375_vram + offset, copied);
+        return copied;
+    }
+#endif
 
     for (uint32_t i = 0; i < count; ++i) {
         buffer[i] = read8(address + i, 0);
@@ -1603,6 +2045,9 @@ PALM_EXPORT void palm_native_set_button_bits(uint16_t bits, int down) {
 
     uint8_t new_key_bits = port_d_key_bits();
     g_port_d_edge |= new_key_bits & (uint8_t)~old_key_bits;
+    if (down != 0 && is_asleep()) {
+        g_port_d_edge |= sleeping_key_edge_columns(bits);
+    }
     update_port_d_interrupts();
 }
 
@@ -1610,12 +2055,25 @@ PALM_EXPORT void palm_native_set_power_button(int down) {
     palm_native_set_button_bits(KEY_BIT_POWER, down);
 }
 
+PALM_EXPORT void palm_native_set_cradle_button(int down) {
+    set_cradle_button_line(down);
+}
+
+PALM_EXPORT void palm_native_set_in_cradle(int in_cradle) {
+    g_iiic_in_cradle = in_cradle != 0;
+    update_interrupt_status();
+}
+
+PALM_EXPORT int palm_native_get_in_cradle(void) {
+    return g_iiic_in_cradle;
+}
+
 PALM_EXPORT void palm_native_set_hotsync_button(int down) {
-    if (down != 0) {
-        put16(0x310, (uint16_t)(get16(0x310) | INT_HI_IRQ1));
-    } else {
-        put16(0x310, (uint16_t)(get16(0x310) & (uint16_t)~INT_HI_IRQ1));
-    }
+    palm_native_set_cradle_button(down);
+}
+
+PALM_EXPORT void palm_native_pulse_irq1(void) {
+    put16(0x310, (uint16_t)(get16(0x310) | INT_HI_IRQ1));
     update_interrupt_status();
 }
 

@@ -13,6 +13,8 @@ RAM headroom for the current core.
 
 - Desktop Palm m100 profile boots and works well in normal use.
 - Palm IIIx profile is still supported by the native core and harness.
+- Palm IIIc support is experimental. It uses the Palm IIIc/Austin hardware
+  profile, 8 MB RAM, and the SED1375 color LCD path.
 - ESP32 CYD build is experimental and likely needs PSRAM for practical use.
 - Native emulator core is exposed through `NativeMusashi/palm_core.h` for future
   hosts such as SDL, Android, Linux, or ESP32+PSRAM.
@@ -22,6 +24,7 @@ RAM headroom for the current core.
 - Musashi 68000 CPU core.
 - DragonBall EZ-style memory map, registers, interrupts, timers, RTC, LCD,
   GPIO/button input, pen/touch input, UART transport, and PWM buzzer.
+- Experimental SED1375 color LCD controller path for Palm IIIc.
 - 160x160 1-bit LCD rendering with bulk framebuffer transfer.
 - Palm m100-style 160x220 digitizer area, including silkscreen region.
 - Sleep/wake handling with timer/RTC wake support.
@@ -38,6 +41,7 @@ ESP32-PALM.ino             Arduino sketch for ESP32/CYD experiments
 NativeMusashi/             Native C Palm hardware/CPU bridge
 PalmDesktopHarness/        VB.NET WinForms desktop emulator
 PalmRamProbe/              Desktop RAM limit test harness
+PalmRomExtractor/          VB.NET ROM app lister and PRC exporter
 Musashi-master/            Musashi 68000 CPU core used by the emulator
 HARDWARE_PROFILES.md       Profile switching notes
 README_BRINGUP.md          Detailed bring-up history and low-level notes
@@ -52,6 +56,7 @@ root before running:
 
 - `Palm-m100-3.51-en.rom` for the m100 profile
 - `Palm-IIIx-3.1.rom` for the IIIx profile
+- `Palm-IIIc-4.1-en.rom` for the IIIc experimental profile
 
 The `.gitignore` intentionally excludes ROMs, Palm application packages, RAM
 state files, HotSync data, and build outputs.
@@ -85,9 +90,46 @@ Run:
 PalmDesktopHarness\bin\Release\net8.0-windows\PalmDesktopHarness.exe
 ```
 
-The desktop harness currently uses the m100 profile in
-`PalmDesktopHarness/PalmConfig.vb`. Keep that setting in sync with the native
+The desktop harness profile is selected in `PalmDesktopHarness/PalmConfig.vb`.
+Keep that setting in sync with the native
 `PALM_PROFILE` CMake option.
+
+## ROM Application Export
+
+`PalmRomExtractor` lists application databases inside a Palm ROM dump and can
+export them as installable `.prc` files. It handles normal PRC/PDB relative
+offsets, file-absolute offsets, and common Palm ROM-base absolute offsets.
+
+Build:
+
+```bat
+dotnet build PalmRomExtractor\PalmRomExtractor.vbproj -c Release
+```
+
+List ROM applications:
+
+```bat
+dotnet run --project PalmRomExtractor -- list Palm-m100-3.51-en.rom
+```
+
+Export all ROM applications:
+
+```bat
+dotnet run --project PalmRomExtractor -- export Palm-m100-3.51-en.rom ExtractedApps --all
+```
+
+Export one app by display name or creator code:
+
+```bat
+dotnet run --project PalmRomExtractor -- export Palm-m100-3.51-en.rom ExtractedApps --name "Memo Pad"
+dotnet run --project PalmRomExtractor -- export Palm-m100-3.51-en.rom ExtractedApps --creator memo
+```
+
+If a dump preserves a nonstandard ROM address base, pass it explicitly:
+
+```bat
+dotnet run --project PalmRomExtractor -- list MyPalm.rom --rom-base 0x10C00000
+```
 
 ## Switching Hardware Profiles
 
@@ -95,33 +137,36 @@ See [HARDWARE_PROFILES.md](HARDWARE_PROFILES.md) for full profile notes.
 
 Short version:
 
-- Native CMake profile: `-DPALM_PROFILE=IIIX` or
-  `-DPALM_PROFILE=M100_EXPERIMENTAL`
+- Native CMake profile: `-DPALM_PROFILE=IIIX`,
+  `-DPALM_PROFILE=M100_EXPERIMENTAL`, or
+  `-DPALM_PROFILE=IIIC_EXPERIMENTAL`
 - VB profile switch:
-  `#Const PALM_PROFILE_M100_EXPERIMENTAL = True` or `False` in
-  `PalmDesktopHarness/PalmConfig.vb`
+  set exactly one of `PALM_PROFILE_M100_EXPERIMENTAL` or
+  `PALM_PROFILE_IIIC_EXPERIMENTAL` to `True` in
+  `PalmDesktopHarness/PalmConfig.vb`; keep both `False` for IIIx.
 
 Rebuild both the native DLL and the VB harness after switching.
 
 The m100 profile includes the m100/Calvin hardware identity, 160x220 digitizer
 geometry, m100 key matrix, and LCD contrast PWM register. The m100 ROM shows
 Brightness rather than Contrast in the Pen shortcut list, but contrast writes
-are still modeled for display rendering. The IIIx profile keeps desktop LCD
-contrast fixed at maximum because its ROM does not normally expose that
-software control.
+are still modeled for display rendering. The IIIc profile adds the SED1375
+color LCD path and 8 MB RAM map. The IIIx profile keeps desktop LCD contrast
+fixed at maximum because its ROM does not normally expose that software
+control.
 
 The desktop LCD palette is also profile-owned in
 `PalmDesktopHarness/PalmConfig.vb`; see
 [HARDWARE_PROFILES.md](HARDWARE_PROFILES.md#desktop-lcd-palette) for the
 current normal LCD and inverted green backlight RGB values.
 
-## Serial Keyboard
+## External Keyboards
 
-Serial Palm/Stowaway keyboard emulation is currently incomplete and disabled in
-the UI. The real keyboard shares the HotSync/DCD line and waits for an RTS
-low-to-high handshake before sending the `FA FD` ID bytes; the current emulator
-model can wake the HotSync app instead of the keyboard driver, so the feature is
-left in code only for future work.
+External serial/IR keyboard emulation is disabled in normal builds. The tested
+keyboard drivers either target newer Palm OS releases or depend on hardware
+handshakes that conflict with HotSync behavior on the current profiles. Native
+Palm input remains Graffiti, the on-screen keyboard, touch, and
+the hardware application buttons.
 
 ## ESP32 / CYD Notes
 

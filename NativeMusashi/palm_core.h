@@ -59,6 +59,7 @@ PALM_EXPORT int palm_native_load_state(const uint8_t *buffer, uint32_t buffer_si
 
 PALM_EXPORT uint32_t palm_native_get_pc(void);
 PALM_EXPORT uint32_t palm_native_get_sp(void);
+PALM_EXPORT uint32_t palm_native_get_sr(void);
 PALM_EXPORT uint32_t palm_native_get_d0(void);
 PALM_EXPORT uint32_t palm_native_get_a0(void);
 PALM_EXPORT uint32_t palm_native_get_d(int index);
@@ -85,7 +86,11 @@ PALM_EXPORT void palm_native_set_pen(int down, uint16_t x, uint16_t y);
 PALM_EXPORT void palm_native_set_pen_raw(int down, uint16_t raw_x, uint16_t raw_y);
 PALM_EXPORT void palm_native_set_button_bits(uint16_t bits, int down);
 PALM_EXPORT void palm_native_set_power_button(int down);
+PALM_EXPORT void palm_native_set_cradle_button(int down);
+PALM_EXPORT void palm_native_set_in_cradle(int in_cradle);
+PALM_EXPORT int palm_native_get_in_cradle(void);
 PALM_EXPORT void palm_native_set_hotsync_button(int down);
+PALM_EXPORT void palm_native_pulse_irq1(void);
 
 PALM_EXPORT uint32_t palm_native_uart_write_rx(const uint8_t *buffer, uint32_t count);
 PALM_EXPORT uint32_t palm_native_uart_read_tx(uint8_t *buffer, uint32_t count);
@@ -94,6 +99,9 @@ PALM_EXPORT uint32_t palm_native_uart_tx_count(void);
 PALM_EXPORT uint32_t palm_native_uart_rx_overrun_count(void);
 PALM_EXPORT uint32_t palm_native_uart_tx_overrun_count(void);
 PALM_EXPORT uint16_t palm_native_uart_misc(void);
+PALM_EXPORT uint32_t palm_native_uart_is_irda(void);
+PALM_EXPORT uint32_t palm_native_event_wakeup(void);
+PALM_EXPORT uint32_t palm_native_show_brightness_adjust(void);
 
 PALM_EXPORT uint16_t palm_native_ads_channel_conversion(int channel);
 PALM_EXPORT uint32_t palm_native_ads_channel_count(int channel);

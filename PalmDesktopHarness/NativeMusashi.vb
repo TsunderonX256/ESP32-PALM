@@ -112,6 +112,18 @@ Namespace PalmDesktopHarness
         Friend Shared Function palm_native_uart_misc() As UShort
         End Function
 
+        <DllImport("PalmMusashi.dll", CallingConvention:=CallingConvention.Cdecl)>
+        Friend Shared Function palm_native_uart_is_irda() As UInteger
+        End Function
+
+        <DllImport("PalmMusashi.dll", CallingConvention:=CallingConvention.Cdecl)>
+        Friend Shared Function palm_native_event_wakeup() As UInteger
+        End Function
+
+        <DllImport("PalmMusashi.dll", CallingConvention:=CallingConvention.Cdecl)>
+        Friend Shared Function palm_native_show_brightness_adjust() As UInteger
+        End Function
+
         ' PWM buzzer state
         <DllImport("PalmMusashi.dll", CallingConvention:=CallingConvention.Cdecl)>
         Friend Shared Function palm_native_sound_enabled() As Integer
@@ -132,6 +144,10 @@ Namespace PalmDesktopHarness
 
         <DllImport("PalmMusashi.dll", CallingConvention:=CallingConvention.Cdecl)>
         Friend Shared Function palm_native_get_sp() As UInteger
+        End Function
+
+        <DllImport("PalmMusashi.dll", CallingConvention:=CallingConvention.Cdecl)>
+        Friend Shared Function palm_native_get_sr() As UInteger
         End Function
 
         <DllImport("PalmMusashi.dll", CallingConvention:=CallingConvention.Cdecl)>
@@ -192,6 +208,10 @@ Namespace PalmDesktopHarness
         End Function
 
         <DllImport("PalmMusashi.dll", CallingConvention:=CallingConvention.Cdecl)>
+        Friend Shared Function palm_native_lcd_palette(index As Byte) As UInteger
+        End Function
+
+        <DllImport("PalmMusashi.dll", CallingConvention:=CallingConvention.Cdecl)>
         Friend Shared Function palm_native_lcd_dirty() As Integer
         End Function
 
@@ -217,7 +237,23 @@ Namespace PalmDesktopHarness
         End Sub
 
         <DllImport("PalmMusashi.dll", CallingConvention:=CallingConvention.Cdecl)>
+        Friend Shared Sub palm_native_set_cradle_button(down As Integer)
+        End Sub
+
+        <DllImport("PalmMusashi.dll", CallingConvention:=CallingConvention.Cdecl)>
+        Friend Shared Sub palm_native_set_in_cradle(inCradle As Integer)
+        End Sub
+
+        <DllImport("PalmMusashi.dll", CallingConvention:=CallingConvention.Cdecl)>
+        Friend Shared Function palm_native_get_in_cradle() As Integer
+        End Function
+
+        <DllImport("PalmMusashi.dll", CallingConvention:=CallingConvention.Cdecl)>
         Friend Shared Sub palm_native_set_hotsync_button(down As Integer)
+        End Sub
+
+        <DllImport("PalmMusashi.dll", CallingConvention:=CallingConvention.Cdecl)>
+        Friend Shared Sub palm_native_pulse_irq1()
         End Sub
 
         <DllImport("PalmMusashi.dll", CallingConvention:=CallingConvention.Cdecl)>

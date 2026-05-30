@@ -21,6 +21,7 @@ static bool penDown = false;
 static uint16_t penXRaw = 0;
 static uint16_t penYRaw = 0;
 static uint16_t buttonBitsDown = 0;
+static bool cradleButtonLineLow = false;
 static uint8_t portDEdge = 0;
 
 static constexpr uint8_t PORT_D_POWER_FAIL = 0x80;
@@ -43,6 +44,8 @@ static constexpr uint16_t INT_LO_INT1 = 0x0200;
 static constexpr uint16_t INT_LO_INT2 = 0x0400;
 static constexpr uint16_t INT_LO_INT3 = 0x0800;
 static constexpr uint16_t INT_LO_ALL_KEYS = 0x0f00;
+static constexpr uint16_t ICR_POL1 = 0x8000;
+static constexpr uint16_t ICR_ET1 = 0x0800;
 static constexpr uint16_t SPIM_ENABLE = 0x0200;
 static constexpr uint16_t SPIM_EXCHANGE = 0x0100;
 static constexpr uint16_t SPIM_INT_STATUS = 0x0080;
@@ -92,7 +95,26 @@ static uint32_t get32(uint16_t offset) {
   return (static_cast<uint32_t>(get16(offset)) << 16) | get16(offset + 2);
 }
 
+static bool irq1IsEdgeTriggered() {
+  return (get16(0x302) & ICR_ET1) != 0;
+}
+
+static bool cradleButtonIrq1Asserted() {
+  bool activeHigh = (get16(0x302) & ICR_POL1) != 0;
+  return activeHigh ? !cradleButtonLineLow : cradleButtonLineLow;
+}
+
+static void updateCradleIrq1Level() {
+  if (irq1IsEdgeTriggered()) return;
+  if (cradleButtonIrq1Asserted()) {
+    put16(0x310, get16(0x310) | INT_HI_IRQ1);
+  } else {
+    put16(0x310, get16(0x310) & ~INT_HI_IRQ1);
+  }
+}
+
 static void updateInterruptStatus() {
+  updateCradleIrq1Level();
   put16(0x30C, get16(0x310) & ~get16(0x304));
   put16(0x30E, get16(0x312) & ~get16(0x306));
 }
@@ -415,6 +437,7 @@ void palmHwInit() {
   penXRaw = 0;
   penYRaw = 0;
   buttonBitsDown = 0;
+  cradleButtonLineLow = false;
   portDEdge = 0;
 
   // DragonBall EZ defaults copied from Cloudpilot's EmRegsEZ reset image.
@@ -505,6 +528,21 @@ void palmHwSetPowerButton(bool down) {
   palmHwSetButtonBits(KEY_BIT_POWER, down);
 }
 
+void palmHwSetCradleButton(bool down) {
+  bool oldAsserted = cradleButtonIrq1Asserted();
+  cradleButtonLineLow = down;
+  bool newAsserted = cradleButtonIrq1Asserted();
+
+  if (irq1IsEdgeTriggered()) {
+    if (!oldAsserted && newAsserted) {
+      put16(0x310, get16(0x310) | INT_HI_IRQ1);
+    }
+  } else {
+    updateCradleIrq1Level();
+  }
+  updateInterruptStatus();
+}
+
 void palmHwSetButtonBits(uint16_t bits, bool down) {
   uint8_t oldKeyBits = portDKeyBits();
   uint16_t before = buttonBitsDown;
@@ -588,6 +626,17 @@ void palmHwWrite8(uint32_t address, uint8_t value) {
     return;
   }
 
+  if (offset == 0x30C || offset == 0x30D) {
+    if (offset == 0x30D && (value & static_cast<uint8_t>(INT_HI_IRQ1)) != 0 && irq1IsEdgeTriggered()) {
+      put16(0x310, get16(0x310) & ~INT_HI_IRQ1);
+    }
+    updateInterruptStatus();
+    ++hwDebug.regWriteCount;
+    hwDebug.lastRegWriteOffset = offset;
+    hwDebug.lastRegWriteValue = value;
+    return;
+  }
+
   dbRegs[offset] = value;
   if (offset == 0x419) {
     portDEdge &= static_cast<uint8_t>(~(value & dbRegs[0x41F]));
@@ -604,7 +653,7 @@ void palmHwWrite8(uint32_t address, uint8_t value) {
       updateInterruptStatus();
     }
   }
-  if (offset >= 0x304 && offset <= 0x313) updateInterruptStatus();
+  if (offset >= 0x302 && offset <= 0x313) updateInterruptStatus();
   if ((offset >= 0x418 && offset <= 0x41F) || offset == 0x408 || offset == 0x409 ||
       offset == 0x410 || offset == 0x411 || offset == 0x428 || offset == 0x429) {
     updatePortDInterrupts();

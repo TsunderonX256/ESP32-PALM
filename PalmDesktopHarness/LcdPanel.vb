@@ -17,6 +17,7 @@ Namespace PalmDesktopHarness
         Private frameBpp As Integer = 1
         Private framePan As Integer
         Private frameContrast As UShort
+        Private framePalette As UInteger()
         Private displayMode As DisplayRenderMode = DisplayRenderMode.NormalMono
         Private lastPoint As Point
         Private isDisplayAsleep As Boolean
@@ -30,13 +31,14 @@ Namespace PalmDesktopHarness
             MinimumSize = Size
         End Sub
 
-        Public Sub UpdateFrame(bytes As Byte(), width As Integer, height As Integer, pitch As Integer, bpp As Integer, pan As Integer)
+        Public Sub UpdateFrame(bytes As Byte(), width As Integer, height As Integer, pitch As Integer, bpp As Integer, pan As Integer, Optional palette As UInteger() = Nothing)
             frameBytes = bytes
             frameWidth = width
             frameHeight = height
             framePitch = pitch
             frameBpp = bpp
             framePan = pan
+            framePalette = palette
             Invalidate()
         End Sub
 
@@ -101,7 +103,8 @@ Namespace PalmDesktopHarness
                         e.Graphics.FillRectangle(bg, lcdRect)
                     End Using
 
-                    For i = 1 To maxValue
+                    Dim firstBrush = If(UseFramePalette(), 0, 1)
+                    For i = firstBrush To maxValue
                         brushes(i) = New SolidBrush(PixelColor(i, maxValue))
                     Next
 
@@ -109,7 +112,7 @@ Namespace PalmDesktopHarness
                         Dim row = y * framePitch
                         For x = 0 To drawWidth - 1
                             Dim value = GetPixelValue(row, x + framePan)
-                            If value > 0 Then
+                            If value > 0 OrElse UseFramePalette() Then
                                 e.Graphics.FillRectangle(brushes(value), x * scaleX, y * lcdScaleY, Math.Max(1.0F, scaleX), Math.Max(1.0F, lcdScaleY))
                             End If
                         Next
@@ -155,6 +158,15 @@ Namespace PalmDesktopHarness
         End Function
 
         Private Function PixelColor(value As Integer, maxValue As Integer) As Color
+            If UseFramePalette() AndAlso value >= 0 AndAlso value < framePalette.Length Then
+                Dim argb = framePalette(value)
+                Dim scale = Math.Max(0.15, ContrastLevel())
+                Return Color.FromArgb(255,
+                                      CInt(((argb >> 16) And &HFFUI) * scale),
+                                      CInt(((argb >> 8) And &HFFUI) * scale),
+                                      CInt((argb And &HFFUI) * scale))
+            End If
+
             Dim level = Math.Max(0.0, Math.Min(1.0, value / CDbl(Math.Max(1, maxValue))))
 
             Select Case displayMode
@@ -168,6 +180,10 @@ Namespace PalmDesktopHarness
                     shade = Math.Max(0, Math.Min(255, shade))
                     Return Color.FromArgb(shade, shade, shade)
             End Select
+        End Function
+
+        Private Function UseFramePalette() As Boolean
+            Return framePalette IsNot Nothing AndAlso framePalette.Length > 0 AndAlso displayMode = DisplayRenderMode.NormalMono
         End Function
 
         Private Function MonoLcdInkLevel() As Double

@@ -40,7 +40,9 @@
 #define M68K_LOG_ENABLE           OPT_OFF
 #define M68K_LOG_1010_1111        OPT_OFF
 
+#ifndef M68K_DASM_ENABLE
 #define M68K_DASM_ENABLE          OPT_OFF
+#endif
 
 /* Static decode table: consumes flash, not scarce ESP32 DRAM. */
 #define M68K_DYNAMIC_INSTR_TABLES OPT_OFF

@@ -10,6 +10,7 @@ PalmDesktopHarness/bin/
 PalmDesktopHarness/obj/
 PalmRamProbe/bin/
 PalmRamProbe/obj/
+Tools/M68kDasm/build*/
 
 # Emulator runtime state and desktop sync data
 HotSync/
@@ -34,6 +35,7 @@ palm_state.bin
 # Reference source trees kept locally for research.
 cloudpilot_ref/
 cyd_ref/
+prc_keyboard*_analysis/
 
 # Musashi emulator tests/examples are not needed for this project build.
 Musashi-master/example/

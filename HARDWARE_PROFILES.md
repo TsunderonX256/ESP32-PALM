@@ -4,13 +4,15 @@ The emulator is built around one Palm hardware profile at a time. Runtime
 switching is intentionally avoided so each build has one ROM mapping, RAM map,
 LCD geometry, digitizer geometry, and device identity.
 
-## Supported Profile
+## Supported Profiles
 
 - `IIIX`: current working Palm IIIx profile.
 - `M100_EXPERIMENTAL`: current working Palm m100 profile for
   `Palm-m100-3.51-en.rom`.
+- `IIIC_EXPERIMENTAL`: current working Palm IIIc/Austin desktop profile for
+  `Palm-IIIc-4.1-en.rom`.
 
-## Experimental Profile
+## Profile Notes
 
 - `M100_EXPERIMENTAL`: uses the m100-class 160x160 LCD plus 60-pixel
   silkscreen geometry, Calvin/m100 hardware ID bits, the m100 key matrix, and
@@ -23,6 +25,9 @@ LCD geometry, digitizer geometry, and device identity.
   when the ROM writes it.
 - The IIIx profile keeps desktop contrast fixed at maximum because this ROM
   does not expose a software brightness/contrast control in normal use.
+- The IIIc profile uses an 8 MB RAM map and the external Epson SED1375 color
+  LCD controller at `$1F000000`. This is intentionally separate from the
+  DragonBall EZ LCD path used by IIIx and m100.
 
 ## Switching Profiles
 
@@ -54,6 +59,20 @@ and in `PalmDesktopHarness/PalmConfig.vb`:
 #Const PALM_PROFILE_M100_EXPERIMENTAL = True
 ```
 
+For IIIc:
+
+```powershell
+cmake -S NativeMusashi -B NativeMusashi\build-release -DPALM_PROFILE=IIIC_EXPERIMENTAL
+cmake --build NativeMusashi\build-release
+```
+
+and in `PalmDesktopHarness/PalmConfig.vb`:
+
+```vb
+#Const PALM_PROFILE_M100_EXPERIMENTAL = False
+#Const PALM_PROFILE_IIIC_EXPERIMENTAL = True
+```
+
 After switching either profile, rebuild the VB harness so the current
 `PalmMusashi.dll` and ROM are copied into the app output folder.
 
@@ -71,6 +90,7 @@ Accepted `PALM_PROFILE` values:
 
 - `IIIX`
 - `M100_EXPERIMENTAL`
+- `IIIC_EXPERIMENTAL`
 
 ## VB Harness
 
@@ -79,10 +99,13 @@ The VB harness currently selects its profile with a conditional constant in
 
 ```vb
 #Const PALM_PROFILE_M100_EXPERIMENTAL = False
+#Const PALM_PROFILE_IIIC_EXPERIMENTAL = False
 ```
 
-Keep this `False` for the IIIx build. Set it to `True` for the m100 build, and
-make sure the matching ROM file exists beside the EXE.
+Keep both `False` for the IIIx build. Set only `PALM_PROFILE_M100_EXPERIMENTAL`
+to `True` for the m100 build, or only `PALM_PROFILE_IIIC_EXPERIMENTAL` to
+`True` for the IIIc build. Make sure the matching ROM file exists beside the
+EXE.
 
 Current desktop profile files:
 
@@ -90,6 +113,8 @@ Current desktop profile files:
 - IIIx state: `palm_iiix_state.bin`
 - m100 ROM: `Palm-m100-3.51-en.rom`
 - m100 state: `palm_m100_state.bin`
+- IIIc ROM: `Palm-IIIc-4.1-en.rom`
+- IIIc state: `palm_iiic_state.bin`
 
 ## Desktop LCD Palette
 
@@ -126,21 +151,28 @@ m100 Note Pad data:
 - Current HotSync support exports records to 1-bit BMP files under
   `HotSync/NotePad`.
 
-## Serial Keyboard
+## External Keyboards
 
-Serial Palm/Stowaway keyboard emulation is incomplete and disabled in the
-desktop UI. The experimental code is intentionally kept but hidden because the
-keyboard shares the HotSync/DCD signal on real hardware, and the current DCD
-model tends to start HotSync instead of letting the keyboard driver complete its
-RTS handshake. The intended protocol from Think Outside's hardware reference is:
+External keyboard emulation is intentionally disabled for the current OS 3.x
+profiles. The serial/Stowaway experiment was removed from the normal source
+surface because the tested driver handshakes share the cradle button/IRQ1 line
+and can fight HotSync. The IR keyboard driver path appears to require Palm OS
+4-era Serial/IrDA behavior, so it is not part of the normal profile surface.
 
-- `FA FD` keyboard ID
-- `0x00..0x7F` key-down scan codes
-- `0x80 | scanCode` key-up scan codes
-- final key-up is sent twice when no other keys are held
+The hardware UART still models the IIIx-style IR route: `uMisc.IRDAEn` (`$0020`)
+selects IRDA mode and transmitted bytes echo back to receive, matching the
+half-duplex IR circuit. That behavior belongs to the device profile even though
+no external keyboard is currently exposed.
 
-Future work should model the shared DCD/HotSync edge and RTS low-to-high timing
-without causing the HotSync app to claim the event.
+## Cradle Button / IRQ1
+
+The cradle HotSync button is modeled as an active-low physical line feeding
+DragonBall EZ IRQ1. The emulator honors the IRQ1 polarity and edge/level mode
+bits in ICR (`$302`): level mode follows the line until release, while edge mode
+latches IRQ1 on the active transition and lets Palm OS clear it by writing the
+IRQ1 bit to ISR (`$30D`). The public desktop API name is
+`palm_native_set_cradle_button`; the older HotSync-named entry point remains as a
+compatibility alias.
 
 ## ESP32 Build
 
@@ -157,3 +189,12 @@ or:
 ```c
 #define PALM_HARDWARE_PROFILE PALM_PROFILE_M100_EXPERIMENTAL
 ```
+
+or, for desktop/header parity only:
+
+```c
+#define PALM_HARDWARE_PROFILE PALM_PROFILE_IIIC_EXPERIMENTAL
+```
+
+The ESP32/CYD path does not currently implement the IIIc SED1375 color LCD
+controller, so IIIc remains a desktop-oriented profile for now.

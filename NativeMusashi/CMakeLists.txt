@@ -4,8 +4,8 @@ project(PalmMusashi C)
 # Keep this native profile in sync with PalmDesktopHarness/PalmConfig.vb.
 # The VB harness chooses the ROM/state filename while this DLL chooses the
 # hardware map; mismatches can produce confusing boot or persistence bugs.
-set(PALM_PROFILE "IIIX" CACHE STRING "Palm hardware profile: IIIX or M100_EXPERIMENTAL")
-set_property(CACHE PALM_PROFILE PROPERTY STRINGS IIIX M100_EXPERIMENTAL)
+set(PALM_PROFILE "IIIX" CACHE STRING "Palm hardware profile: IIIX, M100_EXPERIMENTAL, or IIIC_EXPERIMENTAL")
+set_property(CACHE PALM_PROFILE PROPERTY STRINGS IIIX M100_EXPERIMENTAL IIIC_EXPERIMENTAL)
 
 add_library(PalmMusashi SHARED
     palm_musashi_bridge.c
@@ -24,9 +24,11 @@ target_compile_definitions(PalmMusashi PRIVATE
 )
 
 if (PALM_PROFILE STREQUAL "M100_EXPERIMENTAL")
-    target_compile_definitions(PalmMusashi PRIVATE PALM_HARDWARE_PROFILE=2)
+    target_compile_definitions(PalmMusashi PRIVATE PALM_HARDWARE_PROFILE=PALM_PROFILE_M100_EXPERIMENTAL)
+elseif (PALM_PROFILE STREQUAL "IIIC_EXPERIMENTAL")
+    target_compile_definitions(PalmMusashi PRIVATE PALM_HARDWARE_PROFILE=PALM_PROFILE_IIIC_EXPERIMENTAL)
 elseif (PALM_PROFILE STREQUAL "IIIX")
-    target_compile_definitions(PalmMusashi PRIVATE PALM_HARDWARE_PROFILE=1)
+    target_compile_definitions(PalmMusashi PRIVATE PALM_HARDWARE_PROFILE=PALM_PROFILE_IIIX)
 else()
     message(FATAL_ERROR "Unsupported PALM_PROFILE: ${PALM_PROFILE}")
 endif()

@@ -12,6 +12,7 @@
   <ItemGroup>
     <None Include="..\Palm-IIIx-3.1.rom" Link="Palm-IIIx-3.1.rom" CopyToOutputDirectory="PreserveNewest" />
     <None Include="..\Palm-m100-3.51-en.rom" Link="Palm-m100-3.51-en.rom" CopyToOutputDirectory="PreserveNewest" Condition="Exists('..\Palm-m100-3.51-en.rom')" />
+    <None Include="..\Palm-IIIc-4.1-en.rom" Link="Palm-IIIc-4.1-en.rom" CopyToOutputDirectory="PreserveNewest" Condition="Exists('..\Palm-IIIc-4.1-en.rom')" />
     <None Include="..\NativeMusashi\build-release\PalmMusashi.dll" Link="PalmMusashi.dll" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>
