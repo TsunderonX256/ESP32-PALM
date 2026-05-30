@@ -86,6 +86,7 @@ Namespace PalmDesktopHarness
         Private rxPadpExpectedSize As Integer
         Private ReadOnly rxPadpPayload As New List(Of Byte)
         Private Const VerboseSerialLog As Boolean = False
+        Private Const EnableHotSyncTrace As Boolean = False
         Private Const PadpChunkSize As Integer = 200
         Private Const PalmMemoMaxBytes As Integer = 4096
         Private Const DlpCmdReadUserInfo As Byte = &H10
@@ -2338,6 +2339,7 @@ Namespace PalmDesktopHarness
         End Function
 
         Private Sub AppendHotSyncTrace(message As String)
+            If Not EnableHotSyncTrace Then Return
             Try
                 File.AppendAllText(hotSyncTracePath, $"{DateTime.Now:HH:mm:ss.fff} {message}{Environment.NewLine}")
             Catch
