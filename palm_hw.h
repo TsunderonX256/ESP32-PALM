@@ -41,6 +41,7 @@ void palmHwSetPenRaw(bool down, uint16_t rawX, uint16_t rawY);
 void palmHwSetButtonBits(uint16_t bits, bool down);
 void palmHwSetPowerButton(bool down);
 void palmHwSetCradleButton(bool down);
+void palmHwAdvanceCycles(uint32_t cycles);
 void palmHwCycle();
 uint8_t palmHwGetInterruptLevel();
 bool palmHwIsAsleep();

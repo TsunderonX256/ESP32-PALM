@@ -37,12 +37,18 @@ static PalmMemoryDebug memoryDebug;
 
 static void *palmAlloc(size_t size) {
 #if defined(ESP32)
+#if PALM_PREFER_PSRAM && defined(MALLOC_CAP_SPIRAM)
+  void *ptr = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (ptr != nullptr) return ptr;
+  return heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+#else
   void *ptr = heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   if (ptr != nullptr) return ptr;
 #if defined(MALLOC_CAP_SPIRAM)
   return heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 #else
   return nullptr;
+#endif
 #endif
 #else
   return malloc(size);
@@ -145,7 +151,11 @@ bool palmMemoryInit() {
   palmRamSizeBytes = sizeof(palmRamStatic);
 #else
   memset(palmRamSegments, 0, sizeof(palmRamSegments));
-  static const size_t blockSizes[] = {65536, 32768, 16384, 8192, 4096, 2048, 1024, 512, 256, 128, 64};
+  static const size_t blockSizes[] = {
+#if PALM_PREFER_PSRAM
+      1048576, 524288, 262144, 131072,
+#endif
+      65536, 32768, 16384, 8192, 4096, 2048, 1024, 512, 256, 128, 64};
   for (size_t b = 0; b < sizeof(blockSizes) / sizeof(blockSizes[0]) &&
                      palmRamSizeBytes < PALM_RAM_ALLOC_TARGET_SIZE &&
                      palmRamSegmentCount < RAM_MAX_SEGMENTS; ++b) {

@@ -1,13 +1,13 @@
 # ESP32-PALM
 
-ESP32-PALM is an experimental Palm OS emulator project. It started as a
-bring-up attempt for the ESP32 CYD, then grew a desktop harness that now runs
-Palm OS well enough to use apps, HotSync files, persist RAM state, and emulate
-basic Palm buzzer audio.
+ESP32-PALM is an experimental Palm OS emulator project. It includes a Windows
+desktop harness that runs Palm OS well enough to use apps, HotSync files,
+persist RAM state, and emulate basic Palm buzzer audio, plus an ESP32+PSRAM
+hardware target.
 
-The current most usable target is the Windows desktop harness. The ESP32 CYD
-target is kept in the tree, but a non-PSRAM CYD does not have enough practical
-RAM headroom for the current core.
+The current most usable target is the Windows desktop harness. The embedded
+target is the ESP32-4827S043C board with 16 MB flash, 8 MB PSRAM, 480x272 RGB
+LCD, and GT911 touch.
 
 ## Current Status
 
@@ -15,7 +15,8 @@ RAM headroom for the current core.
 - Palm IIIx profile is still supported by the native core and harness.
 - Palm IIIc support is experimental. It uses the Palm IIIc/Austin hardware
   profile, 8 MB RAM, and the SED1375 color LCD path.
-- ESP32 CYD build is experimental and likely needs PSRAM for practical use.
+- ESP32 support is experimental and targets the ESP32-4827S043C with PSRAM,
+  RGB LCD, and GT911 touch.
 - Native emulator core is exposed through `NativeMusashi/palm_core.h` for future
   hosts such as SDL, Android, Linux, or ESP32+PSRAM.
 
@@ -37,7 +38,7 @@ RAM headroom for the current core.
 ## Repository Layout
 
 ```text
-ESP32-PALM.ino             Arduino sketch for ESP32/CYD experiments
+ESP32-PALM.ino             Arduino sketch for the ESP32-4827S043C target
 NativeMusashi/             Native C Palm hardware/CPU bridge
 PalmDesktopHarness/        VB.NET WinForms desktop emulator
 PalmRamProbe/              Desktop RAM limit test harness
@@ -181,20 +182,27 @@ handshakes that conflict with HotSync behavior on the current profiles. Native
 Palm input remains Graffiti, the on-screen keyboard, touch, and
 the hardware application buttons.
 
-## ESP32 / CYD Notes
+## ESP32 Notes
 
-The Arduino sketch targets ESP32 CYD-style hardware with TFT and touch setup
-borrowed from the local CYD reference project. The non-PSRAM CYD is too tight
-for a comfortable Palm RAM allocation.
+The Arduino sketch targets the ESP32-4827S043C board, based on the
+local `cyd_ref/005638_005638_Jingcai_ESP32_4827S043C_simple_GT911_touch.ino`
+reference. That profile uses Arduino_GFX for the 480x272 RGB panel, GT911 touch,
+and PSRAM for Palm RAM.
 
-For a future ESP32+PSRAM pass, the likely direction is:
+The ESP32 path keeps:
 
 - Palm RAM in PSRAM
 - CPU/register/timer hot state in internal DRAM
 - ROM in flash
 - dirty/interval LCD updates only
-- real touch ADC mapped into the ADS/digitizer emulation
-- ESP32 LEDC output for Palm buzzer PWM
+- GT911 touch mapped into the ADS/digitizer emulation
+- room for future ESP32 LEDC output for Palm buzzer PWM
+
+Known-good Arduino CLI compile target for the ESP32-4827S043C profile:
+
+```bat
+"%LOCALAPPDATA%\Programs\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" compile --fqbn "esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi,CPUFreq=240,USBMode=hwcdc,UploadMode=default,CDCOnBoot=default" .
+```
 
 ## Future Porting
 

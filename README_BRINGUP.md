@@ -1,17 +1,15 @@
 # ESP32-PALM Bring-Up Notes
 
 This sketch is currently a hardware and memory scaffold for a minimal Palm OS
-emulator on the ESP32 CYD.
+emulator on the ESP32-4827S043C board.
 
 What is wired now:
 
-- CYD TFT/backlight/touch pins copied from `cyd_ref/ESP32_xAlarm.cpp`.
-- Sketch-local `User_Setup.h` for the common CYD ILI9341 TFT_eSPI pinout.
+- ESP32-4827S043C RGB LCD and GT911 touch pins copied from
+  `cyd_ref/005638_005638_Jingcai_ESP32_4827S043C_simple_GT911_touch.ino`.
 - Palm IIIx ROM embedded from `Palm-IIIx-3.1.rom` with `.incbin`.
-- Adaptive emulated Palm RAM at `0x00000000`. The sketch tries to back up to
-  256 KB with real 1 KB ESP32 heap pages, then rounds that real allocation down
-  to a stable bank size. Separately, the logical Palm RAM size is currently
-  faked as 4 MB because Cloudpilot marks Palm IIIx as a 4096 KB device.
+- Adaptive emulated Palm RAM at `0x00000000`. The ESP32-4827S043C profile tries
+  to allocate the full hardware profile RAM in PSRAM.
 - ROM mapped at `0x10c08000`; the supplied file is the Palm IIIx Big ROM image,
   so reset PC `0x10c0822a` maps to file offset `0x022a`.
 - The same file is also aliased at `0x10c00000` below the Big ROM base, because
@@ -21,18 +19,18 @@ What is wired now:
   16 MB (`0x10c08000` and `0xfffff000`), so 24-bit masking causes false RAM and
   register alias collisions. Musashi's reset SP/PC are seeded from the ROM
   vector so execution starts in ROM.
-- 160x160 1-bit Palm LCD renderer shown on the CYD LCD.
+- 160x160 1-bit Palm LCD renderer shown on the selected ESP32 LCD.
 - A top-of-16MB RAM alias maps the upper emulated RAM window ending at
   `0x01000000` back onto the allocated Palm RAM. Early Palm OS code writes into
   this `0x00ffxxxx` area before the LCD controller is initialized.
 - Musashi memory callback functions.
 - Musashi CPU integration enabled in `palm_config.h`.
-- Musashi core updated to the CYD-friendly fork used by `likeablob/cydintosh`,
+- Musashi core updated to the ESP32-friendly fork used by `likeablob/cydintosh`,
   configured for a 68000-only static decode table so the opcode table lives in
   flash instead of consuming about 256 KB of ESP32 DRAM.
 - First DragonBall EZ LCD register bridge at `0xfffff000`, based on Cloudpilot's
-  Palm IIIx/EZ register model. The CYD renderer now reads the LCD start address,
-  width, height, page width, panel control, and panning registers.
+  Palm IIIx/EZ register model. The ESP32 renderer now reads the LCD start
+  address, width, height, page width, panel control, and panning registers.
 - Direct 1-bit LCD rendering from emulated Palm memory. There is no extra local
   160x160 framebuffer copy; this saves 3200 bytes of ESP32 RAM and avoids touch
   input scribbling static into the Palm display area.
@@ -64,17 +62,11 @@ Current CPU switch in `palm_config.h`:
 #define PALM_ENABLE_MUSASHI 1
 ```
 
-The embedded ROM does not fit in the default 1.2 MB ESP32 app partition. In
-Arduino IDE, select:
-
-```text
-Tools > Partition Scheme > Huge APP (3MB No OTA/1MB SPIFFS)
-```
-
-The command-line build equivalent is:
+The embedded ROM does not fit in the default 1.2 MB ESP32 app partition. The
+command-line build for the ESP32-4827S043C target is:
 
 ```sh
-arduino-cli compile --fqbn "esp32:esp32:esp32:PartitionScheme=huge_app" .
+arduino-cli compile --fqbn "esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi,CPUFreq=240,USBMode=hwcdc,UploadMode=default,CDCOnBoot=default" .
 ```
 
 Expected first milestone:

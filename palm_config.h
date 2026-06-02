@@ -6,11 +6,12 @@
 
 #include "palm_profile.h"
 
-#define PALM_RAM_ALLOC_TARGET_SIZE (256UL * 1024UL)
-// The CYD build tries for the VB-proven 256K backing, but current ESP32
-// heap pressure leaves a little less available. Keep the logical RAM at 4MB
-// and allow testing with the largest physical backing we can grab.
-#define PALM_RAM_ALLOC_MIN_SIZE (238UL * 1024UL)
+// ESP32 target: ESP32-4827S043C with 16 MB flash, 8 MB PSRAM,
+// 480x272 RGB panel, and GT911 capacitive touch.
+#define PALM_RAM_ALLOC_TARGET_SIZE PALM_RAM_LOGICAL_SIZE
+#define PALM_RAM_ALLOC_MIN_SIZE PALM_RAM_LOGICAL_SIZE
+#define PALM_PREFER_PSRAM 1
+
 #define PALM_POST_RAM_INTERNAL_RESERVE 0
 #define PALM_RAM_STATIC_BACKING 0
 #define PALM_RAM_STATIC_FALLBACK_SIZE 0
@@ -19,13 +20,19 @@
 // maps to 0x10c08000; the reset vector 0x10c0822a therefore lands at file
 // offset 0x022a, where the real boot jump and "boot" marker live.
 
-#define PALM_CPU_SLICE_CYCLES 2000
+#define PALM_CPU_SLICE_CYCLES 10000
+#define PALM_CPU_BURST_MS 6
 #define PALM_LCD_REDRAW_INTERVAL_MS 100
+#define PALM_TOUCH_POLL_INTERVAL_MS 5
+#define PALM_TOUCH_RELEASE_DEBOUNCE_MS 30
 
 // Keep the ESP32 target as thin as possible. The VB harness is the place for
 // heavy diagnostics; this build spends RAM on Palm state and simple LCD blits.
-#define PALM_TOUCH_USE_CYD_RAW_ADC 1
-#define PALM_SERIAL_STATS 1
+// Match the VB harness' known-good "ADS raw / raw wide" path. The GT911 gives
+// calibrated panel coordinates, but Palm OS still expects ADS-style raw values.
+#define PALM_TOUCH_USE_RAW_ADC 1
+#define PALM_BOOT_SERIAL_STATS 1
+#define PALM_RUNTIME_SERIAL_STATS 1
 #define PALM_BOOT_STATUS_TEXT 0
 #define PALM_DRAW_STATIC_SHELL 1
 #define PALM_TRACE_UNMAPPED 0

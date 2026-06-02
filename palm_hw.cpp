@@ -8,8 +8,9 @@ static bool lcdFrameReady = true;
 static uint32_t lcdDirtyGeneration = 1;
 static uint32_t lcdLastDirtyMillis = 0;
 static PalmHwDebug hwDebug;
-static uint32_t lastTimerMillis = 0;
 static uint16_t lastTimerStatus = 0;
+static uint64_t systemCycles = 0;
+static double timerLastCycles = 0.0;
 static uint32_t lastRtcSecond = 0xffffffffUL;
 static uint32_t adsBitBufferIn = 0;
 static uint16_t adsBitBufferOut = 0;
@@ -159,21 +160,52 @@ bool palmHwIsAsleep() {
   return (get16(0x200) & PLL_CONTROL_DISABLE) != 0;
 }
 
-static void updateTimer() {
-  uint32_t now = millis();
-  if (lastTimerMillis == 0) lastTimerMillis = now;
-  uint32_t elapsed = now - lastTimerMillis;
-  if (elapsed == 0) return;
-  lastTimerMillis = now;
+static double systemClockFrequency() {
+  return PALM_SYSTEM_CLOCK_HZ;
+}
 
+static double timerTicksPerSecond() {
   uint16_t control = get16(0x600);
-  if ((control & TMR_CONTROL_ENABLE) == 0) return;
+  uint8_t clockSource = static_cast<uint8_t>((control >> 1) & 0x7);
+  double prescaler = static_cast<double>((get16(0x602) & 0x00ff) + 1);
 
-  uint16_t counter = get16(0x608) + static_cast<uint16_t>(elapsed);
-  put16(0x608, counter);
-  if (counter >= get16(0x604)) {
+  switch (clockSource) {
+    case 0x1:
+      return systemClockFrequency() / prescaler;
+    case 0x2:
+      return systemClockFrequency() / prescaler / 16.0;
+    default:
+      return (clockSource & 0x4) ? 32768.0 / prescaler : 0.0;
+  }
+}
+
+static void updateTimer() {
+  uint16_t control = get16(0x600);
+  if ((control & TMR_CONTROL_ENABLE) == 0) {
+    timerLastCycles = static_cast<double>(systemCycles);
+    return;
+  }
+
+  double timerHz = timerTicksPerSecond();
+  if (timerHz <= 0.0) {
+    timerLastCycles = static_cast<double>(systemCycles);
+    return;
+  }
+
+  double elapsedCycles = static_cast<double>(systemCycles) - timerLastCycles;
+  uint32_t ticks = static_cast<uint32_t>(elapsedCycles / systemClockFrequency() * timerHz);
+  if (ticks == 0) return;
+
+  timerLastCycles += static_cast<double>(ticks) / timerHz * systemClockFrequency();
+
+  uint32_t updatedCounter = static_cast<uint32_t>(get16(0x608)) + ticks;
+  uint16_t compare = get16(0x604);
+  put16(0x608, static_cast<uint16_t>(updatedCounter));
+  if (compare != 0 && updatedCounter >= compare) {
     put16(0x60A, get16(0x60A) | TMR_STATUS_COMPARE);
-    put16(0x608, counter - get16(0x604));
+    if ((control & 0x0100) == 0) {
+      put16(0x608, static_cast<uint16_t>(updatedCounter - compare));
+    }
     if ((control & TMR_CONTROL_INT_ENABLE) != 0) {
       put16(0x312, get16(0x312) | INT_LO_TIMER);
       updateInterruptStatus();
@@ -492,8 +524,9 @@ void palmHwInit() {
   lcdFrameReady = true;
   lcdDirtyGeneration = 1;
   lcdLastDirtyMillis = millis();
-  lastTimerMillis = millis();
   lastTimerStatus = 0;
+  systemCycles = 0;
+  timerLastCycles = 0.0;
   lastRtcSecond = 0xffffffffUL;
   memset(&hwDebug, 0, sizeof(hwDebug));
 }
@@ -556,6 +589,10 @@ void palmHwSetButtonBits(uint16_t bits, bool down) {
   uint8_t newKeyBits = portDKeyBits();
   portDEdge |= newKeyBits & static_cast<uint8_t>(~oldKeyBits);
   updatePortDInterrupts();
+}
+
+void palmHwAdvanceCycles(uint32_t cycles) {
+  systemCycles += cycles;
 }
 
 void palmHwCycle() {
