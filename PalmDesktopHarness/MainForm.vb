@@ -27,6 +27,9 @@ Namespace PalmDesktopHarness
         Private ReadOnly statePath As String
         Private ReadOnly hotSyncPath As String
         Private ReadOnly hotSyncTracePath As String
+        Private ReadOnly irdaCapturePath As String
+        Private ReadOnly irdaTracePath As String
+        Private ReadOnly irdaBeamLogPath As String
         Private cradleMenuItem As ToolStripMenuItem
         Private ReadOnly displayModeMenuItems As New List(Of ToolStripMenuItem)
         Private nativeReady As Boolean
@@ -46,7 +49,41 @@ Namespace PalmDesktopHarness
         Private powerWakeTouchActive As Boolean
         Private uartTxLogBuffer As New List(Of Byte)
         Private uartSlpRxBuffer As New List(Of Byte)
+        Private irdaFrameBuffer As New List(Of Byte)
         Private lastUartLogTick As Long
+        Private irdaInFrame As Boolean
+        Private irdaEscaped As Boolean
+        Private irdaRespondedInDiscovery As Boolean
+        Private irdaLastDiscoverySource As UInteger
+        Private irdaConnectionAddress As Byte
+        Private irdaConnectedResponseAddress As Byte
+        Private irdaConnectedPeer As UInteger
+        Private irdaReceiveNext As Byte
+        Private irdaTransmitNext As Byte
+        Private irdaLastInformationResponse As Byte()
+        Private irdaLastInformationResponseLabel As String = ""
+        Private irdaObexObjectName As String = ""
+        Private irdaObexObjectType As String = ""
+        Private ReadOnly irdaObexBody As New List(Of Byte)
+        Private ReadOnly irdaObexPacket As New List(Of Byte)
+        Private irdaObexExpectedLength As Integer
+        Private irdaObexClientLsap As Byte
+        Private pendingIrdaResponse As Byte()
+        Private pendingIrdaResponseLabel As String = ""
+        Private pendingIrdaResponseDueTick As Long
+        Private ReadOnly pendingIrdaResponses As New Queue(Of IrdaPendingResponse)
+        Private irdaTxQuietSinceTick As Long
+        Private irdaBeamState As IrdaBeamSendState = IrdaBeamSendState.Idle
+        Private irdaBeamPeerAddress As UInteger
+        Private irdaBeamConnectionAddress As Byte
+        Private irdaBeamReceiveNext As Byte
+        Private irdaBeamTransmitNext As Byte
+        Private irdaBeamFileName As String = ""
+        Private irdaBeamFileBytes As Byte()
+        Private irdaBeamOffset As Integer
+        Private irdaBeamLastProgressTick As Long
+        Private irdaBeamDiscoverySlot As Integer
+        Private irdaBeamEmptyEndBodySent As Boolean
         Private cmpHandshakeStarted As Boolean
         Private hostPadpTxId As Byte = 1
         Private cmpInitTxId As Byte
@@ -62,20 +99,6 @@ Namespace PalmDesktopHarness
         Private installAwaitingTxId As Byte
         Private installAppBlockDone As Boolean
         Private installSortBlockDone As Boolean
-        Private memoDbId As Byte
-        Private memoRecordCount As Integer
-        Private memoRecordIndex As Integer
-        Private memoWriteIndex As Integer
-        Private ReadOnly memoRecords As New List(Of MemoRecordMirror)
-        Private ReadOnly memoPendingWrites As New List(Of MemoRecordMirror)
-        Private noteDbId As Byte
-        Private noteDbNameIndex As Integer
-        Private noteDbListStartIndex As Integer
-        Private noteRecordCount As Integer
-        Private noteRecordIndex As Integer
-        Private ReadOnly noteDbNameCandidates As New List(Of String)
-        Private ReadOnly dbListEntries As New List(Of DbListEntry)
-        Private ReadOnly noteRecords As New List(Of NotePadRecordMirror)
         Private pendingPadpPayload As Byte()
         Private pendingPadpLabel As String = ""
         Private pendingPadpTxId As Byte
@@ -87,26 +110,51 @@ Namespace PalmDesktopHarness
         Private ReadOnly rxPadpPayload As New List(Of Byte)
         Private Const VerboseSerialLog As Boolean = False
         Private Const EnableHotSyncTrace As Boolean = False
+        Private Const EnableIrdaTrace As Boolean = False
+        Private Const IrdaSirBof As Byte = &HC0
+        Private Const IrdaSirEof As Byte = &HC1
+        Private Const IrdaSirEscape As Byte = &H7D
+        Private Const IrdaBroadcastAddress As Byte = &HFF
+        Private Const IrdaUiControl As Byte = &H3F
+        Private Const IrdaDiscoveryResponseAddress As Byte = &HFE
+        Private Const IrdaXidResponseControl As Byte = &HBF
+        Private Const IrdaXidFormat As Byte = &H1
+        Private Const IrdaSnrmControl As Byte = &H93
+        Private Const IrdaUaResponseControl As Byte = &H73
+        Private Const IrdaDiscControl As Byte = &H53
+        Private Const IrdaRrPollFinalControl As Byte = &H11
+        Private Const IrdaFinalBit As Byte = &H10
+        Private Const IrdaControlBit As Byte = &H80
+        Private Const IrdaLmpConnectCommand As Byte = &H1
+        Private Const IrdaLmpConnectConfirm As Byte = &H81
+        Private Const IrdaIasGetValueByClass As Byte = &H4
+        Private Const IrdaIasLast As Byte = &H80
+        Private Const IrdaIasSuccess As Byte = &H0
+        Private Const IrdaIasInteger As Byte = &H1
+        Private Const IrdaObexLsap As Byte = &H2
+        Private Const IrdaHostAddress As UInteger = &H45535032UI ' "ESP2"
+        Private Const IrdaTurnaroundDelayMs As Long = 20
+        Private Const IrdaConnectedTurnaroundDelayMs As Long = 0
+        Private Const IrdaTxQuietBeforeResponseMs As Long = 2
+        Private Const IrdaCyclesPerPoll As Integer = 100
+        Private Const IrdaBeamBodyChunkSize As Integer = 40
+        Private Const IrdaBeamDiscoveryRetryMs As Long = 250
+        Private Const IrdaBeamTimeoutMs As Long = 15000
         Private Const PadpChunkSize As Integer = 200
         Private Const PalmMemoMaxBytes As Integer = 4096
         Private Const DlpCmdReadUserInfo As Byte = &H10
         Private Const DlpCmdWriteUserInfo As Byte = &H11
         Private Const DlpCmdReadSysInfo As Byte = &H12
         Private Const DlpCmdReadStorageInfo As Byte = &H15
-        Private Const DlpCmdReadDBList As Byte = &H16
-        Private Const DlpCmdOpenDB As Byte = &H17
         Private Const DlpCmdCreateDB As Byte = &H18
         Private Const DlpCmdCloseDB As Byte = &H19
         Private Const DlpCmdDeleteDB As Byte = &H1A
         Private Const DlpCmdWriteAppBlock As Byte = &H1C
         Private Const DlpCmdWriteSortBlock As Byte = &H1E
-        Private Const DlpCmdReadRecord As Byte = &H20
         Private Const DlpCmdWriteRecord As Byte = &H21
         Private Const DlpCmdWriteResource As Byte = &H24
-        Private Const DlpCmdReadOpenDBInfo As Byte = &H2B
         Private Const DlpCmdEndOfSync As Byte = &H2F
         Private Const DlpArgFirstId As Byte = &H20
-        Private Const PalmRecordDeletedMask As Byte = &H80
         Private Const SleepTimerStepMs As Long = 10
         Private Const SleepCatchupMaxMs As Long = 250
         Private Const SleepWakeCycles As Integer = 60000
@@ -135,20 +183,34 @@ Namespace PalmDesktopHarness
             WritingResource
             CloseSent
             EndSent
-            MemoOpenSent
-            MemoInfoSent
-            MemoReadSent
-            MemoWriteSent
-            MemoCloseSent
-            MemoEndSent
-            NoteDbListSent
-            NoteOpenSent
-            NoteInfoSent
-            NoteReadSent
-            NoteCloseSent
-            NoteEndSent
             Done
             Failed
+        End Enum
+
+        Private NotInheritable Class IrdaPendingResponse
+            Public Sub New(frameBytes As Byte(), labelText As String, dueTick As Long)
+                Frame = frameBytes
+                Label = labelText
+                Due = dueTick
+            End Sub
+
+            Public ReadOnly Frame As Byte()
+            Public ReadOnly Label As String
+            Public ReadOnly Due As Long
+        End Class
+
+        Private Enum IrdaBeamSendState
+            Idle
+            Discover
+            Snrm
+            IasConnect
+            IasQuery
+            ObexLmpConnect
+            ObexConnect
+            ObexPutMeta
+            ObexPutBody
+            ObexDisconnect
+            LinkDisconnect
         End Enum
 
         Private Const KeyBitPower As UShort = &H1US
@@ -170,6 +232,9 @@ Namespace PalmDesktopHarness
             statePath = Path.Combine(AppContext.BaseDirectory, PalmConfig.StateFileName)
             hotSyncPath = Path.Combine(AppContext.BaseDirectory, "HotSync")
             hotSyncTracePath = Path.Combine(AppContext.BaseDirectory, "HotSyncTrace.log")
+            irdaCapturePath = Path.Combine(hotSyncPath, "IrDA")
+            irdaTracePath = Path.Combine(AppContext.BaseDirectory, "IrDATrace.log")
+            irdaBeamLogPath = Path.Combine(AppContext.BaseDirectory, "IrDABeam.log")
             romBytes = File.ReadAllBytes(romPath)
             memory = New PalmMemory(romPath, CInt(PalmConfig.RamLogicalSize))
 
@@ -235,6 +300,7 @@ Namespace PalmDesktopHarness
             Dim menu As New MenuStrip()
             Dim deviceItem As New ToolStripMenuItem("Device")
             deviceItem.DropDownItems.Add(CreateMenuItem("Install PRC/PDB...", AddressOf InstallPrcButton_Click))
+            deviceItem.DropDownItems.Add(CreateMenuItem("Beam File to Palm...", AddressOf BeamFileToPalmMenuItem_Click))
             If PalmConfig.ActiveHardwareProfile = PalmConfig.HardwareProfile.IIIcExperimental Then
                 cradleMenuItem = CreateMenuItem("In Cradle", AddressOf InCradleMenuItem_Click)
                 cradleMenuItem.CheckOnClick = True
@@ -502,6 +568,29 @@ Namespace PalmDesktopHarness
             End Using
         End Sub
 
+        Private Sub BeamFileToPalmMenuItem_Click(sender As Object, e As EventArgs)
+            If Not nativeReady Then
+                InitCpuButton_Click(Me, EventArgs.Empty)
+                If Not nativeReady Then Return
+            End If
+
+            Using dialog As New OpenFileDialog With {
+                .Title = "Beam file to Palm",
+                .Filter = "Palm/beamable files (*.prc;*.pdb;*.pqa;*.bas;*.txt;*.npd)|*.prc;*.pdb;*.pqa;*.bas;*.txt;*.npd|All files (*.*)|*.*",
+                .CheckFileExists = True,
+                .Multiselect = False
+            }
+                If dialog.ShowDialog(Me) <> DialogResult.OK Then Return
+
+                Try
+                    StartIrdaBeamSend(dialog.FileName)
+                Catch ex As Exception
+                    Append($"IrDA beam send failed: {ex.Message}")
+                    ResetIrdaBeamSender()
+                End Try
+            End Using
+        End Sub
+
         Private Sub BackupRamStateMenuItem_Click(sender As Object, e As EventArgs)
             If Not nativeReady Then
                 InitCpuButton_Click(Me, EventArgs.Empty)
@@ -580,8 +669,6 @@ Namespace PalmDesktopHarness
                         installState = HotSyncInstallState.Idle
                         installAppBlockDone = False
                         installSortBlockDone = False
-                        ResetMemoSync()
-                        ResetNotePadSync()
                         RefreshDebugStatus()
                         UpdateNativeLcdPreview()
                         Append($"RAM state restored: {dialog.FileName}")
@@ -738,9 +825,7 @@ Namespace PalmDesktopHarness
 
             If Not skipSleepingCpu Then
                 For i = 1 To PalmConfig.NativeAutoRunSlicesPerTick
-                    NativeMusashi.palm_native_execute(PalmConfig.NativeAutoRunCyclesPerSlice)
-                    PollNativeUart(False)
-                    ServiceHotSyncHost()
+                    ExecuteAutoRunSlice()
                 Next
                 nativeSlices += CUInt(PalmConfig.NativeAutoRunSlicesPerTick)
             End If
@@ -751,6 +836,25 @@ Namespace PalmDesktopHarness
             UpdateSleepVisualState()
 
             If ShouldRefreshAutoLcd() Then UpdateNativeLcdPreview()
+        End Sub
+
+        Private Sub ExecuteAutoRunSlice()
+            Dim cyclesRemaining = PalmConfig.NativeAutoRunCyclesPerSlice
+            If NativeMusashi.palm_native_uart_is_irda() = 0UI Then
+                NativeMusashi.palm_native_execute(cyclesRemaining)
+                PollNativeUart(False)
+                ServiceHotSyncHost()
+                Return
+            End If
+
+            While cyclesRemaining > 0
+                PollNativeUart(False)
+                Dim stepCycles = Math.Min(IrdaCyclesPerPoll, cyclesRemaining)
+                NativeMusashi.palm_native_execute(stepCycles)
+                PollNativeUart(False)
+                ServiceHotSyncHost()
+                cyclesRemaining -= stepCycles
+            End While
         End Sub
 
         Private Sub UpdateSound()
@@ -870,7 +974,10 @@ Namespace PalmDesktopHarness
         Private Sub PollNativeUart(forceLog As Boolean)
             Dim pending = NativeMusashi.palm_native_uart_tx_count()
             Dim hotSyncRouteEnabled = NativeMusashi.palm_native_uart_is_irda() = 0UI
+            Dim irdaRouteEnabled = Not hotSyncRouteEnabled
+            Dim nowTick = Environment.TickCount64
             If pending > 0UI Then
+                If irdaRouteEnabled Then irdaTxQuietSinceTick = 0
                 Dim buffer(CInt(Math.Min(256UI, pending)) - 1) As Byte
                 Dim read = NativeMusashi.palm_native_uart_read_tx(buffer, CUInt(buffer.Length))
                 For i = 0 To CInt(read) - 1
@@ -878,6 +985,8 @@ Namespace PalmDesktopHarness
                     uartTxLogBuffer.Add(value)
                     If hotSyncRouteEnabled Then
                         uartSlpRxBuffer.Add(value)
+                    Else
+                        ProcessIrdaByte(value)
                     End If
                 Next
                 If Not hotSyncRouteEnabled Then
@@ -887,7 +996,12 @@ Namespace PalmDesktopHarness
                 End If
             End If
 
-            Dim nowTick = Environment.TickCount64
+            If irdaRouteEnabled AndAlso NativeMusashi.palm_native_uart_tx_count() = 0UI AndAlso irdaTxQuietSinceTick = 0 Then
+                irdaTxQuietSinceTick = nowTick
+            End If
+            If irdaRouteEnabled Then SendPendingIrdaResponse()
+            ServiceIrdaBeamSender()
+
             If VerboseSerialLog AndAlso uartTxLogBuffer.Count > 0 AndAlso (forceLog OrElse nowTick - lastUartLogTick >= 250) Then
                 Append($"UART TX {uartTxLogBuffer.Count}: {FormatBytes(uartTxLogBuffer)}")
                 uartTxLogBuffer.Clear()
@@ -896,6 +1010,1044 @@ Namespace PalmDesktopHarness
                 uartTxLogBuffer.Clear()
                 lastUartLogTick = nowTick
             End If
+        End Sub
+
+        Private Sub ProcessIrdaByte(value As Byte)
+            Select Case value
+                Case IrdaSirBof
+                    irdaFrameBuffer.Clear()
+                    irdaInFrame = True
+                    irdaEscaped = False
+                    Return
+                Case IrdaSirEof
+                    If irdaInFrame AndAlso irdaFrameBuffer.Count >= 4 Then
+                        HandleIrdaFrame(irdaFrameBuffer.ToArray())
+                        SendPendingIrdaResponse()
+                    End If
+                    irdaFrameBuffer.Clear()
+                    irdaInFrame = False
+                    irdaEscaped = False
+                    Return
+            End Select
+
+            If Not irdaInFrame Then Return
+
+            If irdaEscaped Then
+                irdaFrameBuffer.Add(CByte(value Xor &H20))
+                irdaEscaped = False
+            ElseIf value = IrdaSirEscape Then
+                irdaEscaped = True
+            Else
+                irdaFrameBuffer.Add(value)
+            End If
+        End Sub
+
+        Private Sub StartIrdaBeamSend(filePath As String)
+            If String.IsNullOrWhiteSpace(filePath) Then Return
+
+            ResetIrdaBeamSender()
+            ResetIrdaConnectionState()
+            pendingIrdaResponse = Nothing
+            pendingIrdaResponses.Clear()
+
+            irdaBeamFileName = Path.GetFileName(filePath)
+            irdaBeamFileBytes = File.ReadAllBytes(filePath)
+            If Path.GetExtension(irdaBeamFileName).Equals(".txt", StringComparison.OrdinalIgnoreCase) Then
+                irdaBeamFileBytes = NormalizeIrdaBeamTextBytes(irdaBeamFileBytes)
+                If irdaBeamFileBytes.Length > PalmMemoMaxBytes Then
+                    Throw New InvalidOperationException($"Memo text is too large ({irdaBeamFileBytes.Length} bytes). Limit is {PalmMemoMaxBytes} bytes.")
+                End If
+            End If
+            irdaBeamConnectionAddress = &HC0
+            irdaBeamReceiveNext = 0
+            irdaBeamTransmitNext = 0
+            irdaBeamOffset = 0
+            irdaBeamDiscoverySlot = -1
+            irdaBeamEmptyEndBodySent = False
+            irdaBeamState = IrdaBeamSendState.Discover
+            irdaBeamLastProgressTick = 0
+
+            AppendIrdaBeamLog($"IrDA beam send starting: {irdaBeamFileName} ({irdaBeamFileBytes.Length} bytes).")
+            AppendIrdaBeamLog("Open Beam Receive on the Palm if it is not already listening.")
+            If NativeMusashi.palm_native_uart_is_irda() <> 0UI Then
+                SendIrdaBeamDiscovery()
+            Else
+                AppendIrdaBeamLog("IrDA beam send armed; waiting for Palm OS to enable IrDA UART.")
+            End If
+        End Sub
+
+        Private Sub ServiceIrdaBeamSender()
+            If irdaBeamState = IrdaBeamSendState.Idle Then Return
+            If NativeMusashi.palm_native_uart_is_irda() = 0UI Then Return
+
+            Dim nowTick = Environment.TickCount64
+            If irdaBeamState = IrdaBeamSendState.Discover Then
+                If irdaBeamLastProgressTick = 0 OrElse nowTick - irdaBeamLastProgressTick >= IrdaBeamDiscoveryRetryMs Then
+                    SendIrdaBeamDiscovery()
+                End If
+                Return
+            End If
+
+            If irdaBeamLastProgressTick <> 0 AndAlso nowTick - irdaBeamLastProgressTick < IrdaBeamTimeoutMs Then Return
+            AppendIrdaBeamLog($"IrDA beam send timed out at {irdaBeamState}.")
+            ResetIrdaBeamSender()
+        End Sub
+
+        Private Function HandleIrdaBeamSenderFrame(frame As Byte()) As Boolean
+            If frame.Length < 2 Then Return False
+            AppendIrdaBeamLog($"IrDA beam RX state={irdaBeamState} addr=${frame(0):X2} ctrl=${frame(1):X2} len={frame.Length}")
+
+            If irdaBeamState = IrdaBeamSendState.Discover AndAlso
+                frame.Length >= 13 AndAlso frame(0) = IrdaDiscoveryResponseAddress AndAlso frame(1) = IrdaXidResponseControl Then
+                irdaBeamPeerAddress = ReadU32(frame, 3)
+                irdaBeamLastProgressTick = Environment.TickCount64
+                AppendIrdaTrace($"BEAM peer XID ${irdaBeamPeerAddress:X8}")
+                AppendIrdaBeamLog($"IrDA beam peer found: ${irdaBeamPeerAddress:X8}")
+                irdaBeamState = IrdaBeamSendState.Snrm
+                SendIrdaBeamSnrm()
+                Return True
+            End If
+
+            If irdaBeamState = IrdaBeamSendState.Snrm AndAlso frame.Length >= 2 AndAlso frame(1) = IrdaUaResponseControl Then
+                irdaBeamReceiveNext = 0
+                irdaBeamTransmitNext = 0
+                irdaBeamLastProgressTick = Environment.TickCount64
+                AppendIrdaBeamLog("IrDA beam link established; connecting IAS.")
+                irdaBeamState = IrdaBeamSendState.IasConnect
+                SendIrdaBeamInformation(BuildLmpConnectPayload(0, 1, 0), "IAS-CONNECT")
+                Return True
+            End If
+
+            If frame(0) <> irdaBeamConnectionAddress AndAlso frame(0) <> (irdaBeamConnectionAddress Or 1) Then
+                AppendIrdaTrace($"BEAM ignored frame state={irdaBeamState} addr=${frame(0):X2} {FormatBytes(frame)}")
+                Return False
+            End If
+
+            Dim control = frame(1)
+            If IsIrdaReceiveReadyControl(control) Then
+                irdaBeamLastProgressTick = Environment.TickCount64
+                Return True
+            End If
+
+            If control = IrdaDiscControl Then
+                AppendIrdaBeamLog($"IrDA beam peer disconnected during {irdaBeamState}.")
+                SendIrdaBeamControl(IrdaUaResponseControl, "BEAM-UA-DISC")
+                ResetIrdaBeamSender()
+                Return True
+            End If
+
+            If Not IsIrdaInformationControl(control) Then
+                AppendIrdaTrace($"BEAM control state={irdaBeamState} ctrl=${control:X2} {FormatBytes(frame)}")
+                Return True
+            End If
+            If frame.Length < 4 Then
+                AppendIrdaTrace($"BEAM short I-frame state={irdaBeamState} {FormatBytes(frame)}")
+                Return True
+            End If
+
+            Dim sendSequence = CByte((control >> 1) And &H7)
+            If sendSequence = irdaBeamReceiveNext Then irdaBeamReceiveNext = CByte((irdaBeamReceiveNext + 1) And &H7)
+
+            Dim dataLength = frame.Length - 4
+            Dim data(dataLength - 1) As Byte
+            Array.Copy(frame, 2, data, 0, dataLength)
+            HandleIrdaBeamSenderPayload(data)
+            Return True
+        End Function
+
+        Private Sub HandleIrdaBeamSenderPayload(data As Byte())
+            irdaBeamLastProgressTick = Environment.TickCount64
+            If data.Length = 0 Then Return
+
+            Select Case irdaBeamState
+                Case IrdaBeamSendState.IasConnect
+                    If data.Length >= 4 AndAlso (data(0) And &H7F) = 1 AndAlso data(2) = IrdaLmpConnectConfirm Then
+                        ' Palm OS 3.x/4.x OBEX receive uses the standard TinyTP LSAP 2.
+                        ' Going directly keeps the sender small and avoids device-specific IAS quirks.
+                        AppendIrdaBeamLog("IrDA beam IAS connected; connecting OBEX.")
+                        irdaBeamState = IrdaBeamSendState.ObexLmpConnect
+                        SendIrdaBeamInformation(BuildLmpConnectPayload(IrdaObexLsap, 3, &H10), "OBEX-LMP-CONNECT")
+                    Else
+                        AppendIrdaBeamLog($"IrDA beam unexpected IAS response: {FormatBytes(data.Take(Math.Min(data.Length, 16)).ToArray())}")
+                    End If
+
+                Case IrdaBeamSendState.IasQuery
+                    If data.Length >= 4 Then
+                        AppendIrdaBeamLog("IrDA beam IAS query answered; connecting OBEX.")
+                        irdaBeamState = IrdaBeamSendState.ObexLmpConnect
+                        SendIrdaBeamInformation(BuildLmpConnectPayload(IrdaObexLsap, 3, &H10), "OBEX-LMP-CONNECT")
+                    End If
+
+                Case IrdaBeamSendState.ObexLmpConnect
+                    If data.Length >= 4 AndAlso data(2) = IrdaLmpConnectConfirm Then
+                        AppendIrdaBeamLog("IrDA beam OBEX link connected.")
+                        irdaBeamState = IrdaBeamSendState.ObexConnect
+                        SendIrdaBeamInformation(WrapTinyTpObex(BuildObexConnectPacket()), "OBEX-CONNECT")
+                    Else
+                        AppendIrdaBeamLog($"IrDA beam unexpected OBEX link response: {FormatBytes(data.Take(Math.Min(data.Length, 16)).ToArray())}")
+                    End If
+
+                Case IrdaBeamSendState.ObexConnect
+                    If IsObexResponse(data, &HA0) Then
+                        AppendIrdaBeamLog("IrDA beam OBEX connected; sending file metadata.")
+                        irdaBeamState = IrdaBeamSendState.ObexPutMeta
+                        SendIrdaBeamPutMetadata()
+                    Else
+                        AppendIrdaBeamLog($"IrDA beam unexpected OBEX connect response: {FormatBytes(data.Take(Math.Min(data.Length, 16)).ToArray())}")
+                    End If
+
+                Case IrdaBeamSendState.ObexPutMeta
+                    If IsObexResponse(data, &H90) OrElse IsObexResponse(data, &HA0) Then
+                        AppendIrdaBeamLog("IrDA beam metadata accepted; sending file body.")
+                        irdaBeamState = IrdaBeamSendState.ObexPutBody
+                        SendIrdaBeamNextBodyChunk()
+                    Else
+                        AppendIrdaBeamLog($"IrDA beam unexpected metadata response: {FormatBytes(data.Take(Math.Min(data.Length, 16)).ToArray())}")
+                    End If
+
+                Case IrdaBeamSendState.ObexPutBody
+                    If IsObexResponse(data, &H90) Then
+                        SendIrdaBeamNextBodyChunk()
+                    ElseIf IsObexResponse(data, &HA0) Then
+                        AppendIrdaBeamLog("IrDA beam body accepted; disconnecting.")
+                        irdaBeamState = IrdaBeamSendState.ObexDisconnect
+                        SendIrdaBeamInformation(WrapTinyTpObex(New Byte() {&H81, &H0, &H3}), "OBEX-DISCONNECT")
+                    Else
+                        AppendIrdaBeamLog($"IrDA beam unexpected body response: {FormatBytes(data.Take(Math.Min(data.Length, 16)).ToArray())}")
+                    End If
+
+                Case IrdaBeamSendState.ObexDisconnect
+                    If IsObexResponse(data, &HA0) Then
+                        AppendIrdaBeamLog("IrDA beam OBEX disconnected.")
+                        irdaBeamState = IrdaBeamSendState.LinkDisconnect
+                        SendIrdaBeamControl(IrdaDiscControl, "BEAM-DISC")
+                    Else
+                        AppendIrdaBeamLog($"IrDA beam unexpected disconnect response: {FormatBytes(data.Take(Math.Min(data.Length, 16)).ToArray())}")
+                    End If
+            End Select
+        End Sub
+
+        Private Sub SendIrdaBeamDiscovery()
+            Dim slot = irdaBeamDiscoverySlot
+            If slot > 5 Then slot = -1
+            irdaBeamDiscoverySlot = slot + 1
+
+            Dim payload(13) As Byte
+            payload(0) = IrdaBroadcastAddress
+            payload(1) = IrdaUiControl
+            payload(2) = IrdaXidFormat
+            WriteU32(payload, 3, IrdaHostAddress)
+            WriteU32(payload, 7, &HFFFFFFFFUI)
+            payload(11) = 0
+            payload(12) = If(slot < 0, CByte(&HFF), CByte(slot))
+            payload(13) = 0
+            SendIrdaBeamPayload(payload, $"BEAM-XID slot=${payload(12):X2}")
+        End Sub
+
+        Private Sub SendIrdaBeamSnrm()
+            Dim parameters = New Byte() {
+                &H1, &H1, &H2,
+                &H82, &H1, &H1,
+                &H83, &H1, &H1,
+                &H84, &H1, &H1,
+                &H85, &H1, &H8,
+                &H86, &H1, &H7,
+                &H8, &H1, &HFF
+            }
+            Dim payload(11 + parameters.Length - 1) As Byte
+            payload(0) = IrdaBroadcastAddress
+            payload(1) = IrdaSnrmControl
+            WriteU32(payload, 2, IrdaHostAddress)
+            WriteU32(payload, 6, irdaBeamPeerAddress)
+            payload(10) = irdaBeamConnectionAddress
+            Array.Copy(parameters, 0, payload, 11, parameters.Length)
+            SendIrdaBeamPayload(payload, "BEAM-SNRM")
+        End Sub
+
+        Private Sub SendIrdaBeamInformation(data As Byte(), label As String)
+            Dim control = CByte(IrdaFinalBit Or ((irdaBeamTransmitNext And &H7) << 1) Or ((irdaBeamReceiveNext And &H7) << 5))
+            Dim payload(2 + data.Length - 1) As Byte
+            payload(0) = CByte(irdaBeamConnectionAddress Or 1)
+            payload(1) = control
+            Array.Copy(data, 0, payload, 2, data.Length)
+            irdaBeamTransmitNext = CByte((irdaBeamTransmitNext + 1) And &H7)
+            SendIrdaBeamPayload(payload, $"{label} ctrl=${control:X2}")
+        End Sub
+
+        Private Sub SendIrdaBeamControl(control As Byte, label As String)
+            Dim payload = New Byte() {CByte(irdaBeamConnectionAddress Or 1), control}
+            SendIrdaBeamPayload(payload, label)
+            If control = IrdaDiscControl Then
+                AppendIrdaBeamLog($"IrDA beam send complete: {irdaBeamFileName}")
+                ResetIrdaBeamSender()
+            End If
+        End Sub
+
+        Private Sub SendIrdaBeamPayload(payload As Byte(), label As String)
+            Dim frame = BuildIrdaSirFrame(payload)
+            Dim written = NativeMusashi.palm_native_uart_write_rx(frame, CUInt(frame.Length))
+            irdaBeamLastProgressTick = Environment.TickCount64
+            AppendIrdaTrace($"BEAM TX {label} wrote={written} {FormatBytes(frame)}")
+            AppendIrdaBeamLog($"IrDA beam TX {label} payload={FormatBytes(payload.Take(Math.Min(payload.Length, 24)).ToArray())}")
+            If label.StartsWith("BEAM-XID", StringComparison.Ordinal) AndAlso VerboseSerialLog Then Append($"IrDA {label}")
+        End Sub
+
+        Private Sub SendIrdaBeamPutMetadata()
+            Dim headers As New List(Of Byte)
+            headers.AddRange(BuildObexNameHeader(irdaBeamFileName))
+            Dim objectType = IrdaBeamObexTypeForFile(irdaBeamFileName)
+            If objectType.Length > 0 Then headers.AddRange(BuildObexTypeHeader(objectType))
+            headers.AddRange(BuildObexLengthHeader(If(irdaBeamFileBytes Is Nothing, 0, irdaBeamFileBytes.Length)))
+            If IsIrdaBeamTextFile() Then
+                headers.AddRange(BuildObexUnicodeHeader(&H5, Path.GetFileNameWithoutExtension(irdaBeamFileName)))
+                headers.AddRange(BuildObexU32Header(&HCF, &H6D656D6FUI)) ' "memo" Exchange Manager target.
+            End If
+            Dim packet = BuildObexPacket(&H2, headers.ToArray())
+            SendIrdaBeamInformation(WrapTinyTpObex(packet), If(objectType.Length = 0, "OBEX-PUT-META", $"OBEX-PUT-META type={objectType}"))
+        End Sub
+
+        Private Sub SendIrdaBeamNextBodyChunk(Optional includeMetadata As Boolean = False)
+            If irdaBeamFileBytes Is Nothing Then Return
+
+            Dim remaining = irdaBeamFileBytes.Length - irdaBeamOffset
+            If remaining <= 0 Then
+                If IsIrdaBeamTextFile() AndAlso Not irdaBeamEmptyEndBodySent Then
+                    irdaBeamEmptyEndBodySent = True
+                    Dim finalPacket = BuildObexPacket(&H82, New Byte() {&H49, &H0, &H3})
+                    SendIrdaBeamInformation(WrapTinyTpObex(finalPacket), "OBEX-PUT-FINAL-EMPTY")
+                Else
+                    irdaBeamState = IrdaBeamSendState.ObexDisconnect
+                    SendIrdaBeamInformation(WrapTinyTpObex(New Byte() {&H81, &H0, &H3}), "OBEX-DISCONNECT")
+                End If
+                Return
+            End If
+
+            Dim count = Math.Min(IrdaBeamBodyChunkSize, remaining)
+            Dim isFinal = irdaBeamOffset + count >= irdaBeamFileBytes.Length AndAlso Not IsIrdaBeamTextFile()
+            Dim chunk(count - 1) As Byte
+            Array.Copy(irdaBeamFileBytes, irdaBeamOffset, chunk, 0, count)
+            irdaBeamOffset += count
+
+            Dim headers As New List(Of Byte)
+            If includeMetadata Then
+                headers.AddRange(BuildObexNameHeader(irdaBeamFileName))
+                headers.AddRange(BuildObexLengthHeader(irdaBeamFileBytes.Length))
+            End If
+            headers.Add(If(isFinal, CByte(&H49), CByte(&H48)))
+            headers.Add(CByte(((count + 3) >> 8) And &HFF))
+            headers.Add(CByte((count + 3) And &HFF))
+            headers.AddRange(chunk)
+            Dim packet = BuildObexPacket(If(isFinal, CByte(&H82), CByte(&H2)), headers.ToArray())
+            SendIrdaBeamInformation(WrapTinyTpObex(packet), $"OBEX-PUT-BODY {irdaBeamOffset}/{irdaBeamFileBytes.Length}")
+        End Sub
+
+        Private Sub ResetIrdaBeamSender()
+            irdaBeamState = IrdaBeamSendState.Idle
+            irdaBeamPeerAddress = 0
+            irdaBeamConnectionAddress = 0
+            irdaBeamReceiveNext = 0
+            irdaBeamTransmitNext = 0
+            irdaBeamFileName = ""
+            irdaBeamFileBytes = Nothing
+            irdaBeamOffset = 0
+            irdaBeamLastProgressTick = 0
+            irdaBeamDiscoverySlot = -1
+            irdaBeamEmptyEndBodySent = False
+        End Sub
+
+        Private Shared Function BuildLmpConnectPayload(destinationLsap As Byte, sourceLsap As Byte, initialCredit As Byte) As Byte()
+            If initialCredit = 0 Then
+                Return New Byte() {CByte(destinationLsap Or IrdaControlBit), sourceLsap, IrdaLmpConnectCommand, 0}
+            End If
+            Return New Byte() {CByte(destinationLsap Or IrdaControlBit), sourceLsap, IrdaLmpConnectCommand, 0, initialCredit}
+        End Function
+
+        Private Shared Function BuildIasObexQueryPayload() As Byte()
+            Dim className = Encoding.ASCII.GetBytes("IrDA:IrCOMM")
+            Dim attributeName = Encoding.ASCII.GetBytes("IrDA:TinyTP:LsapSel")
+            Dim payload As New List(Of Byte) From {&H0, &H1, CByte(IrdaIasGetValueByClass Or IrdaIasLast), 0}
+            payload.Add(CByte(className.Length))
+            payload.AddRange(className)
+            payload.Add(CByte(attributeName.Length))
+            payload.AddRange(attributeName)
+            Return payload.ToArray()
+        End Function
+
+        Private Shared Function WrapTinyTpObex(obexPacket As Byte()) As Byte()
+            Dim payload(3 + obexPacket.Length - 1) As Byte
+            payload(0) = IrdaObexLsap
+            payload(1) = 3
+            payload(2) = &H10
+            Array.Copy(obexPacket, 0, payload, 3, obexPacket.Length)
+            Return payload
+        End Function
+
+        Private Shared Function BuildObexConnectPacket() As Byte()
+            Return New Byte() {&H80, &H0, &H7, &H10, &H0, &H4, &H0}
+        End Function
+
+        Private Shared Function BuildObexPacket(opcode As Byte, headers As Byte()) As Byte()
+            Dim packet(3 + headers.Length - 1) As Byte
+            packet(0) = opcode
+            WriteU16(packet, 1, CUShort(packet.Length))
+            Array.Copy(headers, 0, packet, 3, headers.Length)
+            Return packet
+        End Function
+
+        Private Shared Function BuildObexLengthHeader(length As Integer) As Byte()
+            Dim header(4) As Byte
+            header(0) = &HC3
+            WriteU32(header, 1, CUInt(Math.Max(0, length)))
+            Return header
+        End Function
+
+        Private Shared Function BuildObexTypeHeader(mimeType As String) As Byte()
+            Dim typeBytes = Encoding.ASCII.GetBytes(If(mimeType, ""))
+            Dim header(3 + typeBytes.Length) As Byte
+            header(0) = &H42
+            WriteU16(header, 1, CUShort(header.Length))
+            Array.Copy(typeBytes, 0, header, 3, typeBytes.Length)
+            header(header.Length - 1) = 0
+            Return header
+        End Function
+
+        Private Shared Function BuildObexU32Header(headerId As Byte, value As UInteger) As Byte()
+            Dim header(4) As Byte
+            header(0) = headerId
+            WriteU32(header, 1, value)
+            Return header
+        End Function
+
+        Private Shared Function BuildObexUnicodeHeader(headerId As Byte, value As String) As Byte()
+            Dim encoded As New List(Of Byte)
+            For Each ch In If(value, "").ToCharArray()
+                encoded.Add(CByte((AscW(ch) >> 8) And &HFF))
+                encoded.Add(CByte(AscW(ch) And &HFF))
+            Next
+            encoded.Add(0)
+            encoded.Add(0)
+
+            Dim header(3 + encoded.Count - 1) As Byte
+            header(0) = headerId
+            WriteU16(header, 1, CUShort(header.Length))
+            encoded.CopyTo(header, 3)
+            Return header
+        End Function
+
+        Private Shared Function BuildObexNameHeader(name As String) As Byte()
+            Return BuildObexUnicodeHeader(&H1, name)
+        End Function
+
+        Private Shared Function IsObexResponse(data As Byte(), responseCode As Byte) As Boolean
+            If data.Length < 6 Then Return False
+            Dim cursor = 0
+            If data.Length >= 3 AndAlso ((data(0) And &H7F) = IrdaObexLsap OrElse (data(1) And &H7F) = IrdaObexLsap) Then cursor = 3
+            Return data.Length > cursor AndAlso data(cursor) = responseCode
+        End Function
+
+        Private Shared Function IrdaBeamObexTypeForFile(fileName As String) As String
+            Select Case Path.GetExtension(If(fileName, "")).ToLowerInvariant()
+                Case ".txt"
+                    Return ""
+                Case Else
+                    Return ""
+            End Select
+        End Function
+
+        Private Function IsIrdaBeamTextFile() As Boolean
+            Return Path.GetExtension(If(irdaBeamFileName, "")).Equals(".txt", StringComparison.OrdinalIgnoreCase)
+        End Function
+
+        Private Shared Function NormalizeIrdaBeamTextBytes(bytes As Byte()) As Byte()
+            Dim text = Encoding.Default.GetString(If(bytes, Array.Empty(Of Byte)()))
+            text = text.Replace(vbCrLf, vbLf).Replace(vbCr, vbLf).Replace(vbLf, vbCrLf)
+            Return Encoding.Default.GetBytes(text)
+        End Function
+
+        Private Sub HandleIrdaFrame(frame As Byte())
+            If Not IrdaFrameHasValidFcs(frame) Then Return
+            If irdaBeamState <> IrdaBeamSendState.Idle AndAlso HandleIrdaBeamSenderFrame(frame) Then Return
+
+            If frame.Length >= 16 AndAlso frame(0) = IrdaBroadcastAddress AndAlso frame(1) = IrdaUiControl AndAlso frame(2) = IrdaXidFormat Then
+                HandleIrdaXidFrame(frame)
+                Return
+            End If
+
+            If frame.Length >= 13 AndAlso frame(1) = IrdaSnrmControl Then
+                HandleIrdaSnrmFrame(frame)
+                Return
+            End If
+
+            If frame.Length >= 4 AndAlso irdaConnectionAddress <> 0 AndAlso
+                (frame(0) = irdaConnectionAddress OrElse frame(0) = (irdaConnectionAddress Or 1)) Then
+                HandleIrdaConnectedFrame(frame)
+            End If
+        End Sub
+
+        Private Sub HandleIrdaXidFrame(frame As Byte())
+            Dim sourceAddress = ReadU32(frame, 3)
+            Dim slot = frame(12)
+
+            If sourceAddress <> irdaLastDiscoverySource Then
+                irdaLastDiscoverySource = sourceAddress
+                irdaRespondedInDiscovery = False
+            End If
+
+            If slot = &HFF Then
+                irdaRespondedInDiscovery = False
+                Return
+            End If
+
+            If irdaRespondedInDiscovery Then Return
+            If slot <> 2 Then Return
+
+            SendIrdaXidResponse(sourceAddress, slot)
+            irdaRespondedInDiscovery = True
+        End Sub
+
+        Private Sub HandleIrdaSnrmFrame(frame As Byte())
+            Dim sourceAddress = ReadU32(frame, 2)
+            Dim destinationAddress = ReadU32(frame, 6)
+            If destinationAddress <> IrdaHostAddress Then Return
+
+            Dim connectionAddress = frame(10)
+            irdaConnectionAddress = CByte(connectionAddress And &HFE)
+            irdaConnectedPeer = sourceAddress
+            irdaReceiveNext = 0
+            irdaTransmitNext = 0
+            irdaLastInformationResponse = Nothing
+            irdaLastInformationResponseLabel = ""
+            Dim parameterCount = Math.Max(0, frame.Length - 13)
+            Dim parameters As Byte() = Array.Empty(Of Byte)()
+            If parameterCount > 0 Then ReDim parameters(parameterCount - 1)
+            If parameterCount > 0 Then Array.Copy(frame, 11, parameters, 0, parameterCount)
+
+            SendIrdaUaResponse(sourceAddress, connectionAddress, NegotiateIrdaParameters(parameters))
+        End Sub
+
+        Private Sub HandleIrdaConnectedFrame(frame As Byte())
+            Dim control = frame(1)
+            irdaConnectedResponseAddress = frame(0)
+            AppendIrdaTrace($"RX connected addr=${frame(0):X2} ctrl=${control:X2} len={frame.Length} {FormatBytes(frame)}")
+
+            If IsIrdaInformationControl(control) Then
+                HandleIrdaInformationFrame(frame)
+                Return
+            End If
+
+            If IsIrdaReceiveReadyControl(control) Then
+                SendIrdaReceiveReady("RR")
+            ElseIf control = IrdaDiscControl Then
+                SendIrdaConnectedControl(IrdaUaResponseControl, "UA-DISC")
+                ResetIrdaConnectionState()
+            End If
+        End Sub
+
+        Private Sub HandleIrdaInformationFrame(frame As Byte())
+            If frame.Length < 6 Then Return
+
+            Dim control = frame(1)
+            Dim sendSequence = CByte((control >> 1) And &H7)
+            If sendSequence = irdaReceiveNext Then
+                irdaReceiveNext = CByte((irdaReceiveNext + 1) And &H7)
+                Dim dataLength = frame.Length - 4
+                Dim data(dataLength - 1) As Byte
+                Array.Copy(frame, 2, data, 0, dataLength)
+                If HandleIrdaInformationPayload(data) Then Return
+            Else
+                AppendIrdaTrace($"RX duplicate/out-of-order I ns={sendSequence} expected={irdaReceiveNext}")
+                If irdaLastInformationResponse IsNot Nothing Then
+                    QueueIrdaResponse(irdaLastInformationResponse, irdaLastInformationResponseLabel, IrdaConnectedTurnaroundDelayMs)
+                    Return
+                End If
+            End If
+
+            SendIrdaReceiveReady("RR")
+        End Sub
+
+        Private Function HandleIrdaInformationPayload(data As Byte()) As Boolean
+            AppendIrdaTrace($"RX I payload {FormatBytes(data)}")
+            If data.Length >= 4 AndAlso (data(0) And IrdaControlBit) <> 0 AndAlso data(2) = IrdaLmpConnectCommand Then
+                Dim destinationLsap = CByte(data(0) And &H7F)
+                Dim sourceLsap = CByte(data(1) And &H7F)
+                Dim initialCredit As Byte = If(destinationLsap = IrdaObexLsap, CByte(&H10), CByte(0))
+                Dim responseLength = If(initialCredit = 0, 4, 5)
+                Dim response(responseLength - 1) As Byte
+                response(0) = CByte(sourceLsap Or IrdaControlBit)
+                response(1) = destinationLsap
+                response(2) = IrdaLmpConnectConfirm
+                response(3) = 0
+                If responseLength > 4 Then response(4) = initialCredit
+                SendIrdaInformationResponse(response, $"LMP-CONNECT-CNF dlsap=${sourceLsap:X2} slsap=${destinationLsap:X2}")
+                Return True
+            End If
+            If IsIrdaIasGetValueByClass(data) Then
+                SendIrdaIasGetValueByClassResponse(data)
+                Return True
+            End If
+            If HandleIrdaTinyTpObexPayload(data) Then Return True
+            Return False
+        End Function
+
+        Private Function HandleIrdaTinyTpObexPayload(data As Byte()) As Boolean
+            If data.Length < 3 Then Return False
+
+            Dim destinationLsap = CByte(data(0) And &H7F)
+            Dim sourceLsap = CByte(data(1) And &H7F)
+            If destinationLsap <> IrdaObexLsap Then Return False
+
+            Dim obexOffset = 3
+            If irdaObexExpectedLength > 0 Then
+                If data.Length <= obexOffset Then Return False
+                AppendObexFragment(data, obexOffset, data.Length - obexOffset)
+                If irdaObexPacket.Count < irdaObexExpectedLength Then
+                    AppendIrdaTrace($"OBEX fragment {irdaObexPacket.Count}/{irdaObexExpectedLength}")
+                    Return False
+                End If
+
+                Dim packet = irdaObexPacket.Take(irdaObexExpectedLength).ToArray()
+                irdaObexPacket.Clear()
+                irdaObexExpectedLength = 0
+                Return HandleCompleteObexPacket(packet, irdaObexClientLsap)
+            End If
+
+            If data.Length - obexOffset < 3 Then Return False
+
+            Dim opcode = data(obexOffset)
+            Dim packetLength = (CInt(data(obexOffset + 1)) << 8) Or data(obexOffset + 2)
+            If packetLength < 3 Then
+                AppendIrdaTrace($"OBEX malformed opcode=${opcode:X2} len={packetLength} payload={FormatBytes(data)}")
+                Return False
+            End If
+
+            If obexOffset + packetLength > data.Length Then
+                irdaObexExpectedLength = packetLength
+                irdaObexClientLsap = sourceLsap
+                irdaObexPacket.Clear()
+                AppendObexFragment(data, obexOffset, data.Length - obexOffset)
+                AppendIrdaTrace($"OBEX start opcode=${opcode:X2} {irdaObexPacket.Count}/{irdaObexExpectedLength}")
+                Return False
+            End If
+
+            Dim completePacket(packetLength - 1) As Byte
+            Array.Copy(data, obexOffset, completePacket, 0, packetLength)
+            Return HandleCompleteObexPacket(completePacket, sourceLsap)
+        End Function
+
+        Private Sub AppendObexFragment(data As Byte(), offset As Integer, count As Integer)
+            For i = 0 To count - 1
+                irdaObexPacket.Add(data(offset + i))
+            Next
+        End Sub
+
+        Private Function HandleCompleteObexPacket(packet As Byte(), clientLsap As Byte) As Boolean
+            If packet.Length < 3 Then Return False
+
+            Dim opcode = packet(0)
+            Dim packetLength = (CInt(packet(1)) << 8) Or packet(2)
+            AppendIrdaTrace($"OBEX packet opcode=${opcode:X2} len={packetLength} body={irdaObexBody.Count} name='{irdaObexObjectName}'")
+            If packetLength < 3 OrElse packetLength > packet.Length Then
+                AppendIrdaTrace($"OBEX malformed opcode=${opcode:X2} len={packetLength} packet={FormatBytes(packet)}")
+                Return False
+            End If
+
+            Select Case opcode
+                Case &H80
+                    irdaObexObjectName = ""
+                    irdaObexObjectType = ""
+                    irdaObexBody.Clear()
+                    Dim response = New Byte() {
+                        clientLsap,
+                        IrdaObexLsap,
+                        &H10,
+                        &HA0, &H00, &H07,
+                        &H10, &H00, &H04, &H00
+                    }
+                    SendIrdaInformationResponse(response, "OBEX CONNECT OK")
+                    Return True
+                Case &H81
+                    ' OBEX DISCONNECT also expects a success response; without it Palm OS
+                    ' remains on the beam dialog's "Disconnecting" state after saving.
+                    AppendIrdaTrace($"OBEX disconnect requested name='{irdaObexObjectName}' body={irdaObexBody.Count}")
+                    SendIrdaObexResponse(clientLsap, &HA0, "OBEX DISCONNECT OK")
+                    irdaObexObjectName = ""
+                    irdaObexObjectType = ""
+                    irdaObexBody.Clear()
+                    irdaObexPacket.Clear()
+                    irdaObexExpectedLength = 0
+                    Return True
+                Case &H2, &H82
+                    AppendIrdaBeamLog($"IrDA receive OBEX PUT opcode=${opcode:X2} len={packetLength} head={FormatBytes(packet.Take(Math.Min(packetLength, 96)).ToArray())}")
+                    HandleObexHeaders(packet, 3, packetLength)
+                    If opcode = &H82 Then
+                        AppendIrdaTrace($"OBEX final PUT name='{irdaObexObjectName}' body={irdaObexBody.Count}")
+                        SaveIrdaObexObject()
+                        SendIrdaObexResponse(clientLsap, &HA0, "OBEX PUT OK")
+                    Else
+                        AppendIrdaTrace($"OBEX continue PUT name='{irdaObexObjectName}' body={irdaObexBody.Count}")
+                        SendIrdaObexResponse(clientLsap, &H90, "OBEX PUT CONTINUE")
+                    End If
+                    Return True
+                Case Else
+                    AppendIrdaTrace($"OBEX opcode=${opcode:X2} len={packetLength} packet={FormatBytes(packet)}")
+                    Return False
+            End Select
+        End Function
+
+        Private Sub SendIrdaObexResponse(clientLsap As Byte, responseCode As Byte, label As String)
+            Dim response = New Byte() {
+                clientLsap,
+                IrdaObexLsap,
+                &H10,
+                responseCode, &H00, &H03
+            }
+            SendIrdaInformationResponse(response, label)
+        End Sub
+
+        Private Sub HandleObexHeaders(data As Byte(), startOffset As Integer, endOffset As Integer)
+            Dim cursor = startOffset
+            While cursor < endOffset
+                Dim headerId = data(cursor)
+                cursor += 1
+
+                Select Case headerId And &HC0
+                    Case &H0, &H40
+                        If cursor + 2 > endOffset Then Exit While
+                        Dim headerLength = (CInt(data(cursor)) << 8) Or data(cursor + 1)
+                        cursor += 2
+                        Dim valueLength = headerLength - 3
+                        If valueLength < 0 OrElse cursor + valueLength > endOffset Then Exit While
+
+                        If headerId = &H1 Then
+                            irdaObexObjectName = DecodeObexUnicode(data, cursor, valueLength)
+                            AppendIrdaTrace($"OBEX name '{irdaObexObjectName}'")
+                            AppendIrdaBeamLog($"IrDA receive OBEX name: '{irdaObexObjectName}'")
+                        ElseIf headerId = &H42 Then
+                            irdaObexObjectType = DecodeObexAscii(data, cursor, valueLength)
+                            AppendIrdaTrace($"OBEX type '{irdaObexObjectType}'")
+                            AppendIrdaBeamLog($"IrDA receive OBEX type: '{irdaObexObjectType}'")
+                        ElseIf headerId = &H48 OrElse headerId = &H49 Then
+                            For i = 0 To valueLength - 1
+                                irdaObexBody.Add(data(cursor + i))
+                            Next
+                            AppendIrdaTrace($"OBEX body += {valueLength} byte(s), total {irdaObexBody.Count}")
+                        Else
+                            AppendIrdaBeamLog($"IrDA receive OBEX header ${headerId:X2} len={headerLength} value={FormatBytes(data.Skip(cursor).Take(Math.Min(valueLength, 32)).ToArray())}")
+                        End If
+
+                        cursor += valueLength
+                    Case &H80
+                        If cursor < endOffset Then AppendIrdaBeamLog($"IrDA receive OBEX header ${headerId:X2} byte=${data(cursor):X2}")
+                        cursor += 1
+                    Case &HC0
+                        If headerId = &HC3 AndAlso cursor + 4 <= endOffset Then
+                            AppendIrdaBeamLog($"IrDA receive OBEX length: {ReadU32(data, cursor)}")
+                        ElseIf cursor + 4 <= endOffset Then
+                            AppendIrdaBeamLog($"IrDA receive OBEX header ${headerId:X2} value={ReadU32(data, cursor)}")
+                        End If
+                        cursor += 4
+                End Select
+            End While
+        End Sub
+
+        Private Sub SaveIrdaObexObject()
+            Directory.CreateDirectory(irdaCapturePath)
+
+            Dim fileName = If(String.IsNullOrWhiteSpace(irdaObexObjectName), $"beam_{DateTime.Now:yyyyMMdd_HHmmss}.bin", irdaObexObjectName)
+            fileName = SanitizeBmpFileName(fileName)
+            Dim outputPath As String = UniquePath(Path.Combine(irdaCapturePath, fileName))
+
+            File.WriteAllBytes(outputPath, irdaObexBody.ToArray())
+            Append($"IrDA received: {Path.GetFileName(outputPath)} ({irdaObexBody.Count} bytes)")
+            AppendIrdaTrace($"OBEX saved {irdaObexBody.Count} byte(s) -> {outputPath}")
+        End Sub
+
+        Private Shared Function UniquePath(filePath As String) As String
+            If Not File.Exists(filePath) Then Return filePath
+
+            Dim directory = Path.GetDirectoryName(filePath)
+            Dim baseName = Path.GetFileNameWithoutExtension(filePath)
+            Dim extension = Path.GetExtension(filePath)
+            Dim suffix = DateTime.Now.ToString("yyyyMMdd_HHmmss")
+            Dim candidate = Path.Combine(directory, $"{baseName}_{suffix}{extension}")
+            If Not File.Exists(candidate) Then Return candidate
+
+            Dim index = 2
+            Do
+                candidate = Path.Combine(directory, $"{baseName}_{suffix}_{index:D2}{extension}")
+                If Not File.Exists(candidate) Then Return candidate
+                index += 1
+            Loop
+        End Function
+
+        Private Shared Function DecodeObexUnicode(data As Byte(), offset As Integer, count As Integer) As String
+            Dim builder As New StringBuilder()
+            Dim endOffset = offset + count
+            Dim cursor = offset
+            While cursor + 1 < endOffset
+                Dim code = (CInt(data(cursor)) << 8) Or data(cursor + 1)
+                If code = 0 Then Exit While
+                builder.Append(ChrW(code))
+                cursor += 2
+            End While
+            Return builder.ToString()
+        End Function
+
+        Private Shared Function DecodeObexAscii(data As Byte(), offset As Integer, count As Integer) As String
+            Dim endOffset = offset + count
+            If count > 0 AndAlso offset + count <= data.Length AndAlso data(offset + count - 1) = 0 Then endOffset -= 1
+            If endOffset <= offset Then Return ""
+            Return Encoding.ASCII.GetString(data, offset, endOffset - offset)
+        End Function
+
+        Private Shared Function IsIrdaIasGetValueByClass(data As Byte()) As Boolean
+            If data.Length < 5 Then Return False
+            Return (data(0) And &H7F) = 0 AndAlso (data(2) And &H7F) = IrdaIasGetValueByClass
+        End Function
+
+        Private Sub SendIrdaIasGetValueByClassResponse(request As Byte())
+            Dim className = ""
+            Dim attributeName = ""
+            Dim cursor = 3
+            If cursor < request.Length Then
+                Dim classLength = request(cursor)
+                cursor += 1
+                If cursor + classLength <= request.Length Then
+                    className = Encoding.ASCII.GetString(request, cursor, classLength)
+                    cursor += classLength
+                End If
+            End If
+            If cursor < request.Length Then
+                Dim attributeLength = request(cursor)
+                cursor += 1
+                If cursor + attributeLength <= request.Length Then
+                    attributeName = Encoding.ASCII.GetString(request, cursor, attributeLength)
+                End If
+            End If
+
+            Dim clientLsap = CByte(request(1) And &H7F)
+            Dim response(12) As Byte
+            response(0) = clientLsap
+            response(1) = 0
+            response(2) = CByte(IrdaIasGetValueByClass Or IrdaIasLast)
+            response(3) = IrdaIasSuccess
+            response(4) = 0
+            response(5) = 1
+            response(6) = 0
+            response(7) = 0
+            response(8) = IrdaIasInteger
+            response(9) = 0
+            response(10) = 0
+            response(11) = 0
+            response(12) = IrdaObexLsap
+
+            SendIrdaInformationResponse(response, $"IAS {className}/{attributeName} LSAP=${IrdaObexLsap:X2}")
+        End Sub
+
+        Private Sub SendIrdaXidResponse(destinationAddress As UInteger, slot As Byte)
+            Dim nameBytes = Encoding.ASCII.GetBytes("ESP32-PALM")
+            Dim payload(13 + 4 + nameBytes.Length - 1) As Byte
+            payload(0) = IrdaDiscoveryResponseAddress
+            payload(1) = IrdaXidResponseControl
+            payload(2) = IrdaXidFormat
+            WriteU32(payload, 3, IrdaHostAddress)
+            WriteU32(payload, 7, destinationAddress)
+            payload(11) = 0
+            payload(12) = slot
+            payload(13) = 0
+            payload(14) = &H82
+            payload(15) = &H20
+            payload(16) = 0
+            Array.Copy(nameBytes, 0, payload, 17, nameBytes.Length)
+
+            pendingIrdaResponse = BuildIrdaSirFrame(payload)
+            pendingIrdaResponseLabel = $"XID slot=${slot:X2} peer=${destinationAddress:X8}"
+            pendingIrdaResponseDueTick = Environment.TickCount64 + IrdaTurnaroundDelayMs
+            AppendIrdaTrace($"QUEUE {pendingIrdaResponseLabel} {FormatBytes(pendingIrdaResponse)}")
+        End Sub
+
+        Private Sub SendIrdaUaResponse(destinationAddress As UInteger, connectionAddress As Byte, parameters As Byte())
+            Dim payload(10 + parameters.Length - 1) As Byte
+            payload(0) = connectionAddress
+            payload(1) = IrdaUaResponseControl
+            WriteU32(payload, 2, IrdaHostAddress)
+            WriteU32(payload, 6, destinationAddress)
+            If parameters.Length > 0 Then Array.Copy(parameters, 0, payload, 10, parameters.Length)
+
+            pendingIrdaResponse = BuildIrdaSirFrame(payload)
+            pendingIrdaResponseLabel = $"UA ca=${connectionAddress:X2} peer=${destinationAddress:X8}"
+            pendingIrdaResponseDueTick = Environment.TickCount64 + IrdaTurnaroundDelayMs
+            AppendIrdaTrace($"QUEUE {pendingIrdaResponseLabel} {FormatBytes(pendingIrdaResponse)}")
+        End Sub
+
+        Private Shared Function NegotiateIrdaParameters(requested As Byte()) As Byte()
+            If requested Is Nothing OrElse requested.Length = 0 Then Return requested
+
+            Dim negotiated As Byte() = CType(requested.Clone(), Byte())
+            Dim index = 0
+            While index + 2 < negotiated.Length
+                Dim pi = negotiated(index)
+                Dim length = negotiated(index + 1)
+                Dim valueIndex = index + 2
+                If valueIndex + length > negotiated.Length Then Exit While
+
+                Select Case pi
+                    Case &H1
+                        ' Keep the link at 9600 bps for now; higher IrDA rates need real UART timing.
+                        If length >= 1 Then negotiated(valueIndex) = CByte(negotiated(valueIndex) And &H2)
+                    Case &H83
+                        ' Limit received I-field size to the smallest offered size.
+                        If length >= 1 Then negotiated(valueIndex) = CByte(negotiated(valueIndex) And &H1)
+                    Case &H84
+                        ' Window size 1 keeps primary/secondary turn-taking simple.
+                        If length >= 1 Then negotiated(valueIndex) = CByte(negotiated(valueIndex) And &H1)
+                End Select
+
+                index += 2 + length
+            End While
+
+            Return negotiated
+        End Function
+
+        Private Sub SendIrdaConnectedControl(control As Byte, label As String)
+            If irdaConnectionAddress = 0 Then Return
+
+            Dim responseAddress = irdaConnectionAddress
+            Dim payload = New Byte() {responseAddress, control}
+            Dim frame = BuildIrdaSirFrame(payload)
+            Dim responseLabel = $"{label} ca=${irdaConnectionAddress:X2} addr=${responseAddress:X2}"
+            QueueIrdaResponse(frame, responseLabel, IrdaConnectedTurnaroundDelayMs)
+        End Sub
+
+        Private Sub SendIrdaReceiveReady(label As String)
+            Dim control = CByte(IrdaRrPollFinalControl Or ((irdaReceiveNext And &H7) << 5))
+            SendIrdaConnectedControl(control, label)
+        End Sub
+
+        Private Sub SendIrdaInformationResponse(data As Byte(), label As String)
+            If irdaConnectionAddress = 0 Then Return
+
+            Dim control = CByte(IrdaFinalBit Or ((irdaTransmitNext And &H7) << 1) Or ((irdaReceiveNext And &H7) << 5))
+            Dim payload(2 + data.Length - 1) As Byte
+            payload(0) = irdaConnectionAddress
+            payload(1) = control
+            Array.Copy(data, 0, payload, 2, data.Length)
+
+            Dim frame = BuildIrdaSirFrame(payload)
+            Dim responseLabel = $"{label} ca=${irdaConnectionAddress:X2} ctrl=${control:X2}"
+            irdaTransmitNext = CByte((irdaTransmitNext + 1) And &H7)
+            irdaLastInformationResponse = frame
+            irdaLastInformationResponseLabel = responseLabel
+            QueueIrdaResponse(frame, responseLabel, IrdaConnectedTurnaroundDelayMs)
+        End Sub
+
+        Private Sub ResetIrdaConnectionState()
+            irdaConnectionAddress = 0
+            irdaConnectedResponseAddress = 0
+            irdaConnectedPeer = 0
+            irdaReceiveNext = 0
+            irdaTransmitNext = 0
+            irdaLastInformationResponse = Nothing
+            irdaLastInformationResponseLabel = ""
+            irdaObexObjectName = ""
+            irdaObexObjectType = ""
+            irdaObexBody.Clear()
+            irdaObexPacket.Clear()
+            irdaObexExpectedLength = 0
+            irdaObexClientLsap = 0
+            irdaTxQuietSinceTick = 0
+        End Sub
+
+        Private Shared Function IsIrdaInformationControl(control As Byte) As Boolean
+            Return (control And &H1) = 0
+        End Function
+
+        Private Shared Function IsIrdaReceiveReadyControl(control As Byte) As Boolean
+            Return (control And &H1F) = IrdaRrPollFinalControl
+        End Function
+
+        Private Sub SendPendingIrdaResponse()
+            If pendingIrdaResponse Is Nothing AndAlso pendingIrdaResponses.Count > 0 Then
+                Dim queued = pendingIrdaResponses.Dequeue()
+                pendingIrdaResponse = queued.Frame
+                pendingIrdaResponseLabel = queued.Label
+                pendingIrdaResponseDueTick = queued.Due
+            End If
+
+            If pendingIrdaResponse Is Nothing OrElse pendingIrdaResponse.Length = 0 Then Return
+            If NativeMusashi.palm_native_uart_tx_count() <> 0UI Then Return
+            Dim nowTick = Environment.TickCount64
+            If irdaTxQuietSinceTick = 0 Then
+                irdaTxQuietSinceTick = nowTick
+                Return
+            End If
+            If nowTick - irdaTxQuietSinceTick < IrdaTxQuietBeforeResponseMs Then Return
+            If nowTick < pendingIrdaResponseDueTick Then Return
+
+            Dim response = pendingIrdaResponse
+            Dim label = pendingIrdaResponseLabel
+            pendingIrdaResponse = Nothing
+            pendingIrdaResponseLabel = ""
+            pendingIrdaResponseDueTick = 0
+
+            Dim written = NativeMusashi.palm_native_uart_write_rx(response, CUInt(response.Length))
+            AppendIrdaTrace($"TX {label} wrote={written} {FormatBytes(response)}")
+            If VerboseSerialLog Then Append($"IrDA {label} response {written}")
+        End Sub
+
+        Private Sub QueueIrdaResponse(frame As Byte(), label As String, delayMs As Long)
+            Dim due = Environment.TickCount64 + delayMs
+            pendingIrdaResponses.Enqueue(New IrdaPendingResponse(frame, label, due))
+            AppendIrdaTrace($"QUEUE {label} delayMs={delayMs} {FormatBytes(frame)}")
+        End Sub
+
+        Private Shared Function BuildIrdaSirFrame(payload As Byte()) As Byte()
+            Dim bytes As New List(Of Byte)
+            For i = 1 To 10
+                bytes.Add(&HFF)
+            Next
+            bytes.Add(IrdaSirBof)
+
+            Dim crc = Crc16X25(payload, payload.Length)
+            For Each value In payload
+                AddEscapedIrdaByte(bytes, value)
+            Next
+            AddEscapedIrdaByte(bytes, CByte(crc And &HFF))
+            AddEscapedIrdaByte(bytes, CByte((crc >> 8) And &HFF))
+            bytes.Add(IrdaSirEof)
+            Return bytes.ToArray()
+        End Function
+
+        Private Shared Sub AddEscapedIrdaByte(bytes As List(Of Byte), value As Byte)
+            If value = IrdaSirBof OrElse value = IrdaSirEof OrElse value = IrdaSirEscape Then
+                bytes.Add(IrdaSirEscape)
+                bytes.Add(CByte(value Xor &H20))
+            Else
+                bytes.Add(value)
+            End If
+        End Sub
+
+        Private Shared Function IrdaFrameHasValidFcs(frame As Byte()) As Boolean
+            If frame.Length < 3 Then Return False
+            Dim expected = CUInt(frame(frame.Length - 2)) Or (CUInt(frame(frame.Length - 1)) << 8)
+            Dim actual = CUInt(Crc16X25(frame, frame.Length - 2))
+            Return expected = actual
+        End Function
+
+        Private Sub AppendIrdaTrace(message As String)
+            If Not EnableIrdaTrace Then Return
+            Try
+                File.AppendAllText(irdaTracePath, $"{DateTime.Now:HH:mm:ss.fff} {message}{Environment.NewLine}")
+            Catch
+            End Try
+        End Sub
+
+        Private Sub AppendIrdaBeamLog(message As String)
+            Append(message)
+            Try
+                File.AppendAllText(irdaBeamLogPath, $"{DateTime.Now:HH:mm:ss.fff} {message}{Environment.NewLine}")
+            Catch
+            End Try
         End Sub
 
         Private Sub ProcessPalmSerialFrames()
@@ -999,7 +2151,6 @@ Namespace PalmDesktopHarness
                     installAppBlockDone = False
                     installSortBlockDone = False
                     ResetPadpReceive()
-                    ResetMemoSync()
                 End If
                 If isCmpWake AndAlso Not cmpHandshakeStarted Then
                     cmpHandshakeStarted = True
@@ -1191,12 +2342,6 @@ Namespace PalmDesktopHarness
             If cmd = InstallExpectedResponseCommand() Then
                 HandleInstallResponse(payload, err)
                 Return
-            ElseIf cmd = MemoExpectedResponseCommand() Then
-                HandleMemoSyncResponse(payload, err)
-                Return
-            ElseIf cmd = NotePadExpectedResponseCommand() Then
-                HandleNotePadSyncResponse(payload, err)
-                Return
             End If
             If err <> 0 Then Return
 
@@ -1266,49 +2411,12 @@ Namespace PalmDesktopHarness
             End Select
         End Function
 
-        Private Function MemoExpectedResponseCommand() As Byte
-            Select Case installState
-                Case HotSyncInstallState.MemoOpenSent
-                    Return DlpCmdOpenDB
-                Case HotSyncInstallState.MemoInfoSent
-                    Return DlpCmdReadOpenDBInfo
-                Case HotSyncInstallState.MemoReadSent
-                    Return DlpCmdReadRecord
-                Case HotSyncInstallState.MemoWriteSent
-                    Return DlpCmdWriteRecord
-                Case HotSyncInstallState.MemoCloseSent
-                    Return DlpCmdCloseDB
-                Case HotSyncInstallState.MemoEndSent
-                    Return DlpCmdEndOfSync
-                Case Else
-                    Return 0
-            End Select
-        End Function
-
-        Private Function NotePadExpectedResponseCommand() As Byte
-            Select Case installState
-                Case HotSyncInstallState.NoteDbListSent
-                    Return DlpCmdReadDBList
-                Case HotSyncInstallState.NoteOpenSent
-                    Return DlpCmdOpenDB
-                Case HotSyncInstallState.NoteInfoSent
-                    Return DlpCmdReadOpenDBInfo
-                Case HotSyncInstallState.NoteReadSent
-                    Return DlpCmdReadRecord
-                Case HotSyncInstallState.NoteCloseSent
-                    Return DlpCmdCloseDB
-                Case HotSyncInstallState.NoteEndSent
-                    Return DlpCmdEndOfSync
-                Case Else
-                    Return 0
-            End Select
-        End Function
-
         Private Sub BeginHotSyncWork()
             If installState <> HotSyncInstallState.Idle Then Return
             If pendingInstall Is Nothing Then PrepareNextPendingInstall()
             If pendingInstall Is Nothing Then
-                BeginMemoSync()
+                Append("HotSync has no queued installs.")
+                SendDlpEndOfSync()
                 Return
             End If
 
@@ -1395,7 +2503,7 @@ Namespace PalmDesktopHarness
                         Append($"HotSync install starting: {pendingInstall.Name}")
                         SendDlpDeleteDb()
                     Else
-                        BeginMemoSync()
+                        SendDlpEndOfSync()
                     End If
                 Case HotSyncInstallState.EndSent
                     If err <> 0 Then
@@ -1413,597 +2521,6 @@ Namespace PalmDesktopHarness
             installState = HotSyncInstallState.Failed
             installAppBlockDone = False
             installSortBlockDone = False
-        End Sub
-
-        Private Sub BeginMemoSync()
-            ResetMemoSync()
-            Append("HotSync MemoPad sync starting.")
-            SendDlpOpenMemoDb()
-        End Sub
-
-        Private Sub ResetMemoSync()
-            memoDbId = 0
-            memoRecordCount = 0
-            memoRecordIndex = 0
-            memoWriteIndex = 0
-            memoRecords.Clear()
-            memoPendingWrites.Clear()
-        End Sub
-
-        Private Sub HandleMemoSyncResponse(payload As Byte(), err As Integer)
-            Select Case installState
-                Case HotSyncInstallState.MemoOpenSent
-                    If err <> 0 Then
-                        Append(If(err = 5, "MemoDB not found; nothing to sync.", $"MemoDB open failed ${err:X4}"))
-                        BeginNotePadSync()
-                        Return
-                    End If
-                    memoDbId = DecodeSingleByteArg(payload)
-                    SendDlpReadOpenDbInfo()
-                Case HotSyncInstallState.MemoInfoSent
-                    If err <> 0 Then
-                        Append($"MemoDB info failed ${err:X4}")
-                        SendDlpCloseMemoDb()
-                        Return
-                    End If
-                    memoRecordCount = DecodeMemoRecordCount(payload)
-                    Append($"MemoDB records: {memoRecordCount}")
-                    memoRecordIndex = 0
-                    SendNextMemoRecord()
-                Case HotSyncInstallState.MemoReadSent
-                    If err <> 0 Then
-                        Append($"Memo record {memoRecordIndex} read failed ${err:X4}")
-                        SendDlpCloseMemoDb()
-                        Return
-                    End If
-                    Dim record = DecodeMemoRecord(payload)
-                    If record.RecordId <> 0UI AndAlso (record.Attributes And PalmRecordDeletedMask) = 0 Then
-                        memoRecords.Add(record)
-                    End If
-                    memoRecordIndex += 1
-                    SendNextMemoRecord()
-                Case HotSyncInstallState.MemoWriteSent
-                    If err <> 0 Then
-                        Append($"Memo write {memoWriteIndex + 1}/{memoPendingWrites.Count} failed ${err:X4}")
-                        SendDlpCloseMemoDb()
-                        Return
-                    End If
-                    If memoWriteIndex < memoPendingWrites.Count Then
-                        Dim written = memoPendingWrites(memoWriteIndex)
-                        Dim dataOffset = DlpFirstArgDataOffset(payload)
-                        If dataOffset >= 0 AndAlso payload.Length >= dataOffset + 4 Then written.RecordId = ReadU32(payload, dataOffset)
-                    End If
-                    memoWriteIndex += 1
-                    SendNextMemoWrite()
-                Case HotSyncInstallState.MemoCloseSent
-                    If err <> 0 Then Append($"MemoDB close failed ${err:X4}")
-                    SaveMemoTextFile()
-                    BeginNotePadSync()
-                Case HotSyncInstallState.MemoEndSent
-                    If err <> 0 Then
-                        Append($"MemoPad sync EndOfSync failed ${err:X4}")
-                    Else
-                        Append("HotSync MemoPad sync complete.")
-                    End If
-                    installState = HotSyncInstallState.Done
-                    ResetMemoSync()
-            End Select
-        End Sub
-
-        Private Sub SendDlpOpenMemoDb()
-            Dim nameBytes = Encoding.ASCII.GetBytes("MemoDB" & ChrW(0))
-            Dim arg(2 + nameBytes.Length - 1) As Byte
-            arg(0) = 0
-            arg(1) = &HD0
-            Array.Copy(nameBytes, 0, arg, 2, nameBytes.Length)
-            SendDlpRequestWithArg(DlpCmdOpenDB, arg, "DLP Open MemoDB")
-            installState = HotSyncInstallState.MemoOpenSent
-        End Sub
-
-        Private Sub SendDlpReadOpenDbInfo()
-            SendDlpRequestWithArg(DlpCmdReadOpenDBInfo, New Byte() {memoDbId}, "DLP ReadOpenDBInfo")
-            installState = HotSyncInstallState.MemoInfoSent
-        End Sub
-
-        Private Sub SendNextMemoRecord()
-            If memoRecordIndex >= memoRecordCount Then
-                PrepareMemoWrites()
-                SendNextMemoWrite()
-                Return
-            End If
-
-            Dim arg(7) As Byte
-            arg(0) = memoDbId
-            arg(1) = 0
-            WriteU16(arg, 2, CUShort(memoRecordIndex))
-            WriteU16(arg, 4, 0US)
-            WriteU16(arg, 6, &HFFFFUS)
-            SendDlpRequestWithArg(DlpCmdReadRecord, CByte(DlpArgFirstId + 1), arg, $"DLP ReadMemoRecord {memoRecordIndex + 1}/{memoRecordCount}")
-            installState = HotSyncInstallState.MemoReadSent
-        End Sub
-
-        Private Sub SendNextMemoWrite()
-            If memoWriteIndex >= memoPendingWrites.Count Then
-                SendDlpCloseMemoDb()
-                Return
-            End If
-
-            Dim record = memoPendingWrites(memoWriteIndex)
-            Dim textBytes = Encoding.ASCII.GetBytes(LimitPalmMemoText(record.Text) & ChrW(0))
-            Dim arg(8 + textBytes.Length - 1) As Byte
-            arg(0) = memoDbId
-            arg(1) = &H80
-            WriteU32(arg, 2, record.RecordId)
-            arg(6) = CByte(record.Attributes And &H70)
-            arg(7) = CByte(record.Category And &HF)
-            Array.Copy(textBytes, 0, arg, 8, textBytes.Length)
-            SendDlpRequestWithArg(DlpCmdWriteRecord, arg, $"DLP WriteMemo {memoWriteIndex + 1}/{memoPendingWrites.Count}")
-            installState = HotSyncInstallState.MemoWriteSent
-        End Sub
-
-        Private Sub SendDlpCloseMemoDb()
-            If memoDbId <> 0 Then
-                SendDlpRequestWithArg(DlpCmdCloseDB, New Byte() {memoDbId}, "DLP Close MemoDB")
-                installState = HotSyncInstallState.MemoCloseSent
-            Else
-                SendDlpEndOfSync()
-                installState = HotSyncInstallState.MemoEndSent
-            End If
-        End Sub
-
-        Private Function DecodeMemoRecordCount(payload As Byte()) As Integer
-            Dim dataOffset = DlpFirstArgDataOffset(payload)
-            If dataOffset < 0 OrElse payload.Length < dataOffset + 2 Then Return 0
-            Return ReadU16(payload, dataOffset)
-        End Function
-
-        Private Function DecodeMemoRecord(payload As Byte()) As MemoRecordMirror
-            Dim dataOffset = DlpFirstArgDataOffset(payload)
-            If dataOffset < 0 OrElse payload.Length < dataOffset + 10 Then Return New MemoRecordMirror()
-
-            Dim recordId = ReadU32(payload, dataOffset)
-            Dim recSize = ReadU16(payload, dataOffset + 6)
-            Dim attributes = payload(dataOffset + 8)
-            Dim category = payload(dataOffset + 9)
-            Dim textOffset = dataOffset + 10
-            Dim textLength = Math.Min(recSize, payload.Length - textOffset)
-            If textLength <= 0 Then Return New MemoRecordMirror With {.RecordId = recordId, .Attributes = attributes, .Category = category}
-            If payload(textOffset + textLength - 1) = 0 Then textLength -= 1
-            Return New MemoRecordMirror With {
-                .RecordId = recordId,
-                .Attributes = attributes,
-                .Category = category,
-                .Text = Encoding.ASCII.GetString(payload, textOffset, Math.Max(0, textLength))
-            }
-        End Function
-
-        Private Function DlpFirstArgDataOffset(payload As Byte()) As Integer
-            If payload.Length < 6 Then Return -1
-            Dim argOffset = 4
-            Dim argId = payload(argOffset)
-            If (argId And &HC0) = &H80 Then
-                If payload.Length < argOffset + 4 Then Return -1
-                Return argOffset + 4
-            End If
-            Return argOffset + 2
-        End Function
-
-        Private Sub PrepareMemoWrites()
-            memoPendingWrites.Clear()
-            Dim memoDir = Path.Combine(hotSyncPath, "MemoPad")
-            Dim manifest = LoadMemoManifest(memoDir)
-            Dim seenFiles As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
-
-            For i = 0 To memoRecords.Count - 1
-                Dim record = memoRecords(i)
-                Dim key = record.RecordId.ToString("X8", CultureInfo.InvariantCulture)
-                Dim entry As MemoManifestEntry = Nothing
-                If Not manifest.TryGetValue(key, entry) Then
-                    entry = New MemoManifestEntry With {.RecordId = record.RecordId, .FileName = MakeMemoFileName(record, i)}
-                    manifest(key) = entry
-                End If
-
-                record.FileName = SanitizeMemoFileName(entry.FileName)
-                Dim filePath = Path.Combine(memoDir, record.FileName)
-                seenFiles.Add(filePath)
-                Dim palmHash = HashText(record.Text)
-                Dim pcChanged = File.Exists(filePath) AndAlso HashText(File.ReadAllText(filePath, Encoding.ASCII)) <> entry.FileHash
-                Dim palmChanged = entry.PalmHash.Length > 0 AndAlso palmHash <> entry.PalmHash
-
-                If pcChanged AndAlso Not palmChanged Then
-                    record.Text = NormalizeMemoTextForPalm(File.ReadAllText(filePath, Encoding.ASCII))
-                    memoPendingWrites.Add(record)
-                ElseIf pcChanged AndAlso palmChanged Then
-                    record.ConflictText = record.Text
-                    Append($"Memo conflict kept on PC and Palm: {record.FileName}")
-                End If
-            Next
-
-            If Directory.Exists(memoDir) Then
-                For Each filePath In Directory.EnumerateFiles(memoDir, "*.txt")
-                    If filePath.EndsWith(".palm-conflict.txt", StringComparison.OrdinalIgnoreCase) Then Continue For
-                    If seenFiles.Contains(filePath) Then Continue For
-                    Dim fileName = Path.GetFileName(filePath)
-                    Dim known = manifest.Values.Any(Function(e) String.Equals(e.FileName, fileName, StringComparison.OrdinalIgnoreCase))
-                    If Not known Then
-                        memoPendingWrites.Add(New MemoRecordMirror With {
-                            .RecordId = 0UI,
-                            .Attributes = 0,
-                            .Category = 0,
-                            .FileName = SanitizeMemoFileName(fileName),
-                            .Text = NormalizeMemoTextForPalm(File.ReadAllText(filePath, Encoding.ASCII))
-                        })
-                    End If
-                Next
-            End If
-
-            memoWriteIndex = 0
-            If memoPendingWrites.Count > 0 Then Append($"MemoPad PC changes to write: {memoPendingWrites.Count}")
-        End Sub
-
-        Private Sub SaveMemoTextFile()
-            Try
-                Dim memoDir = Path.Combine(hotSyncPath, "MemoPad")
-                Directory.CreateDirectory(memoDir)
-                Dim oldManifest = LoadMemoManifest(memoDir)
-                Dim manifest As New List(Of MemoManifestEntry)
-                Dim currentFiles As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
-
-                For i = 0 To memoRecords.Count - 1
-                    Dim record = memoRecords(i)
-                    If record.FileName.Length = 0 Then record.FileName = MakeMemoFileName(record, i)
-                    Dim filePath = Path.Combine(memoDir, record.FileName)
-                    currentFiles.Add(record.FileName)
-                    If record.ConflictText.Length > 0 Then
-                        Dim conflictPath = Path.Combine(memoDir, Path.GetFileNameWithoutExtension(record.FileName) & ".palm-conflict.txt")
-                        File.WriteAllText(conflictPath, NormalizeMemoTextForPc(record.ConflictText), Encoding.ASCII)
-                    Else
-                        File.WriteAllText(filePath, NormalizeMemoTextForPc(record.Text), Encoding.ASCII)
-                    End If
-                    manifest.Add(New MemoManifestEntry With {
-                        .RecordId = record.RecordId,
-                        .FileName = record.FileName,
-                        .FileHash = HashText(If(File.Exists(filePath), File.ReadAllText(filePath, Encoding.ASCII), record.Text)),
-                        .PalmHash = HashText(record.Text)
-                    })
-                Next
-
-                Dim createdRecords = memoPendingWrites.Where(Function(m) m.RecordId <> 0UI AndAlso Not memoRecords.Any(Function(r) r.RecordId = m.RecordId)).ToList()
-                For Each createdRecord As MemoRecordMirror In createdRecords
-                    If createdRecord.FileName.Length = 0 Then createdRecord.FileName = MakeMemoFileName(createdRecord, manifest.Count)
-                    currentFiles.Add(createdRecord.FileName)
-                    manifest.Add(New MemoManifestEntry With {
-                        .RecordId = createdRecord.RecordId,
-                        .FileName = createdRecord.FileName,
-                        .FileHash = HashText(createdRecord.Text),
-                        .PalmHash = HashText(createdRecord.Text)
-                    })
-                Next
-
-                RemoveStaleMemoFiles(memoDir, oldManifest.Values, currentFiles)
-                SaveMemoManifest(memoDir, manifest)
-                Append($"MemoPad synced: {manifest.Count} memo(s) -> {memoDir}")
-            Catch ex As Exception
-                Append($"MemoPad save failed: {ex.Message}")
-            End Try
-        End Sub
-
-        Private Sub RemoveStaleMemoFiles(memoDir As String, oldEntries As IEnumerable(Of MemoManifestEntry), currentFiles As HashSet(Of String))
-            For Each oldEntry In oldEntries
-                If oldEntry.FileName.Length = 0 OrElse currentFiles.Contains(oldEntry.FileName) Then Continue For
-
-                Dim filePath = Path.Combine(memoDir, oldEntry.FileName)
-                If File.Exists(filePath) Then File.Delete(filePath)
-            Next
-        End Sub
-
-        Private Sub BeginNotePadSync()
-            ResetNotePadSync()
-            NoteTrace($"HotSync NotePad sync requested; profile={PalmConfig.ProfileName}")
-            If PalmConfig.ActiveHardwareProfile <> PalmConfig.HardwareProfile.M100Experimental Then
-                NoteTrace("NotePad sync skipped; active profile is not m100.")
-                SendDlpEndOfSync()
-                installState = HotSyncInstallState.NoteEndSent
-                Return
-            End If
-
-            NoteTrace("HotSync NotePad sync starting.")
-            SendDlpReadDbList(0)
-        End Sub
-
-        Private Sub ResetNotePadSync()
-            noteDbId = 0
-            noteDbNameIndex = 0
-            noteDbListStartIndex = 0
-            noteRecordCount = 0
-            noteRecordIndex = 0
-            noteDbNameCandidates.Clear()
-            noteDbNameCandidates.AddRange(DefaultNotePadDbNames)
-            dbListEntries.Clear()
-            noteRecords.Clear()
-        End Sub
-
-        Private Sub HandleNotePadSyncResponse(payload As Byte(), err As Integer)
-            Select Case installState
-                Case HotSyncInstallState.NoteDbListSent
-                    If err <> 0 Then
-                        NoteTrace($"ReadDBList failed ${err:X4}; trying npadDB directly.")
-                        SendDlpOpenNotePadDb()
-                        Return
-                    End If
-
-                    Dim more = DecodeDbListResponse(payload)
-                    If more Then
-                        SendDlpReadDbList(noteDbListStartIndex)
-                    Else
-                        SaveDatabaseListDump()
-                        PreferDiscoveredNotePadDbs()
-                        SendDlpOpenNotePadDb()
-                    End If
-                Case HotSyncInstallState.NoteOpenSent
-                    If err <> 0 Then
-                        noteDbNameIndex += 1
-                        If noteDbNameIndex < noteDbNameCandidates.Count Then
-                            SendDlpOpenNotePadDb()
-                        Else
-                            NoteTrace("NotePad DB not found; nothing to sync.")
-                            SendDlpEndOfSync()
-                            installState = HotSyncInstallState.NoteEndSent
-                        End If
-                        Return
-                    End If
-                    noteDbId = DecodeSingleByteArg(payload)
-                    SendDlpReadNotePadOpenDbInfo()
-                Case HotSyncInstallState.NoteInfoSent
-                    If err <> 0 Then
-                        NoteTrace($"NotePad DB info failed ${err:X4}")
-                        SendDlpCloseNotePadDb()
-                        Return
-                    End If
-                    noteRecordCount = DecodeMemoRecordCount(payload)
-                    NoteTrace($"NotePad records: {noteRecordCount}")
-                    noteRecordIndex = 0
-                    SendNextNotePadRecord()
-                Case HotSyncInstallState.NoteReadSent
-                    If err <> 0 Then
-                        NoteTrace($"NotePad record {noteRecordIndex} read failed ${err:X4}")
-                        SendDlpCloseNotePadDb()
-                        Return
-                    End If
-                    Dim record = DecodeNotePadRecord(payload)
-                    NoteTrace($"Read NotePad record id ${record.RecordId:X8}, attr ${record.Attributes:X2}, bytes {record.Data.Length}")
-                    If record.RecordId <> 0UI AndAlso (record.Attributes And PalmRecordDeletedMask) = 0 Then
-                        noteRecords.Add(record)
-                    End If
-                    noteRecordIndex += 1
-                    SendNextNotePadRecord()
-                Case HotSyncInstallState.NoteCloseSent
-                    If err <> 0 Then NoteTrace($"NotePad DB close failed ${err:X4}")
-                    SaveNotePadImages()
-                    SendDlpEndOfSync()
-                    installState = HotSyncInstallState.NoteEndSent
-                Case HotSyncInstallState.NoteEndSent
-                    If err <> 0 Then
-                        NoteTrace($"NotePad sync EndOfSync failed ${err:X4}")
-                    Else
-                        NoteTrace("HotSync NotePad sync complete.")
-                    End If
-                    installState = HotSyncInstallState.Done
-                    ResetNotePadSync()
-                    ResetMemoSync()
-            End Select
-        End Sub
-
-        Private Shared ReadOnly Property DefaultNotePadDbNames As String()
-            Get
-                ' m100 Note Pad stores drawings in npadDB, creator npad, type DATA.
-                Return New String() {"npadDB"}
-            End Get
-        End Property
-
-        Private Sub NoteTrace(message As String)
-            Append(message)
-        End Sub
-
-        Private Sub SendDlpReadDbList(startIndex As Integer)
-            Dim arg(3) As Byte
-            arg(0) = &HE0
-            arg(1) = 0
-            WriteU16(arg, 2, CUShort(Math.Max(0, Math.Min(&HFFFF, startIndex))))
-            SendDlpRequestWithArg(DlpCmdReadDBList, arg, $"DLP ReadDBList {startIndex}")
-            installState = HotSyncInstallState.NoteDbListSent
-        End Sub
-
-        Private Sub SendDlpOpenNotePadDb()
-            Dim dbName = noteDbNameCandidates(noteDbNameIndex)
-            NoteTrace($"Opening NotePad DB '{dbName}' ({noteDbNameIndex + 1}/{noteDbNameCandidates.Count})")
-            Dim nameBytes = Encoding.ASCII.GetBytes(dbName & ChrW(0))
-            Dim arg(2 + nameBytes.Length - 1) As Byte
-            arg(0) = 0
-            arg(1) = &HD0
-            Array.Copy(nameBytes, 0, arg, 2, nameBytes.Length)
-            SendDlpRequestWithArg(DlpCmdOpenDB, arg, $"DLP Open NotePad {dbName}")
-            installState = HotSyncInstallState.NoteOpenSent
-        End Sub
-
-        Private Sub SendDlpReadNotePadOpenDbInfo()
-            SendDlpRequestWithArg(DlpCmdReadOpenDBInfo, New Byte() {noteDbId}, "DLP ReadNotePadOpenDBInfo")
-            installState = HotSyncInstallState.NoteInfoSent
-        End Sub
-
-        Private Sub SendNextNotePadRecord()
-            If noteRecordIndex >= noteRecordCount Then
-                SendDlpCloseNotePadDb()
-                Return
-            End If
-
-            Dim arg(7) As Byte
-            arg(0) = noteDbId
-            arg(1) = 0
-            WriteU16(arg, 2, CUShort(noteRecordIndex))
-            WriteU16(arg, 4, 0US)
-            WriteU16(arg, 6, &HFFFFUS)
-            NoteTrace($"Reading NotePad record {noteRecordIndex + 1}/{noteRecordCount}")
-            SendDlpRequestWithArg(DlpCmdReadRecord, CByte(DlpArgFirstId + 1), arg, $"DLP ReadNotePadRecord {noteRecordIndex + 1}/{noteRecordCount}")
-            installState = HotSyncInstallState.NoteReadSent
-        End Sub
-
-        Private Sub SendDlpCloseNotePadDb()
-            If noteDbId <> 0 Then
-                SendDlpRequestWithArg(DlpCmdCloseDB, New Byte() {noteDbId}, "DLP Close NotePad DB")
-                installState = HotSyncInstallState.NoteCloseSent
-            Else
-                SendDlpEndOfSync()
-                installState = HotSyncInstallState.NoteEndSent
-            End If
-        End Sub
-
-        Private Function DecodeNotePadRecord(payload As Byte()) As NotePadRecordMirror
-            Dim dataOffset = DlpFirstArgDataOffset(payload)
-            If dataOffset < 0 OrElse payload.Length < dataOffset + 10 Then Return New NotePadRecordMirror()
-
-            Dim recordId = ReadU32(payload, dataOffset)
-            Dim recSize = ReadU16(payload, dataOffset + 6)
-            Dim attributes = payload(dataOffset + 8)
-            Dim category = payload(dataOffset + 9)
-            Dim dataOffsetStart = dataOffset + 10
-            Dim dataLength = Math.Min(recSize, payload.Length - dataOffsetStart)
-            If dataLength < 0 Then dataLength = 0
-
-            Dim bytes As Byte() = Array.Empty(Of Byte)()
-            If dataLength > 0 Then ReDim bytes(dataLength - 1)
-            If dataLength > 0 Then Array.Copy(payload, dataOffsetStart, bytes, 0, dataLength)
-            Return New NotePadRecordMirror With {
-                .RecordId = recordId,
-                .Attributes = attributes,
-                .Category = category,
-                .Data = bytes
-            }
-        End Function
-
-        Private Function DecodeDbListResponse(payload As Byte()) As Boolean
-            Dim dataOffset = DlpFirstArgDataOffset(payload)
-            If dataOffset < 0 OrElse payload.Length < dataOffset + 4 Then Return False
-
-            Dim lastIndex = ReadU16(payload, dataOffset)
-            Dim flags = payload(dataOffset + 2)
-            Dim count = payload(dataOffset + 3)
-            Dim cursor = dataOffset + 4
-            For i = 0 To count - 1
-                If cursor + 44 > payload.Length Then Exit For
-                Dim totalSize = payload(cursor)
-                If totalSize < 46 OrElse cursor + totalSize > payload.Length Then Exit For
-
-                Dim entry As New DbListEntry With {
-                    .MiscFlags = payload(cursor + 1),
-                    .DbFlags = CUShort(ReadU16(payload, cursor + 2)),
-                    .DbType = ReadU32(payload, cursor + 4),
-                    .Creator = ReadU32(payload, cursor + 8),
-                    .Version = CUShort(ReadU16(payload, cursor + 12)),
-                    .ModNum = ReadU32(payload, cursor + 14),
-                    .DbIndex = CUShort(ReadU16(payload, cursor + 42)),
-                    .Name = ReadNullTerminatedAscii(payload, cursor + 44, totalSize - 44)
-                }
-                dbListEntries.Add(entry)
-                cursor += totalSize
-            Next
-
-            noteDbListStartIndex = lastIndex + 1
-            Return (flags And &H80) <> 0
-        End Function
-
-        Private Sub SaveDatabaseListDump()
-            Try
-                Directory.CreateDirectory(hotSyncPath)
-                Dim dumpPath = Path.Combine(hotSyncPath, "DatabaseList.tsv")
-                Dim sb As New StringBuilder()
-                sb.AppendLine("index" & ControlChars.Tab & "name" & ControlChars.Tab & "type" & ControlChars.Tab & "creator" & ControlChars.Tab & "flags" & ControlChars.Tab & "misc" & ControlChars.Tab & "version" & ControlChars.Tab & "modNum")
-                For Each entry In dbListEntries.OrderBy(Function(e) e.DbIndex).ThenBy(Function(e) e.Name, StringComparer.OrdinalIgnoreCase)
-                    sb.Append(entry.DbIndex.ToString(CultureInfo.InvariantCulture))
-                    sb.Append(ControlChars.Tab)
-                    sb.Append(entry.Name)
-                    sb.Append(ControlChars.Tab)
-                    sb.Append(FourCc(entry.DbType))
-                    sb.Append(ControlChars.Tab)
-                    sb.Append(FourCc(entry.Creator))
-                    sb.Append(ControlChars.Tab)
-                    sb.Append("$" & entry.DbFlags.ToString("X4", CultureInfo.InvariantCulture))
-                    sb.Append(ControlChars.Tab)
-                    sb.Append("$" & entry.MiscFlags.ToString("X2", CultureInfo.InvariantCulture))
-                    sb.Append(ControlChars.Tab)
-                    sb.Append(entry.Version.ToString(CultureInfo.InvariantCulture))
-                    sb.Append(ControlChars.Tab)
-                    sb.AppendLine(entry.ModNum.ToString(CultureInfo.InvariantCulture))
-                Next
-                File.WriteAllText(dumpPath, sb.ToString(), Encoding.ASCII)
-                NoteTrace($"Database list dumped: {dbListEntries.Count} DB(s) -> {dumpPath}")
-            Catch ex As Exception
-                NoteTrace($"Database list dump failed: {ex.Message}")
-            End Try
-        End Sub
-
-        Private Sub PreferDiscoveredNotePadDbs()
-            Dim discovered = dbListEntries.
-                Where(Function(e) e.DbType = FourCcValue("DATA") AndAlso e.Creator = FourCcValue("npad")).
-                Select(Function(e) e.Name).
-                Where(Function(name) name.Length > 0).
-                Distinct(StringComparer.OrdinalIgnoreCase).
-                ToList()
-
-            If discovered.Count = 0 Then Return
-
-            Dim merged As New List(Of String)(discovered)
-            For Each fallback In DefaultNotePadDbNames
-                If Not merged.Any(Function(name) String.Equals(name, fallback, StringComparison.OrdinalIgnoreCase)) Then merged.Add(fallback)
-            Next
-            noteDbNameCandidates.Clear()
-            noteDbNameCandidates.AddRange(merged)
-            noteDbNameIndex = 0
-            NoteTrace("NotePad DB candidate(s): " & String.Join(", ", discovered))
-        End Sub
-
-        Private Shared Function ReadNullTerminatedAscii(buffer As Byte(), offset As Integer, maxLength As Integer) As String
-            Dim length = 0
-            While length < maxLength AndAlso offset + length < buffer.Length AndAlso buffer(offset + length) <> 0
-                length += 1
-            End While
-            Return Encoding.ASCII.GetString(buffer, offset, length)
-        End Function
-
-        Private Sub SaveNotePadImages()
-            Try
-                Dim noteDir = Path.Combine(hotSyncPath, "NotePad")
-                Directory.CreateDirectory(noteDir)
-                Dim currentFiles As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
-
-                For i = 0 To noteRecords.Count - 1
-                    Dim record = noteRecords(i)
-                    Dim bitmap = DecodeNotePadBitmap(record.Data)
-                    Dim baseName = $"{record.RecordId:X8} - Note {i + 1}"
-                    If bitmap.Pixels IsNot Nothing AndAlso bitmap.Pixels.Length > 0 Then
-                        Dim fileName = SanitizeBmpFileName(baseName & ".bmp")
-                        WriteOneBitBmp(Path.Combine(noteDir, fileName), bitmap.Width, bitmap.Height, bitmap.RowBytes, bitmap.Pixels)
-                        currentFiles.Add(fileName)
-                        Dim rawName = SanitizeBmpFileName(baseName & ".bin")
-                        File.WriteAllBytes(Path.Combine(noteDir, rawName), record.Data)
-                        currentFiles.Add(rawName)
-                    Else
-                        Dim rawName = SanitizeBmpFileName(baseName & ".bin")
-                        File.WriteAllBytes(Path.Combine(noteDir, rawName), record.Data)
-                        currentFiles.Add(rawName)
-                        NoteTrace($"NotePad record {i + 1} saved raw; bitmap format not recognized.")
-                    End If
-                Next
-
-                For Each filePath In Directory.EnumerateFiles(noteDir)
-                    Dim name = Path.GetFileName(filePath)
-                    If Not currentFiles.Contains(name) Then File.Delete(filePath)
-                Next
-
-                NoteTrace($"NotePad synced: {noteRecords.Count} note(s) -> {noteDir}")
-            Catch ex As Exception
-                NoteTrace($"NotePad save failed: {ex}")
-            End Try
         End Sub
 
         Private Sub SendDlpDeleteDb()
@@ -2417,6 +2934,21 @@ Namespace PalmDesktopHarness
             Return crc
         End Function
 
+        Private Shared Function Crc16X25(buffer As Byte(), count As Integer) As Integer
+            Dim crc As Integer = &HFFFF
+            For i = 0 To count - 1
+                crc = crc Xor buffer(i)
+                For bit = 0 To 7
+                    If (crc And 1) <> 0 Then
+                        crc = ((crc >> 1) Xor &H8408) And &HFFFF
+                    Else
+                        crc = (crc >> 1) And &HFFFF
+                    End If
+                Next
+            Next
+            Return (Not crc) And &HFFFF
+        End Function
+
         Private Shared ReadOnly Crc16Table As UShort() = {
             &H0US, &H1021US, &H2042US, &H3063US, &H4084US, &H50A5US, &H60C6US, &H70E7US, &H8108US, &H9129US, &HA14AUS, &HB16BUS, &HC18CUS, &HD1ADUS, &HE1CEUS, &HF1EFUS,
             &H1231US, &H210US, &H3273US, &H2252US, &H52B5US, &H4294US, &H72F7US, &H62D6US, &H9339US, &H8318US, &HB37BUS, &HA35AUS, &HD3BDUS, &HC39CUS, &HF3FFUS, &HE3DEUS,
@@ -2445,63 +2977,6 @@ Namespace PalmDesktopHarness
             Return sb.ToString()
         End Function
 
-        Private Function LoadMemoManifest(memoDir As String) As Dictionary(Of String, MemoManifestEntry)
-            Dim result As New Dictionary(Of String, MemoManifestEntry)(StringComparer.OrdinalIgnoreCase)
-            Dim manifestPath = Path.Combine(memoDir, "manifest.tsv")
-            If Not File.Exists(manifestPath) Then Return result
-
-            For Each line In File.ReadAllLines(manifestPath, Encoding.ASCII)
-                If line.Length = 0 OrElse line.StartsWith("#", StringComparison.Ordinal) Then Continue For
-                Dim parts = line.Split(ControlChars.Tab)
-                If parts.Length < 4 Then Continue For
-                Dim recordId As UInteger
-                If Not UInteger.TryParse(parts(0), NumberStyles.HexNumber, CultureInfo.InvariantCulture, recordId) Then Continue For
-                Dim entry = New MemoManifestEntry With {
-                    .RecordId = recordId,
-                    .FileName = SanitizeMemoFileName(parts(1)),
-                    .FileHash = parts(2),
-                    .PalmHash = parts(3)
-                }
-                result(recordId.ToString("X8", CultureInfo.InvariantCulture)) = entry
-            Next
-
-            Return result
-        End Function
-
-        Private Sub SaveMemoManifest(memoDir As String, entries As IEnumerable(Of MemoManifestEntry))
-            Dim sb As New StringBuilder()
-            sb.AppendLine("# recordId" & ControlChars.Tab & "file" & ControlChars.Tab & "fileHash" & ControlChars.Tab & "palmHash")
-            For Each entry In entries.OrderBy(Function(e) e.FileName, StringComparer.OrdinalIgnoreCase)
-                sb.Append(entry.RecordId.ToString("X8", CultureInfo.InvariantCulture))
-                sb.Append(ControlChars.Tab)
-                sb.Append(entry.FileName)
-                sb.Append(ControlChars.Tab)
-                sb.Append(entry.FileHash)
-                sb.Append(ControlChars.Tab)
-                sb.AppendLine(entry.PalmHash)
-            Next
-            File.WriteAllText(Path.Combine(memoDir, "manifest.tsv"), sb.ToString(), Encoding.ASCII)
-        End Sub
-
-        Private Shared Function MakeMemoFileName(record As MemoRecordMirror, index As Integer) As String
-            Dim title = NormalizeMemoTextForPalm(record.Text).Split({vbLf}, StringSplitOptions.None)(0).Trim()
-            If title.Length = 0 Then title = $"Memo {index + 1}"
-            If title.Length > 48 Then title = title.Substring(0, 48).Trim()
-            Return SanitizeMemoFileName($"{record.RecordId:X8} - {title}.txt")
-        End Function
-
-        Private Shared Function SanitizeMemoFileName(fileName As String) As String
-            Dim invalid = Path.GetInvalidFileNameChars()
-            Dim sb As New StringBuilder(fileName.Length)
-            For Each ch In fileName
-                sb.Append(If(invalid.Contains(ch), "_"c, ch))
-            Next
-            Dim sanitized = sb.ToString().Trim()
-            If sanitized.Length = 0 Then sanitized = "memo.txt"
-            If Not sanitized.EndsWith(".txt", StringComparison.OrdinalIgnoreCase) Then sanitized &= ".txt"
-            Return sanitized
-        End Function
-
         Private Shared Function SanitizeBmpFileName(fileName As String) As String
             Dim invalid = Path.GetInvalidFileNameChars()
             Dim sb As New StringBuilder(fileName.Length)
@@ -2512,223 +2987,6 @@ Namespace PalmDesktopHarness
             If sanitized.Length = 0 Then sanitized = "note.bmp"
             Return sanitized
         End Function
-
-        Private Shared Function DecodeNotePadBitmap(data As Byte()) As NotePadBitmap
-            Dim m100Note = FindM100NotePadBitmap(data)
-            If m100Note.Pixels IsNot Nothing AndAlso m100Note.Pixels.Length > 0 Then Return m100Note
-
-            Dim header = FindPalmBitmapHeader(data)
-            If header.Pixels IsNot Nothing AndAlso header.Pixels.Length > 0 Then Return header
-
-            Const width = 160
-            Const height = 160
-            Const rowBytes = width \ 8
-            Dim needed = rowBytes * height
-            If data.Length >= needed Then
-                Dim pixels(needed - 1) As Byte
-                Array.Copy(data, data.Length - needed, pixels, 0, needed)
-                Return New NotePadBitmap With {.Width = width, .Height = height, .RowBytes = rowBytes, .Pixels = pixels}
-            End If
-
-            Return New NotePadBitmap()
-        End Function
-
-        Private Shared Function FindM100NotePadBitmap(data As Byte()) As NotePadBitmap
-            Const titleStart = &H1E
-            If data.Length < titleStart + 24 Then Return New NotePadBitmap()
-
-            Dim titleEnd = titleStart
-            While titleEnd < data.Length AndAlso data(titleEnd) <> 0
-                titleEnd += 1
-            End While
-
-            Dim headerOffset = titleEnd + 1
-            If (headerOffset And 1) <> 0 Then headerOffset += 1
-            If headerOffset + 24 > data.Length Then Return New NotePadBitmap()
-
-            Dim width = CInt(ReadU32(data, headerOffset + 4))
-            Dim height = CInt(ReadU32(data, headerOffset + 8))
-            Dim depth = CInt(ReadU32(data, headerOffset + 12))
-            Dim rleLength = CInt(Math.Min(ReadU32(data, headerOffset + 20), CUInt(data.Length - (headerOffset + 24))))
-
-            If width < 80 OrElse width > 200 Then Return New NotePadBitmap()
-            If height < 80 OrElse height > 512 Then Return New NotePadBitmap()
-            If depth <> 1 Then Return New NotePadBitmap()
-            If rleLength < 2 Then Return New NotePadBitmap()
-
-            Dim rowBytes = ((width + 31) \ 32) * 4
-            Dim pixelBytes = rowBytes * height
-            Dim pixels(pixelBytes - 1) As Byte
-            Dim sourceOffset = headerOffset + 24
-            Dim sourceEnd = Math.Min(data.Length, sourceOffset + rleLength)
-            Dim outOffset = 0
-
-            While sourceOffset + 1 < sourceEnd AndAlso outOffset < pixelBytes
-                Dim count = data(sourceOffset)
-                Dim value = data(sourceOffset + 1)
-                sourceOffset += 2
-                Dim writeCount = Math.Min(count, pixelBytes - outOffset)
-                If writeCount > 0 Then
-                    Array.Fill(pixels, value, outOffset, writeCount)
-                    outOffset += writeCount
-                End If
-            End While
-
-            If outOffset <> pixelBytes Then Return New NotePadBitmap()
-            Return New NotePadBitmap With {.Width = width, .Height = height, .RowBytes = rowBytes, .Pixels = pixels}
-        End Function
-
-        Private Shared Function FindPalmBitmapHeader(data As Byte()) As NotePadBitmap
-            For offset = 0 To Math.Max(-1, data.Length - 16)
-                Dim width = ReadU16(data, offset)
-                Dim height = ReadU16(data, offset + 2)
-                Dim rowBytes = ReadU16(data, offset + 4) And &H3FFF
-                If width < 120 OrElse width > 200 Then Continue For
-                If height < 100 OrElse height > 240 Then Continue For
-                If rowBytes < (width + 7) \ 8 OrElse rowBytes > 64 Then Continue For
-
-                For headerBytes = 16 To 24 Step 4
-                    Dim pixelOffset = offset + headerBytes
-                    Dim pixelBytes = rowBytes * height
-                    If pixelOffset + pixelBytes <= data.Length Then
-                        Dim pixels(pixelBytes - 1) As Byte
-                        Array.Copy(data, pixelOffset, pixels, 0, pixelBytes)
-                        Return New NotePadBitmap With {.Width = width, .Height = height, .RowBytes = rowBytes, .Pixels = pixels}
-                    End If
-                Next
-            Next
-
-            Return New NotePadBitmap()
-        End Function
-
-        Private Shared Sub WriteOneBitBmp(path As String, width As Integer, height As Integer, sourceRowBytes As Integer, pixels As Byte())
-            Dim bmpRowBytes = ((width + 31) \ 32) * 4
-            Dim pixelDataSize = bmpRowBytes * height
-            Dim imageOffset = 14 + 40 + 8
-            Dim fileSize = imageOffset + pixelDataSize
-
-            Using fs As New FileStream(path, FileMode.Create, FileAccess.Write, FileShare.Read)
-                Using bw As New BinaryWriter(fs)
-                    bw.Write(CByte(AscW("B"c)))
-                    bw.Write(CByte(AscW("M"c)))
-                    bw.Write(fileSize)
-                    bw.Write(0US)
-                    bw.Write(0US)
-                    bw.Write(imageOffset)
-                    bw.Write(40)
-                    bw.Write(width)
-                    bw.Write(height)
-                    bw.Write(1US)
-                    bw.Write(1US)
-                    bw.Write(0)
-                    bw.Write(pixelDataSize)
-                    bw.Write(0)
-                    bw.Write(0)
-                    bw.Write(2)
-                    bw.Write(2)
-                    bw.Write(CByte(255))
-                    bw.Write(CByte(255))
-                    bw.Write(CByte(255))
-                    bw.Write(CByte(0))
-                    bw.Write(CByte(0))
-                    bw.Write(CByte(0))
-                    bw.Write(CByte(0))
-                    bw.Write(CByte(0))
-
-                    Dim row(bmpRowBytes - 1) As Byte
-                    For y = height - 1 To 0 Step -1
-                        Array.Clear(row, 0, row.Length)
-                        Dim sourceOffset = y * sourceRowBytes
-                        Dim copyBytes = Math.Min(sourceRowBytes, bmpRowBytes)
-                        If sourceOffset + copyBytes <= pixels.Length Then Array.Copy(pixels, sourceOffset, row, 0, copyBytes)
-                        bw.Write(row)
-                    Next
-                End Using
-            End Using
-        End Sub
-
-        Private Shared Function NormalizeMemoTextForPalm(text As String) As String
-            Return text.Replace(vbCrLf, vbLf).Replace(vbCr, vbLf)
-        End Function
-
-        Private Shared Function NormalizeMemoTextForPc(text As String) As String
-            Return NormalizeMemoTextForPalm(text).Replace(vbLf, vbCrLf)
-        End Function
-
-        Private Shared Function LimitPalmMemoText(text As String) As String
-            Dim normalized = NormalizeMemoTextForPalm(text)
-            Dim bytes = Encoding.ASCII.GetBytes(normalized)
-            If bytes.Length < PalmMemoMaxBytes Then Return normalized
-
-            Dim limited = Encoding.ASCII.GetString(bytes, 0, PalmMemoMaxBytes - 1)
-            Return limited.TrimEnd(ControlChars.NullChar)
-        End Function
-
-        Private Shared Function HashText(text As String) As String
-            Dim bytes = Encoding.ASCII.GetBytes(NormalizeMemoTextForPalm(text))
-            Dim hash As UInteger = &H811C9DC5UI
-            For Each value In bytes
-                hash = hash Xor value
-                hash = CUInt((CULng(hash) * &H1000193UL) And &HFFFFFFFFUL)
-            Next
-            Return hash.ToString("X8", CultureInfo.InvariantCulture)
-        End Function
-
-        Private Shared Function FourCc(value As UInteger) As String
-            Dim chars = {
-                CByte((value >> 24) And &HFFUI),
-                CByte((value >> 16) And &HFFUI),
-                CByte((value >> 8) And &HFFUI),
-                CByte(value And &HFFUI)
-            }
-            Return Encoding.ASCII.GetString(chars)
-        End Function
-
-        Private Shared Function FourCcValue(text As String) As UInteger
-            Dim bytes = Encoding.ASCII.GetBytes(text.PadRight(4).Substring(0, 4))
-            Return (CUInt(bytes(0)) << 24) Or (CUInt(bytes(1)) << 16) Or (CUInt(bytes(2)) << 8) Or bytes(3)
-        End Function
-
-        Private NotInheritable Class MemoRecordMirror
-            Public Property RecordId As UInteger
-            Public Property Attributes As Byte
-            Public Property Category As Byte
-            Public Property Text As String = ""
-            Public Property FileName As String = ""
-            Public Property ConflictText As String = ""
-        End Class
-
-        Private NotInheritable Class MemoManifestEntry
-            Public Property RecordId As UInteger
-            Public Property FileName As String = ""
-            Public Property FileHash As String = ""
-            Public Property PalmHash As String = ""
-        End Class
-
-        Private NotInheritable Class DbListEntry
-            Public Property Name As String = ""
-            Public Property MiscFlags As Byte
-            Public Property DbFlags As UShort
-            Public Property DbType As UInteger
-            Public Property Creator As UInteger
-            Public Property Version As UShort
-            Public Property ModNum As UInteger
-            Public Property DbIndex As UShort
-        End Class
-
-        Private Structure NotePadBitmap
-            Public Width As Integer
-            Public Height As Integer
-            Public RowBytes As Integer
-            Public Pixels As Byte()
-        End Structure
-
-        Private NotInheritable Class NotePadRecordMirror
-            Public Property RecordId As UInteger
-            Public Property Attributes As Byte
-            Public Property Category As Byte
-            Public Property Data As Byte() = Array.Empty(Of Byte)()
-        End Class
 
         Private NotInheritable Class PalmDbImage
             Public Property Name As String = ""

@@ -42,6 +42,7 @@ NativeMusashi/             Native C Palm hardware/CPU bridge
 PalmDesktopHarness/        VB.NET WinForms desktop emulator
 PalmRamProbe/              Desktop RAM limit test harness
 PalmRomExtractor/          VB.NET ROM app lister and PRC exporter
+SmallBasicBasEditor/       VB.NET SmallBASIC .bas text-chunk editor
 Musashi-master/            Musashi 68000 CPU core used by the emulator
 HARDWARE_PROFILES.md       Profile switching notes
 README_BRINGUP.md          Detailed bring-up history and low-level notes
@@ -129,6 +130,18 @@ If a dump preserves a nonstandard ROM address base, pass it explicitly:
 
 ```bat
 dotnet run --project PalmRomExtractor -- list MyPalm.rom --rom-base 0x10C00000
+```
+
+## SmallBASIC .bas Editor
+
+`SmallBasicBasEditor` is a small WinForms editor for Palm SmallBASIC `.bas`
+files. It opens `TEXT` / `SmBa` Palm database files, lists readable BASIC source
+sections for editing, and saves the sections back into a minimal SmallBASIC Palm
+database wrapper.
+
+```bat
+dotnet run --project SmallBasicBasEditor\SmallBasicBasEditor.vbproj
+smallbasic_bas_editor.cmd "path\to\program.bas"
 ```
 
 ## Switching Hardware Profiles

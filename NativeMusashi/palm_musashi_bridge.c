@@ -1432,9 +1432,6 @@ static void write8(uint32_t address, uint8_t value) {
             } else {
                 g_uart_tx_overrun_count++;
             }
-            if ((get16(0x908) & UART_MISC_IRDA_ENABLE) != 0u) {
-                enqueue_uart_rx_byte(value);
-            }
             update_uart_regs();
         }
         if (offset >= 0x900 && offset <= 0x909) update_uart_regs();
