@@ -8,6 +8,6 @@
     <OptionInfer>On</OptionInfer>
   </PropertyGroup>
   <ItemGroup>
-    <None Include="..\NativeMusashi\build-release\PalmMusashi.dll" Link="PalmMusashi.dll" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\NativeMusashi\build-release\PalmMusashi.dll" Link="PalmMusashi.dll" CopyToOutputDirectory="PreserveNewest" Condition="Exists('..\NativeMusashi\build-release\PalmMusashi.dll')" />
   </ItemGroup>
 </Project>

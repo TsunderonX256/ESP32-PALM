@@ -32,7 +32,31 @@ struct PalmHwDebug {
   uint8_t lastLcdWriteValue;
 };
 
+struct PalmHwSavedState {
+  uint16_t lastTimerStatus;
+  uint32_t adsBitBufferIn;
+  uint16_t adsBitBufferOut;
+  int32_t adsNumBitsIn;
+  uint16_t adsPendingResult;
+  int32_t adsHavePending;
+  int32_t adsCommandBitsSeen;
+  int32_t penDown;
+  uint16_t penXRaw;
+  uint16_t penYRaw;
+  uint16_t buttonBitsDown;
+  uint8_t portDEdge;
+  uint64_t systemCycles;
+  double timerLastCycles;
+  int64_t lastRtcSecond;
+  int32_t lcdDirty;
+  int32_t lcdFrameReady;
+};
+
 void palmHwInit();
+bool palmHwLoadState(const uint8_t *regs, size_t regSize, const PalmHwSavedState &state);
+bool palmHwSaveState(uint8_t *regs, size_t regSize, PalmHwSavedState &state);
+void palmHwPrepareForSleepSnapshot();
+bool palmHwSleepSnapshotInputsQuiet();
 bool palmHwInRegisterSpace(uint32_t address);
 uint8_t palmHwRead8(uint32_t address);
 void palmHwWrite8(uint32_t address, uint8_t value);
@@ -49,4 +73,7 @@ bool palmHwHasWakeSource();
 void palmHwNotifyMemoryWrite(uint32_t address);
 PalmLcdState palmHwGetLcdState();
 PalmHwDebug palmHwGetDebug();
+uint8_t palmHwPeekReg8(uint16_t offset);
+uint16_t palmHwPeekReg16(uint16_t offset);
+uint32_t palmHwPeekReg32(uint16_t offset);
 void palmHwMarkLcdClean();
