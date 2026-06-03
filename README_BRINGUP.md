@@ -38,9 +38,11 @@ What is wired now:
 - If the ESP32 cannot allocate all logical Palm RAM, the missing logical range is
   mirrored into the real paged RAM backing store. This follows Cloudpilot's SRAM
   bank behavior more closely than sparse zeroes: reads and writes above the real
-  allocation still round-trip through backing RAM. Reads or writes beyond the
-  logical limit raise a Musashi bus error. The serial status prints mirror
-  access counts plus the last bus-error address.
+  allocation still round-trip through backing RAM. For speed, the ESP32 build
+  currently compiles Musashi bus-error support out (`M68K_BUS_ERR_ENABLE =
+  OPT_OFF`) and leaves `PALM_BUS_ERROR_ON_RAM_LIMIT` disabled. Re-enable both
+  if an app compatibility issue appears to depend on RAM-limit or
+  unmapped-memory bus errors.
 - The serial status also prints DragonBall register read/write counters as
   `hw=reads/writes`, plus the last register offsets touched.
 - Instruction fetches are stricter than data reads: sparse RAM can satisfy data
@@ -65,9 +67,28 @@ Current CPU switch in `palm_config.h`:
 The embedded ROM does not fit in the default 1.2 MB ESP32 app partition. The
 command-line build for the ESP32-4827S043C target is:
 
-```sh
-arduino-cli compile --fqbn "esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi,CPUFreq=240,USBMode=hwcdc,UploadMode=default,CDCOnBoot=default" .
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Tools\CompileEsp32Palm.ps1
 ```
+
+That helper builds from a temporary folder named `ESP32-PALM`, matching
+Arduino's sketch-folder rule, and expects `Palm-m100-3.51-en.rom` in the
+project root. For a compile-only check of the source without a real ROM image:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Tools\CompileEsp32Palm.ps1 -CodeCheckOnly
+```
+
+The raw Arduino CLI command is:
+
+```sh
+arduino-cli compile --fqbn "esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=custom,PSRAM=opi,CPUFreq=240,USBMode=hwcdc,UploadMode=default,CDCOnBoot=default" .
+```
+
+The helper copies `Tools/esp32_palm_16mb_partitions.csv` into the temporary
+sketch as `partitions.csv`. That custom 16 MB layout uses two 4 MB app slots
+and a 7.9 MB FATFS partition, giving the `-O2` ESP32-S3 build more room than
+Arduino's standard `app3M_fat9M_16MB` layout.
 
 Expected first milestone:
 

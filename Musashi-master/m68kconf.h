@@ -34,7 +34,7 @@
 #define M68K_ILLG_HAS_CALLBACK    OPT_OFF
 #define M68K_EMULATE_FC           OPT_OFF
 #define M68K_MONITOR_PC           OPT_OFF
-#define M68K_INSTRUCTION_HOOK     OPT_ON
+#define M68K_INSTRUCTION_HOOK     OPT_OFF
 #define M68K_EMULATE_PREFETCH     OPT_OFF
 #define M68K_EMULATE_ADDRESS_ERROR OPT_OFF
 #define M68K_LOG_ENABLE           OPT_OFF
@@ -48,7 +48,7 @@
 #define M68K_DYNAMIC_INSTR_TABLES OPT_OFF
 #define M68K_CYCLE_COUNTING       OPT_OFF
 #define M68K_FIXED_CPU_TYPE       CPU_TYPE_000
-#define M68K_BUS_ERR_ENABLE       OPT_ON
+#define M68K_BUS_ERR_ENABLE       OPT_OFF
 #define M68K_USE_64_BIT           OPT_ON
 
 unsigned int m68k_read_memory_8(unsigned int address);

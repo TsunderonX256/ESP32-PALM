@@ -8,6 +8,8 @@ size_t palmRomSize();
 size_t palmRamSize();
 size_t palmRamLastAllocAttemptSize();
 size_t palmRamLastAllocAttemptSegments();
+bool palmRamWriteBytes(uint32_t offset, const uint8_t *data, uint32_t count);
+bool palmRamReadBytes(uint32_t offset, uint8_t *data, uint32_t count);
 
 uint8_t palmRead8(uint32_t address);
 uint16_t palmRead16(uint32_t address);

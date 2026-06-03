@@ -198,10 +198,37 @@ The ESP32 path keeps:
 - GT911 touch mapped into the ADS/digitizer emulation
 - room for future ESP32 LEDC output for Palm buzzer PWM
 
+For ESP32 speed, Musashi bus-error support is compiled out by default:
+`M68K_BUS_ERR_ENABLE` is `OPT_OFF` in `Musashi-master/m68kconf.h`, and
+`PALM_BUS_ERROR_ON_RAM_LIMIT` is `0` in `palm_config.h`. Re-enable both if an
+app or ROM path shows compatibility problems that look like missing RAM-limit
+or unmapped-memory bus errors.
+
 Known-good Arduino CLI compile target for the ESP32-4827S043C profile:
 
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Tools\CompileEsp32Palm.ps1
+```
+
+The helper copies the checkout to a temporary folder named `ESP32-PALM`, because
+Arduino CLI expects the sketch folder to match `ESP32-PALM.ino`. It also checks
+that the user-supplied `Palm-m100-3.51-en.rom` exists before compiling. For a
+source-only compile check without a real ROM image, use:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Tools\CompileEsp32Palm.ps1 -CodeCheckOnly
+```
+
+The default helper build uses
+[Tools/esp32_palm_16mb_partitions.csv](Tools/esp32_palm_16mb_partitions.csv),
+a custom 16 MB layout with two 4 MB app slots and a 7.9 MB FATFS partition.
+This gives the speed-focused ESP32-S3 build more headroom than Arduino's
+standard `app3M_fat9M_16MB` layout.
+
+The underlying Arduino CLI command is:
+
 ```bat
-"%LOCALAPPDATA%\Programs\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" compile --fqbn "esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi,CPUFreq=240,USBMode=hwcdc,UploadMode=default,CDCOnBoot=default" .
+"%LOCALAPPDATA%\Programs\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" compile --fqbn "esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=custom,PSRAM=opi,CPUFreq=240,USBMode=hwcdc,UploadMode=default,CDCOnBoot=default" .
 ```
 
 ## Future Porting
