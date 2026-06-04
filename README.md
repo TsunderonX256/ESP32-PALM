@@ -2,21 +2,25 @@
 
 ESP32-PALM is an experimental Palm OS emulator project. It includes a Windows
 desktop harness that runs Palm OS well enough to use apps, HotSync files,
-persist RAM state, and emulate basic Palm buzzer audio, plus an ESP32+PSRAM
-hardware target.
+persist RAM state, and emulate basic Palm buzzer audio, plus an ESP32-S3+PSRAM
+hardware target that now runs the Palm m100 profile directly on a small RGB
+touchscreen board.
 
-The current most usable target is the Windows desktop harness. The embedded
-target is the ESP32-4827S043C board with 16 MB flash, 8 MB PSRAM, 480x272 RGB
-LCD, and GT911 touch.
+The current embedded target is the ESP32-4827S043C board with 16 MB flash,
+8 MB PSRAM, 480x272 RGB LCD, GT911 touch, and a CH340 USB serial bridge.
 
 ## Current Status
 
+- ESP32 Palm m100 profile is usable on the ESP32-4827S043C: Palm OS boots,
+  touch works, the LCD is stable enough for normal use, snapshots can be saved
+  and restored, sleep/wake is handled, and a host serial UART bridge is wired.
 - Desktop Palm m100 profile boots and works well in normal use.
 - Palm IIIx profile is still supported by the native core and harness.
 - Palm IIIc support is experimental. It uses the Palm IIIc/Austin hardware
   profile, 8 MB RAM, and the SED1375 color LCD path.
-- ESP32 support is experimental and targets the ESP32-4827S043C with PSRAM,
-  RGB LCD, and GT911 touch.
+- ESP32 performance is still below real hardware in CPU-heavy apps. The current
+  focus is improving Musashi and memory-map speed while keeping touch and LCD
+  timing stable.
 - Native emulator core is exposed through `NativeMusashi/palm_core.h` for future
   hosts such as SDL, Android, Linux, or ESP32+PSRAM.
 
@@ -30,6 +34,9 @@ LCD, and GT911 touch.
 - Palm m100-style 160x220 digitizer area, including silkscreen region.
 - Sleep/wake handling with timer/RTC wake support.
 - RAM state save/restore.
+- ESP32-S3 m100 target with bilinear LCD scaling, static PNG-derived
+  silkscreen art, virtual hardware buttons, power/save/reset controls,
+  low-power sleep polling, and a raw host serial bridge for UART/HotSync work.
 - Desktop HotSync host for installing `.prc` and `.pdb` files.
 - Memo Pad text sync to per-memo `.txt` files.
 - m100 Note Pad export to raw `.bin` backup plus 1-bit `.bmp` preview.
@@ -39,6 +46,8 @@ LCD, and GT911 touch.
 
 ```text
 ESP32-PALM.ino             Arduino sketch for the ESP32-4827S043C target
+Silkscreen.png             Source art for the ESP32 m100 silkscreen strip
+silkscreen_asset.h         Generated packed 4bpp firmware asset from Silkscreen.png
 NativeMusashi/             Native C Palm hardware/CPU bridge
 PalmDesktopHarness/        VB.NET WinForms desktop emulator
 PalmRamProbe/              Desktop RAM limit test harness
@@ -187,16 +196,47 @@ the hardware application buttons.
 The Arduino sketch targets the ESP32-4827S043C board, based on the
 local `cyd_ref/005638_005638_Jingcai_ESP32_4827S043C_simple_GT911_touch.ino`
 reference. That profile uses Arduino_GFX for the 480x272 RGB panel, GT911 touch,
-and PSRAM for Palm RAM.
+an SD card for snapshots, and PSRAM for most Palm RAM.
 
 The ESP32 path keeps:
 
-- Palm RAM in PSRAM
+- the first 128 KB of Palm RAM in internal DRAM when possible, with the rest in
+  PSRAM
 - CPU/register/timer hot state in internal DRAM
 - ROM in flash
-- dirty/interval LCD updates only
+- 16 MB flash layout with two 4 MB app slots and a FATFS partition
+- 10 FPS interval LCD updates, with only the 160x160 Palm LCD area refreshed
+  dynamically
+- a static PNG-derived 4bpp m100 silkscreen strip compiled into flash
 - GT911 touch mapped into the ADS/digitizer emulation
+- virtual app/up/down buttons on the left side of the panel
+- virtual power, save snapshot, and reset controls on the right side of the
+  panel
+- Palm OS brightness/contrast writes mapped to the real ESP32 backlight PWM
+- automatic restore from `/palm_m100_state.bin` on the SD card, with wake from
+  saved sleep state
+- low-power Palm sleep mode that turns off the display/backlight, lowers CPU
+  frequency, and uses light sleep between lower-rate touch polls
+- raw Palm UART emulation bridged to the board's host serial port at 115200 baud
 - room for future ESP32 LEDC output for Palm buzzer PWM
+
+The ESP32 path intentionally keeps most runtime serial logging compiled out or
+disabled after boot so the host serial port can be handed to the emulated Palm
+UART.
+
+`Silkscreen.png` is the editable source for the side silkscreen artwork.
+`silkscreen_asset.h` is the generated packed 4bpp PROGMEM copy used by the
+firmware. Keeping this asset compiled into flash is faster and simpler than
+loading it from FATFS; the visible static strip is drawn once into the static
+panel frame.
+
+Known ESP32 limitations:
+
+- CPU-heavy apps still run slower than real m100 hardware.
+- RTC stopwatch interrupt behavior is not implemented yet, so apps that depend
+  on stopwatch ticks may pause while Palm OS is asleep.
+- UART/HotSync is a raw serial bridge and still needs more compatibility work.
+- Beam/IR is not implemented.
 
 For ESP32 speed, Musashi bus-error support is compiled out by default:
 `M68K_BUS_ERR_ENABLE` is `OPT_OFF` in `Musashi-master/m68kconf.h`, and
@@ -208,6 +248,12 @@ Known-good Arduino CLI compile target for the ESP32-4827S043C profile:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\Tools\CompileEsp32Palm.ps1
+```
+
+Build and upload to the board on `COM4`:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Tools\CompileEsp32Palm.ps1 -Upload -Port COM4
 ```
 
 The helper copies the checkout to a temporary folder named `ESP32-PALM`, because

@@ -1,17 +1,19 @@
 # ESP32-PALM Bring-Up Notes
 
-This sketch is currently a hardware and memory scaffold for a minimal Palm OS
-emulator on the ESP32-4827S043C board.
+This sketch is now a usable Palm m100 bring-up on the ESP32-4827S043C board.
+It is still experimental, but Palm OS boots, touch works, LCD output is usable,
+state snapshots work, low-power sleep is handled, and the emulated Palm UART is
+bridged to the board's host serial port.
 
 What is wired now:
 
 - ESP32-4827S043C RGB LCD and GT911 touch pins copied from
   `cyd_ref/005638_005638_Jingcai_ESP32_4827S043C_simple_GT911_touch.ino`.
-- Palm IIIx ROM embedded from `Palm-IIIx-3.1.rom` with `.incbin`.
+- Palm m100 ROM embedded from `Palm-m100-3.51-en.rom` with `.incbin`.
 - Adaptive emulated Palm RAM at `0x00000000`. The ESP32-4827S043C profile tries
   to allocate the full hardware profile RAM in PSRAM.
-- ROM mapped at `0x10c08000`; the supplied file is the Palm IIIx Big ROM image,
-  so reset PC `0x10c0822a` maps to file offset `0x022a`.
+- ROM mapped at `0x10c08000`; the supplied m100 Big ROM image maps reset
+  vectors into the embedded flash image.
 - The same file is also aliased at `0x10c00000` below the Big ROM base, because
   early boot checks the `FEEDBEEF` Palm card header token at `0x10c00008`.
 - Musashi is patched for this Palm build to keep 32-bit addresses for the
@@ -19,7 +21,11 @@ What is wired now:
   16 MB (`0x10c08000` and `0xfffff000`), so 24-bit masking causes false RAM and
   register alias collisions. Musashi's reset SP/PC are seeded from the ROM
   vector so execution starts in ROM.
-- 160x160 1-bit Palm LCD renderer shown on the selected ESP32 LCD.
+- 160x160 Palm LCD renderer shown on the selected ESP32 LCD, with bilinear
+  panel scaling and only the Palm LCD area updated dynamically.
+- Static m100 silkscreen artwork is generated from `Silkscreen.png` into
+  `silkscreen_asset.h` as a packed 4bpp PROGMEM asset, then drawn once into the
+  static panel frame.
 - A top-of-16MB RAM alias maps the upper emulated RAM window ending at
   `0x01000000` back onto the allocated Palm RAM. Early Palm OS code writes into
   this `0x00ffxxxx` area before the LCD controller is initialized.
@@ -34,7 +40,9 @@ What is wired now:
 - Direct 1-bit LCD rendering from emulated Palm memory. There is no extra local
   160x160 framebuffer copy; this saves 3200 bytes of ESP32 RAM and avoids touch
   input scribbling static into the Palm display area.
-- Palm RAM is allocated before TFT initialization to reduce heap fragmentation.
+- Palm RAM is allocated before LCD initialization to reduce heap fragmentation.
+  The current m100 build tries to keep the low 128 KB in internal DRAM and the
+  rest in PSRAM.
 - If the ESP32 cannot allocate all logical Palm RAM, the missing logical range is
   mirrored into the real paged RAM backing store. This follows Cloudpilot's SRAM
   bank behavior more closely than sparse zeroes: reads and writes above the real
@@ -48,6 +56,18 @@ What is wired now:
 - Instruction fetches are stricter than data reads: sparse RAM can satisfy data
   probes, but executing from sparse or unmapped memory raises an instruction bus
   error. The serial status prints this as `ibus=count@address`.
+- GT911 touch is mapped through the raw ADS/digitizer path used by Palm OS.
+- Virtual hardware buttons are placed in the unused side panel areas. The left
+  strip exposes the four app buttons plus up/down; the right strip exposes
+  power, hold-to-save snapshot, and reset.
+- Snapshot save/restore uses `/palm_m100_state.bin` on the SD card. Restored
+  sleep states are woken automatically.
+- Palm sleep turns off display/backlight, lowers ESP32 CPU frequency, and uses
+  light sleep between lower-rate touch polls. Touch anywhere wakes the device.
+- The emulated DragonBall UART is bridged to the board's CH340 host serial port
+  at 115200 baud after boot logging is released.
+- RTC stopwatch interrupts are not implemented yet; apps that depend on
+  stopwatch ticks may pause while Palm OS is asleep.
 
 `m68kops.c` and `m68kops.h` have been generated with Ubuntu 24.04 under WSL.
 If they need to be regenerated:
@@ -90,21 +110,9 @@ sketch as `partitions.csv`. That custom 16 MB layout uses two 4 MB app slots
 and a 7.9 MB FATFS partition, giving the `-O2` ESP32-S3 build more room than
 Arduino's standard `app3M_fat9M_16MB` layout.
 
-Expected first milestone:
-
-1. Upload with `PALM_ENABLE_MUSASHI` set to `1`.
-2. Confirm the screen shows ROM/RAM/SP/PC diagnostics.
-3. Confirm serial output prints the Musashi PC, LCD state, LCD register writes,
-   and last unmapped read/write once per second.
-4. If the status stays `LCD=off`, the ROM has not configured the DragonBall LCD
-   registers yet. Check `lcdWr`, `unmR`, and `unmW` in the same serial line.
-5. If `LCD=on`, the screen should render directly from Palm RAM.
-6. Start decoding the next unmapped DragonBall registers: timers, interrupts,
-   GPIO, RTC, and pen input.
-
-The hard work after this scaffold is the Palm IIIx hardware model: DragonBall
-memory control, LCD controller registers, timers, interrupt controller, RTC,
-and enough storage/card behavior for Palm OS 3.1 to finish booting.
+Current next work is polish and compatibility: improve CPU speed, make
+HotSync/serial more robust, emulate RTC stopwatch behavior, and add Beam/IR if
+needed.
 
 Desktop harness:
 
