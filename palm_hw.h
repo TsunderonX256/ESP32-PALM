@@ -73,6 +73,24 @@ bool palmHwHasWakeSource();
 void palmHwNotifyMemoryWrite(uint32_t address);
 PalmLcdState palmHwGetLcdState();
 PalmHwDebug palmHwGetDebug();
+uint32_t palmHwUartWriteRx(const uint8_t *buffer, uint32_t count);
+uint32_t palmHwUartReadTx(uint8_t *buffer, uint32_t count);
+uint32_t palmHwUartRxCount();
+uint32_t palmHwUartRxFree();
+uint32_t palmHwUartTxCount();
+uint32_t palmHwUartRxOverrunCount();
+uint32_t palmHwUartTxOverrunCount();
+uint16_t palmHwUartMisc();
+bool palmHwUartIsIrda();
+void palmHwLoadUartState(const uint8_t *rxFifo, const uint8_t *txFifo,
+                         uint32_t sourceFifoSize,
+                         uint32_t rxHead, uint32_t rxTail, uint32_t rxCount,
+                         uint32_t txHead, uint32_t txTail, uint32_t txCount,
+                         uint32_t rxOverrunCount, uint32_t txOverrunCount);
+void palmHwSaveUartState(uint8_t *rxFifo, uint8_t *txFifo,
+                         uint32_t &rxHead, uint32_t &rxTail, uint32_t &rxCount,
+                         uint32_t &txHead, uint32_t &txTail, uint32_t &txCount,
+                         uint32_t &rxOverrunCount, uint32_t &txOverrunCount);
 uint8_t palmHwPeekReg8(uint16_t offset);
 uint16_t palmHwPeekReg16(uint16_t offset);
 uint32_t palmHwPeekReg32(uint16_t offset);

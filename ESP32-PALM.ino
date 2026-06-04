@@ -6,11 +6,13 @@
 #include <freertos/task.h>
 #include <esp_lcd_panel_rgb.h>
 #include <esp_lcd_panel_ops.h>
+#include <esp_sleep.h>
 #endif
 
 #include "palm_config.h"
 #include "palm_hw.h"
 #include "palm_memory.h"
+#include "silkscreen_asset.h"
 
 #include <SPI.h>
 #include <SD.h>
@@ -72,6 +74,7 @@ static constexpr UBaseType_t PALM_RENDER_TASK_PRIORITY = 1;
 static constexpr BaseType_t PALM_RENDER_TASK_CORE = 0;
 static constexpr bool PALM_LCD_BILINEAR_UPSCALE = true;
 static esp_lcd_panel_handle_t rgbPanel = nullptr;
+static bool rgbPanelNeedsRestart = false;
 static TAMC_GT911 gt911(GT911_SDA, GT911_SCL, GT911_INT, GT911_RST, 320, 240);
 static SPIClass sdSpi(FSPI);
 
@@ -90,13 +93,28 @@ static constexpr int PALM_LCD_VIEW_H = PALM_VIEW_H;
 
 static unsigned long lastFrameMs = 0;
 static unsigned long lastStatsMs = 0;
+static unsigned long lastPerfStatsMs = 0;
 static unsigned long lastWakeStatsMs = 0;
 static bool lcdWaitingDrawn = false;
 static bool staticShellDrawn = false;
 static bool cpuReady = false;
 static uint32_t cpuSlices = 0;
+#if PALM_PERF_SERIAL_STATS
+static uint32_t lastPerfCpuSlices = 0;
+static uint32_t lastPerfRenderFrames = 0;
+static uint64_t cpuExecutedCycles = 0;
+static uint64_t lastPerfCpuExecutedCycles = 0;
+static uint32_t renderMeasuredFrames = 0;
+static uint32_t renderTotalMicros = 0;
+static uint32_t renderMaxMicros = 0;
+static uint32_t lastPerfRenderMeasuredFrames = 0;
+static uint32_t lastPerfRenderTotalMicros = 0;
+#endif
 static uint32_t lastWakeStatsSlices = 0;
 static bool restoredStateLoaded = false;
+#if PALM_DEBUG_SERIAL_ENABLED
+static bool debugSerialActive = false;
+#endif
 static bool palmLowPowerModeActive = false;
 static bool palmLowPowerWakeServiceActive = false;
 static bool palmLowPowerRequireTouchRelease = false;
@@ -125,17 +143,26 @@ static int cachedTouchScreenX = -1;
 static int cachedTouchScreenY = -1;
 static int cachedTouchPalmX = -1;
 static int cachedTouchPalmY = -1;
+
+#if PALM_DEBUG_SERIAL_ENABLED
+#define PALM_DBG_PRINTF(...) do { if (debugSerialActive) Serial.printf(__VA_ARGS__); } while (0)
+#define PALM_DBG_PRINTLN(...) do { if (debugSerialActive) Serial.println(__VA_ARGS__); } while (0)
+#else
+#define PALM_DBG_PRINTF(...) do {} while (0)
+#define PALM_DBG_PRINTLN(...) do {} while (0)
+#endif
+
 static bool nativePenDown = false;
 static uint16_t nativePenAdcX = 0xffff;
 static uint16_t nativePenAdcY = 0xffff;
 static int nativePenX = -1;
 static int nativePenY = -1;
-static constexpr int PEN_MOVE_ADC_THRESHOLD = 32;
+static constexpr int PEN_MOVE_ADC_THRESHOLD = 16;
 static bool touchCandidateActive = false;
 static unsigned long touchCandidateMs = 0;
 static int touchCandidatePalmX = -1;
 static int touchCandidatePalmY = -1;
-static constexpr unsigned long TOUCH_STABLE_DOWN_MS = 20;
+static constexpr unsigned long TOUCH_STABLE_DOWN_MS = 8;
 static constexpr int TOUCH_STABLE_PALM_TOLERANCE = 12;
 static TaskHandle_t renderTaskHandle = nullptr;
 static SemaphoreHandle_t renderSurfaceMutex = nullptr;
@@ -541,6 +568,8 @@ struct __attribute__((packed)) PalmNativeStateHeader {
 static_assert(sizeof(PalmNativeDebugState) == 136, "PalmNativeDebugState layout mismatch");
 static_assert(sizeof(PalmNativeStateHeader) == PALM_NATIVE_STATE_HEADER_SIZE,
               "PalmNativeStateHeader layout mismatch");
+static_assert(PALM_UART_FIFO_SIZE <= sizeof(PalmNativeStateHeader::uartRxFifo),
+              "Palm UART FIFO is larger than native state storage");
 
 static PalmNativeStateHeader stateHeaderBuffer;
 static uint8_t stateIoBuffer[PALM_DB_REG_SIZE];
@@ -622,6 +651,10 @@ static bool resetButtonHoldActive = false;
 static bool resetButtonHoldTriggered = false;
 static unsigned long resetButtonHoldStartMs = 0;
 static uint16_t lastPalmBacklightRegister = 0xffff;
+#if PALM_UART_HOST_SERIAL_BRIDGE
+static bool palmUartBridgeActive = false;
+static uint8_t palmUartBridgeBuffer[PALM_UART_BRIDGE_CHUNK];
+#endif
 
 static void lockRenderSurface() {
   if (renderSurfaceMutex != nullptr) xSemaphoreTake(renderSurfaceMutex, portMAX_DELAY);
@@ -880,6 +913,33 @@ static void panelDrawSystemBitmapIcon(uint16_t *target, int x, int y, int w, int
   }
 }
 
+static inline uint8_t silkscreenPixelIndex(int x, int y) {
+  uint8_t packed = pgm_read_byte(kSilkscreenPixels4bpp +
+                                 static_cast<uint32_t>(y) * SILKSCREEN_IMAGE_STRIDE +
+                                 (x >> 1));
+  return (x & 1) != 0 ? (packed & 0x0f) : (packed >> 4);
+}
+
+static void panelDrawSilkscreenBitmap(uint16_t *target, int x, int y, int w, int h) {
+  if (target == nullptr || w <= 0 || h <= 0) return;
+
+  int x0 = x < 0 ? 0 : x;
+  int y0 = y < 0 ? 0 : y;
+  int x1 = x + w > SCREEN_W ? SCREEN_W : x + w;
+  int y1 = y + h > SCREEN_H ? SCREEN_H : y + h;
+  if (x0 >= x1 || y0 >= y1) return;
+
+  for (int py = y0; py < y1; ++py) {
+    int sy = ((py - y) * SILKSCREEN_IMAGE_H) / h;
+    uint16_t *row = target + static_cast<uint32_t>(py) * SCREEN_W;
+    for (int px = x0; px < x1; ++px) {
+      int sx = ((px - x) * SILKSCREEN_IMAGE_W) / w;
+      uint8_t index = silkscreenPixelIndex(sx, sy);
+      row[px] = pgm_read_word(kSilkscreenPalette565 + (index & 0x0f));
+    }
+  }
+}
+
 static void panelDrawAppIcon(uint16_t *target, int x, int y, int w, int h, int bars) {
   int iconW = w / 2;
   int iconH = h / 2;
@@ -1021,14 +1081,7 @@ static void renderPanelStaticFrameFromSurface(uint16_t *target) {
   renderVirtualPowerStrip(target);
 
   int shellViewW = PALM_LCD_VIEW_X - PALM_VIEW_X;
-  for (int dy = 0; dy < PALM_VIEW_H; ++dy) {
-    uint32_t srcX = palmViewToSurfaceX[dy] >> 16;
-
-    uint16_t *shellRow = target + static_cast<uint32_t>(PALM_VIEW_Y + dy) * SCREEN_W + PALM_VIEW_X;
-    for (int dx = 0; dx < shellViewW; ++dx) {
-      shellRow[dx] = palmSurface[static_cast<uint32_t>(palmViewToSurfaceY[dx] >> 16) * PALM_SURFACE_W + srcX];
-    }
-  }
+  panelDrawSilkscreenBitmap(target, PALM_VIEW_X, PALM_VIEW_Y, shellViewW, PALM_VIEW_H);
   renderPanelLcdFrameFromSurface(target);
 }
 
@@ -1236,14 +1289,14 @@ static void setVirtualButtonBits(uint16_t bits, int index, int rawX, int rawY) {
 
 #if PALM_TOUCH_EDGE_SERIAL_STATS
   if (oldBits != 0 && oldBits != bits) {
-    Serial.printf("Button up idx=%d bits=0x%04x raw=%d,%d\n",
+    PALM_DBG_PRINTF("Button up idx=%d bits=0x%04x raw=%d,%d\n",
                   oldIndex,
                   oldBits,
                   rawX,
                   rawY);
   }
   if (bits != 0 && oldBits != bits) {
-    Serial.printf("Button down idx=%d bits=0x%04x raw=%d,%d\n",
+    PALM_DBG_PRINTF("Button down idx=%d bits=0x%04x raw=%d,%d\n",
                   index,
                   bits,
                   rawX,
@@ -1282,7 +1335,7 @@ static void updateSaveButtonHold(bool down, unsigned long now) {
     saveButtonHoldTriggered = false;
     saveButtonHoldStartMs = now;
 #if PALM_TOUCH_EDGE_SERIAL_STATS
-    Serial.println("State save hold started");
+    PALM_DBG_PRINTLN("State save hold started");
 #endif
     return;
   }
@@ -1291,7 +1344,7 @@ static void updateSaveButtonHold(bool down, unsigned long now) {
     saveButtonHoldTriggered = true;
     palmStateSaveRequested = true;
 #if PALM_TOUCH_EDGE_SERIAL_STATS
-    Serial.println("State save hold accepted");
+    PALM_DBG_PRINTLN("State save hold accepted");
 #endif
   }
 }
@@ -1307,7 +1360,7 @@ static void updateResetButtonHold(bool down, unsigned long now) {
     resetButtonHoldTriggered = false;
     resetButtonHoldStartMs = now;
 #if PALM_TOUCH_EDGE_SERIAL_STATS
-    Serial.println("Palm reset hold started");
+    PALM_DBG_PRINTLN("Palm reset hold started");
 #endif
     return;
   }
@@ -1316,7 +1369,7 @@ static void updateResetButtonHold(bool down, unsigned long now) {
     resetButtonHoldTriggered = true;
     palmOsResetRequested = true;
 #if PALM_TOUCH_EDGE_SERIAL_STATS
-    Serial.println("Palm reset hold accepted");
+    PALM_DBG_PRINTLN("Palm reset hold accepted");
 #endif
   }
 }
@@ -1396,9 +1449,19 @@ static void lcdInit() {
 #endif
 }
 
+static void restartRgbPanelIfNeeded() {
+#if defined(ESP32)
+  if (rgbPanel != nullptr && rgbPanelNeedsRestart) {
+    (void)esp_lcd_rgb_panel_restart(rgbPanel);
+    rgbPanelNeedsRestart = false;
+  }
+#endif
+}
+
 static void setPanelOutputEnabled(bool enabled) {
 #if defined(ESP32)
   if (rgbPanel != nullptr) {
+    if (enabled) restartRgbPanelIfNeeded();
     esp_lcd_panel_disp_on_off(rgbPanel, enabled);
   }
 #else
@@ -1462,6 +1525,7 @@ static void setPalmLowPowerMode(bool enabled) {
     setCpuFrequencyMhz(ESP32_PALM_SLEEP_CPU_MHZ);
 #endif
     palmLowPowerRequireTouchRelease = cachedTouchDown || lastTouchDown || virtualButtonBitsDown != 0;
+    lastTouchPollMs = 0;
   } else {
 #if defined(ESP32)
     setCpuFrequencyMhz(ESP32_ACTIVE_CPU_MHZ);
@@ -1472,11 +1536,12 @@ static void setPalmLowPowerMode(bool enabled) {
     lastFrameMs = 0;
     palmLowPowerWakeServiceActive = false;
     palmLowPowerRequireTouchRelease = false;
+    lastTouchPollMs = 0;
   }
 
   palmLowPowerModeActive = enabled;
 #if PALM_WAKE_SERIAL_STATS
-  Serial.printf("ESP32 palm-sleep mode %s cpu=%lu releaseGuard=%u\n",
+  PALM_DBG_PRINTF("ESP32 palm-sleep mode %s cpu=%lu releaseGuard=%u\n",
                 enabled ? "on" : "off",
 #if defined(ESP32)
                 (unsigned long)getCpuFrequencyMhz(),
@@ -1495,7 +1560,7 @@ static void setPalmLowPowerWakeService(bool enabled) {
 #endif
   palmLowPowerWakeServiceActive = enabled;
 #if PALM_WAKE_SERIAL_STATS
-  Serial.printf("ESP32 palm-wake service %s cpu=%lu\n",
+  PALM_DBG_PRINTF("ESP32 palm-wake service %s cpu=%lu\n",
                 enabled ? "on" : "off",
 #if defined(ESP32)
                 (unsigned long)getCpuFrequencyMhz()
@@ -1516,6 +1581,35 @@ static void updatePalmLowPowerMode() {
   }
 }
 
+static unsigned long touchPollIntervalMs() {
+  if (palmLowPowerModeActive && !palmLowPowerWakeServiceActive) {
+    return PALM_SLEEP_TOUCH_POLL_INTERVAL_MS;
+  }
+  return PALM_TOUCH_POLL_INTERVAL_MS;
+}
+
+static bool palmLowPowerNeedsWakeService() {
+  return !palmLowPowerRequireTouchRelease &&
+         (wakeTouchActive || palmHwGetInterruptLevel() > 0 || palmHwHasWakeSource());
+}
+
+static void enterPalmDeepIdle() {
+  const unsigned long sleepMs = PALM_SLEEP_TOUCH_POLL_INTERVAL_MS > 0 ?
+                                PALM_SLEEP_TOUCH_POLL_INTERVAL_MS : 1;
+#if defined(ESP32) && PALM_DEEP_IDLE_LIGHT_SLEEP
+  const uint64_t sleepUs = static_cast<uint64_t>(sleepMs) * 1000ULL;
+  if (esp_sleep_enable_timer_wakeup(sleepUs) == ESP_OK &&
+      esp_light_sleep_start() == ESP_OK) {
+    // This RGB panel driver exposes restart/set-clock hooks, but not a safe
+    // public DMA pause/resume call. Keep the display dark while light sleep
+    // stops the CPU between touch polls, then resync DMA before showing pixels.
+    rgbPanelNeedsRestart = true;
+    return;
+  }
+#endif
+  delay(sleepMs);
+}
+
 static bool getPalmScreenTouch(int &screenX, int &screenY) {
   unsigned long now = millis();
   if (touchInputDisabled) {
@@ -1528,7 +1622,7 @@ static bool getPalmScreenTouch(int &screenX, int &screenY) {
     return false;
   }
 
-  if (now - lastTouchPollMs >= PALM_TOUCH_POLL_INTERVAL_MS) {
+  if (now - lastTouchPollMs >= touchPollIntervalMs()) {
     lastTouchPollMs = now;
     gt911.read();
     bool controllerDown = gt911.isTouched && gt911.touches > 0;
@@ -1653,7 +1747,7 @@ static void logTouchEdge(const char *mode, bool down, uint16_t adcX, uint16_t ad
                 abs(static_cast<int>(adcY) - static_cast<int>(touchEdgeSerialLastAdcY)) >= PEN_MOVE_ADC_THRESHOLD);
   if (down == touchEdgeSerialLastDown && !moved) return;
 
-  Serial.printf("Touch %s %s gt=%d,%d palm=%d,%d screen=%d,%d adc=%u,%u\n",
+  PALM_DBG_PRINTF("Touch %s %s gt=%d,%d palm=%d,%d screen=%d,%d adc=%u,%u\n",
                 mode,
                 down ? "down" : "up",
                 lastTouchRawX,
@@ -1732,10 +1826,10 @@ static uint32_t callPalmTrapStack(uint16_t trap, const uint8_t *stackBytes,
   m68k_set_reg(M68K_REG_SP, callSp);
   m68k_set_reg(M68K_REG_PC, PALM_CALL_STUB_ADDRESS);
   for (int i = 0; i < 1200; ++i) {
-    palmHwAdvanceCycles(2000);
     palmHwCycle();
     m68k_set_irq(palmHwGetInterruptLevel());
-    m68k_execute(2000);
+    int usedCycles = m68k_execute(2000);
+    palmHwAdvanceCycles(usedCycles > 0 ? static_cast<uint32_t>(usedCycles) : 0);
     palmHwCycle();
     m68k_set_irq(palmHwGetInterruptLevel());
     uint32_t pc = m68k_get_reg(nullptr, M68K_REG_PC);
@@ -1793,7 +1887,7 @@ static void enqueuePalmOsPenPoint(bool down, int palmX, int palmY) {
                                             static_cast<int16_t>(palmY));
   callPalmTrapNoArgs(SYS_TRAP_EVT_WAKEUP);
 #if PALM_TOUCH_EDGE_SERIAL_STATS
-  Serial.printf("Touch evt %s palm=%d,%d err=%lu\n",
+  PALM_DBG_PRINTF("Touch evt %s palm=%d,%d err=%lu\n",
                 down ? "down" : "up",
                 down ? palmX : -1,
                 down ? palmY : -1,
@@ -1859,6 +1953,9 @@ static void drawBootPattern() {
 }
 
 static bool drawPalmFrameFromEmulatedLcd() {
+#if PALM_PERF_SERIAL_STATS
+  uint32_t renderStartMicros = micros();
+#endif
   PalmLcdState lcd = palmHwGetLcdState();
   if (!lcd.valid) {
     drawWaitingFrame();
@@ -1896,6 +1993,12 @@ static bool drawPalmFrameFromEmulatedLcd() {
 
   requestPanelRender();
   palmHwMarkLcdClean();
+#if PALM_PERF_SERIAL_STATS
+  uint32_t renderMicros = micros() - renderStartMicros;
+  renderTotalMicros += renderMicros;
+  if (renderMicros > renderMaxMicros) renderMaxMicros = renderMicros;
+  ++renderMeasuredFrames;
+#endif
   return true;
 }
 
@@ -1927,9 +2030,78 @@ static void initPins() {
 }
 
 static void initSerialDebug() {
-#if PALM_BOOT_SERIAL_STATS || PALM_RUNTIME_SERIAL_STATS
+#if PALM_DEBUG_SERIAL_ENABLED
   Serial.begin(115200);
+  debugSerialActive = true;
   delay(250);
+#endif
+}
+
+static void beginPalmUartBridge() {
+#if PALM_UART_HOST_SERIAL_BRIDGE
+  if (palmUartBridgeActive) return;
+#if PALM_DEBUG_SERIAL_ENABLED
+  if (!debugSerialActive) {
+    Serial.begin(PALM_UART_HOST_SERIAL_BAUD);
+  }
+#else
+  Serial.begin(PALM_UART_HOST_SERIAL_BAUD);
+#endif
+  palmUartBridgeActive = true;
+#endif
+}
+
+static void releaseSerialDebugForPalmUart() {
+#if PALM_DEBUG_SERIAL_BOOT_ONLY && \
+    PALM_BOOT_SERIAL_STATS && \
+    !PALM_STATE_SERIAL_STATS && \
+    !PALM_RUNTIME_SERIAL_STATS && \
+    !PALM_PERF_SERIAL_STATS && \
+    !PALM_TOUCH_EDGE_SERIAL_STATS && \
+    !PALM_WAKE_SERIAL_STATS
+  if (debugSerialActive) {
+    PALM_DBG_PRINTLN("Debug serial released for Palm UART");
+    Serial.flush();
+    delay(20);
+#if !PALM_UART_HOST_SERIAL_BRIDGE
+    Serial.end();
+#endif
+    debugSerialActive = false;
+  }
+#endif
+  beginPalmUartBridge();
+}
+
+static void servicePalmUartBridge() {
+#if PALM_UART_HOST_SERIAL_BRIDGE
+  if (!palmUartBridgeActive) return;
+
+  uint32_t rxFree = palmHwUartRxFree();
+  uint32_t rxRead = 0;
+  while (rxRead < sizeof(palmUartBridgeBuffer) && rxFree > 0 && Serial.available() > 0) {
+    int value = Serial.read();
+    if (value < 0) break;
+    palmUartBridgeBuffer[rxRead++] = static_cast<uint8_t>(value);
+    --rxFree;
+  }
+  if (rxRead > 0) {
+    palmHwUartWriteRx(palmUartBridgeBuffer, rxRead);
+  }
+
+  uint32_t txQueued = palmHwUartTxCount();
+  while (txQueued > 0) {
+    int canWrite = Serial.availableForWrite();
+    if (canWrite <= 0) break;
+
+    uint32_t chunk = txQueued;
+    if (chunk > sizeof(palmUartBridgeBuffer)) chunk = sizeof(palmUartBridgeBuffer);
+    if (chunk > static_cast<uint32_t>(canWrite)) chunk = static_cast<uint32_t>(canWrite);
+
+    uint32_t txRead = palmHwUartReadTx(palmUartBridgeBuffer, chunk);
+    if (txRead == 0) break;
+    Serial.write(palmUartBridgeBuffer, txRead);
+    txQueued = palmHwUartTxCount();
+  }
 #endif
 }
 
@@ -2001,14 +2173,14 @@ static bool copyStateRamFromFile(File &file, uint32_t ramSize) {
     uint32_t chunk = remaining > sizeof(stateIoBuffer) ? sizeof(stateIoBuffer) : remaining;
     if (!readExact(file, stateIoBuffer, chunk)) {
 #if PALM_BOOT_SERIAL_STATS
-      Serial.printf("State restore failed: RAM read stopped at %lu/%lu\n",
+      PALM_DBG_PRINTF("State restore failed: RAM read stopped at %lu/%lu\n",
                     (unsigned long)offset, (unsigned long)ramSize);
 #endif
       return false;
     }
     if (!palmRamWriteBytes(offset, stateIoBuffer, chunk)) {
 #if PALM_BOOT_SERIAL_STATS
-      Serial.printf("State restore failed: RAM write stopped at %lu/%lu\n",
+      PALM_DBG_PRINTF("State restore failed: RAM write stopped at %lu/%lu\n",
                     (unsigned long)offset, (unsigned long)ramSize);
 #endif
       return false;
@@ -2016,7 +2188,7 @@ static bool copyStateRamFromFile(File &file, uint32_t ramSize) {
     offset += chunk;
 #if PALM_BOOT_SERIAL_STATS
     if ((offset & 0x3ffffUL) == 0) {
-      Serial.printf("State RAM restored: %lu/%lu\n",
+      PALM_DBG_PRINTF("State RAM restored: %lu/%lu\n",
                     (unsigned long)offset, (unsigned long)ramSize);
     }
 #endif
@@ -2031,23 +2203,23 @@ static bool copyStateRamToFile(File &file, uint32_t ramSize) {
     uint32_t remaining = ramSize - offset;
     uint32_t chunk = remaining > sizeof(stateIoBuffer) ? sizeof(stateIoBuffer) : remaining;
     if (!palmRamReadBytes(offset, stateIoBuffer, chunk)) {
-#if PALM_BOOT_SERIAL_STATS
-      Serial.printf("State save failed: RAM read stopped at %lu/%lu\n",
+#if PALM_STATE_SERIAL_STATS
+      PALM_DBG_PRINTF("State save failed: RAM read stopped at %lu/%lu\n",
                     (unsigned long)offset, (unsigned long)ramSize);
 #endif
       return false;
     }
     if (!writeExact(file, stateIoBuffer, chunk)) {
-#if PALM_BOOT_SERIAL_STATS
-      Serial.printf("State save failed: RAM write stopped at %lu/%lu\n",
+#if PALM_STATE_SERIAL_STATS
+      PALM_DBG_PRINTF("State save failed: RAM write stopped at %lu/%lu\n",
                     (unsigned long)offset, (unsigned long)ramSize);
 #endif
       return false;
     }
     offset += chunk;
-#if PALM_BOOT_SERIAL_STATS
+#if PALM_STATE_SERIAL_STATS
     if ((offset & 0x3ffffUL) == 0) {
-      Serial.printf("State RAM saved: %lu/%lu\n",
+      PALM_DBG_PRINTF("State RAM saved: %lu/%lu\n",
                     (unsigned long)offset, (unsigned long)ramSize);
     }
 #endif
@@ -2105,7 +2277,7 @@ static void printWakeDebugLine(const char *tag, uint16_t touchAdcX, uint16_t tou
   uint8_t portDReq = palmHwPeekReg8(0x41D);
   uint8_t portDKbd = palmHwPeekReg8(0x41E);
   uint8_t portDEdge = palmHwPeekReg8(0x41F);
-  Serial.printf("DBG %s t=%lu pc=%08lx sp=%08lx sr=%04lx sleep=%u wake=%u irq=%u slices=%lu(+%lu) "
+  PALM_DBG_PRINTF("DBG %s t=%lu pc=%08lx sp=%08lx sr=%04lx sleep=%u wake=%u irq=%u slices=%lu(+%lu) "
                 "pll=%04x im=%04x/%04x st=%04x/%04x pend=%04x/%04x tmr=%04x/%04x/%04x/%04x/%04x "
                 "pd=%02x/%02x pol=%02x req=%02x kbd=%02x edge=%02x "
                 "lcd=%u/%u/%u start=%08lx bpp=%u touch=%u raw=%d,%d palm=%d,%d adc=%u,%u wakeTouch=%u power=%u\n",
@@ -2260,6 +2432,32 @@ static bool fillNativeStateHeaderForSave(PalmNativeStateHeader &header,
   header.lastRtcSecond = hw.lastRtcSecond;
   header.lcdDirty = hw.lcdDirty;
   header.lcdFrameReady = hw.lcdFrameReady;
+  uint32_t uartRxHead;
+  uint32_t uartRxTail;
+  uint32_t uartRxCount;
+  uint32_t uartTxHead;
+  uint32_t uartTxTail;
+  uint32_t uartTxCount;
+  uint32_t uartRxOverrunCount;
+  uint32_t uartTxOverrunCount;
+  palmHwSaveUartState(header.uartRxFifo,
+                      header.uartTxFifo,
+                      uartRxHead,
+                      uartRxTail,
+                      uartRxCount,
+                      uartTxHead,
+                      uartTxTail,
+                      uartTxCount,
+                      uartRxOverrunCount,
+                      uartTxOverrunCount);
+  header.uartRxHead = uartRxHead;
+  header.uartRxTail = uartRxTail;
+  header.uartRxCount = uartRxCount;
+  header.uartTxHead = uartTxHead;
+  header.uartTxTail = uartTxTail;
+  header.uartTxCount = uartTxCount;
+  header.uartRxOverrunCount = uartRxOverrunCount;
+  header.uartTxOverrunCount = uartTxOverrunCount;
   return true;
 }
 
@@ -2267,7 +2465,7 @@ static bool restoreRawRamFromFile(File &file, uint64_t fileSize) {
   if (fileSize != palmRamSize()) return false;
   if (!file.seek(0)) return false;
 #if PALM_BOOT_SERIAL_STATS
-  Serial.printf("Raw RAM image found on SD: %lu bytes\n", (unsigned long)fileSize);
+  PALM_DBG_PRINTF("Raw RAM image found on SD: %lu bytes\n", (unsigned long)fileSize);
 #endif
   return copyStateRamFromFile(file, static_cast<uint32_t>(fileSize));
 }
@@ -2275,14 +2473,14 @@ static bool restoreRawRamFromFile(File &file, uint64_t fileSize) {
 static bool restoreNativeStateFromFile(File &file, uint64_t fileSize) {
   if (fileSize < sizeof(PalmNativeStateHeader)) {
 #if PALM_BOOT_SERIAL_STATS
-    Serial.printf("State restore skipped: file too small (%lu bytes)\n", (unsigned long)fileSize);
+    PALM_DBG_PRINTF("State restore skipped: file too small (%lu bytes)\n", (unsigned long)fileSize);
 #endif
     return false;
   }
   if (!file.seek(0) || !readExact(file, reinterpret_cast<uint8_t *>(&stateHeaderBuffer),
                                   sizeof(stateHeaderBuffer))) {
 #if PALM_BOOT_SERIAL_STATS
-    Serial.println("State restore failed: could not read native header");
+    PALM_DBG_PRINTLN("State restore failed: could not read native header");
 #endif
     return false;
   }
@@ -2290,7 +2488,7 @@ static bool restoreNativeStateFromFile(File &file, uint64_t fileSize) {
   const uint32_t expectedTotal =
       static_cast<uint32_t>(sizeof(PalmNativeStateHeader) + PALM_DB_REG_SIZE + palmRamSize());
 #if PALM_BOOT_SERIAL_STATS
-  Serial.printf("State header: magic=0x%08lx version=%lu total=%lu ram=%lu regs=%lu rom=%lu pc=0x%08lx\n",
+  PALM_DBG_PRINTF("State header: magic=0x%08lx version=%lu total=%lu ram=%lu regs=%lu rom=%lu pc=0x%08lx\n",
                 (unsigned long)stateHeaderBuffer.magic,
                 (unsigned long)stateHeaderBuffer.version,
                 (unsigned long)stateHeaderBuffer.totalSize,
@@ -2308,7 +2506,7 @@ static bool restoreNativeStateFromFile(File &file, uint64_t fileSize) {
       stateHeaderBuffer.romSize != palmRomSize() ||
       fileSize < stateHeaderBuffer.totalSize) {
 #if PALM_BOOT_SERIAL_STATS
-    Serial.printf("State restore rejected: expected total=%lu ram=%lu regs=%lu rom=%lu file=%lu\n",
+    PALM_DBG_PRINTF("State restore rejected: expected total=%lu ram=%lu regs=%lu rom=%lu file=%lu\n",
                   (unsigned long)expectedTotal,
                   (unsigned long)palmRamSize(),
                   (unsigned long)PALM_DB_REG_SIZE,
@@ -2320,24 +2518,35 @@ static bool restoreNativeStateFromFile(File &file, uint64_t fileSize) {
 
   if (!readExact(file, stateIoBuffer, PALM_DB_REG_SIZE)) {
 #if PALM_BOOT_SERIAL_STATS
-    Serial.println("State restore failed: could not read DragonBall registers");
+    PALM_DBG_PRINTLN("State restore failed: could not read DragonBall registers");
 #endif
     return false;
   }
   PalmHwSavedState hw = hwStateFromNativeHeader(stateHeaderBuffer);
   if (!palmHwLoadState(stateIoBuffer, PALM_DB_REG_SIZE, hw)) {
 #if PALM_BOOT_SERIAL_STATS
-    Serial.println("State restore failed: DragonBall restore rejected");
+    PALM_DBG_PRINTLN("State restore failed: DragonBall restore rejected");
 #endif
     return false;
   }
+  palmHwLoadUartState(stateHeaderBuffer.uartRxFifo,
+                      stateHeaderBuffer.uartTxFifo,
+                      sizeof(stateHeaderBuffer.uartRxFifo),
+                      stateHeaderBuffer.uartRxHead,
+                      stateHeaderBuffer.uartRxTail,
+                      stateHeaderBuffer.uartRxCount,
+                      stateHeaderBuffer.uartTxHead,
+                      stateHeaderBuffer.uartTxTail,
+                      stateHeaderBuffer.uartTxCount,
+                      stateHeaderBuffer.uartRxOverrunCount,
+                      stateHeaderBuffer.uartTxOverrunCount);
   if (!copyStateRamFromFile(file, stateHeaderBuffer.ramSize)) return false;
   restoreCpuFromState(stateHeaderBuffer);
   restoredStateLoaded = true;
   lastWakeStatsSlices = cpuSlices;
   wakeDebugLastSleep = palmHwIsAsleep();
 #if PALM_BOOT_SERIAL_STATS
-  Serial.printf("Native state restored: PC=0x%08lx SP=0x%08lx SR=0x%04lx cpuInit=%u\n",
+  PALM_DBG_PRINTF("Native state restored: PC=0x%08lx SP=0x%08lx SR=0x%04lx cpuInit=%u\n",
                 (unsigned long)stateHeaderBuffer.pc,
                 (unsigned long)stateHeaderBuffer.sp,
                 (unsigned long)(stateHeaderBuffer.sr & 0xffffUL),
@@ -2353,7 +2562,7 @@ static bool restorePalmStateFromSd() {
   sdSpi.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
   if (!SD.begin(SD_CS, sdSpi, PALM_STATE_SD_SPI_HZ)) {
 #if PALM_BOOT_SERIAL_STATS
-    Serial.println("SD state restore skipped: SD init failed");
+    PALM_DBG_PRINTLN("SD state restore skipped: SD init failed");
 #endif
     return false;
   }
@@ -2361,14 +2570,14 @@ static bool restorePalmStateFromSd() {
   File stateFile = SD.open(PALM_STATE_SD_PATH, FILE_READ);
   if (!stateFile) {
 #if PALM_BOOT_SERIAL_STATS
-    Serial.printf("SD state restore skipped: %s not found\n", PALM_STATE_SD_PATH);
+    PALM_DBG_PRINTF("SD state restore skipped: %s not found\n", PALM_STATE_SD_PATH);
 #endif
     return false;
   }
 
   uint64_t fileSize = stateFile.size();
 #if PALM_BOOT_SERIAL_STATS
-  Serial.printf("SD state file found: %s, %lu bytes\n",
+  PALM_DBG_PRINTF("SD state file found: %s, %lu bytes\n",
                 PALM_STATE_SD_PATH, (unsigned long)fileSize);
 #endif
   bool restored = restoreNativeStateFromFile(stateFile, fileSize);
@@ -2384,8 +2593,8 @@ static bool savePalmStateToSd() {
   digitalWrite(SD_CS, HIGH);
   sdSpi.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
   if (!SD.begin(SD_CS, sdSpi, PALM_STATE_SD_SPI_HZ)) {
-#if PALM_BOOT_SERIAL_STATS
-    Serial.println("State save failed: SD init failed");
+#if PALM_STATE_SERIAL_STATS
+    PALM_DBG_PRINTLN("State save failed: SD init failed");
 #endif
     return false;
   }
@@ -2393,14 +2602,14 @@ static bool savePalmStateToSd() {
   PalmHwSavedState hw;
   if (!palmHwSaveState(stateIoBuffer, PALM_DB_REG_SIZE, hw) ||
       !fillNativeStateHeaderForSave(stateHeaderBuffer, hw)) {
-#if PALM_BOOT_SERIAL_STATS
-    Serial.println("State save failed: could not capture emulator state");
+#if PALM_STATE_SERIAL_STATS
+    PALM_DBG_PRINTLN("State save failed: could not capture emulator state");
 #endif
     return false;
   }
 
-#if PALM_BOOT_SERIAL_STATS
-  Serial.printf("State save starting: %s, total=%lu ram=%lu pc=0x%08lx\n",
+#if PALM_STATE_SERIAL_STATS
+  PALM_DBG_PRINTF("State save starting: %s, total=%lu ram=%lu pc=0x%08lx\n",
                 PALM_STATE_SD_PATH,
                 (unsigned long)stateHeaderBuffer.totalSize,
                 (unsigned long)stateHeaderBuffer.ramSize,
@@ -2410,8 +2619,8 @@ static bool savePalmStateToSd() {
   SD.remove(PALM_STATE_SD_TEMP_PATH);
   File stateFile = SD.open(PALM_STATE_SD_TEMP_PATH, FILE_WRITE);
   if (!stateFile) {
-#if PALM_BOOT_SERIAL_STATS
-    Serial.printf("State save failed: could not open %s\n", PALM_STATE_SD_TEMP_PATH);
+#if PALM_STATE_SERIAL_STATS
+    PALM_DBG_PRINTF("State save failed: could not open %s\n", PALM_STATE_SD_TEMP_PATH);
 #endif
     return false;
   }
@@ -2429,8 +2638,8 @@ static bool savePalmStateToSd() {
 
   SD.remove(PALM_STATE_SD_PATH);
   ok = SD.rename(PALM_STATE_SD_TEMP_PATH, PALM_STATE_SD_PATH);
-#if PALM_BOOT_SERIAL_STATS
-  Serial.println(ok ? "State save complete" : "State save failed: rename failed");
+#if PALM_STATE_SERIAL_STATS
+  PALM_DBG_PRINTLN(ok ? "State save complete" : "State save failed: rename failed");
 #endif
   if (!ok) SD.remove(PALM_STATE_SD_TEMP_PATH);
   return ok;
@@ -2478,8 +2687,8 @@ static bool waitPalmSleepSettledForStateSave() {
 static bool requestPalmSleepForStateSave() {
   if (palmHwIsAsleep()) return waitPalmSleepSettledForStateSave();
 
-#if PALM_BOOT_SERIAL_STATS
-  Serial.println("State save: requesting Palm sleep");
+#if PALM_STATE_SERIAL_STATS
+  PALM_DBG_PRINTLN("State save: requesting Palm sleep");
 #endif
   palmHwSetPowerButton(true);
   for (int i = 0; i < PALM_STATE_SAVE_SLEEP_PULSE_SLICES; ++i) {
@@ -2488,8 +2697,8 @@ static bool requestPalmSleepForStateSave() {
   }
   palmHwSetPowerButton(false);
   bool settled = waitPalmSleepSettledForStateSave();
-#if PALM_BOOT_SERIAL_STATS
-  Serial.printf("State save: Palm sleep %s\n", settled ? "settled" : "timeout");
+#if PALM_STATE_SERIAL_STATS
+  PALM_DBG_PRINTF("State save: Palm sleep %s\n", settled ? "settled" : "timeout");
 #endif
   return settled;
 }
@@ -2504,14 +2713,14 @@ static bool wakePalmAfterStateSave() {
     if (!palmHwIsAsleep()) return true;
   }
 
-#if PALM_BOOT_SERIAL_STATS
-  Serial.println("State save: waking Palm");
+#if PALM_STATE_SERIAL_STATS
+  PALM_DBG_PRINTLN("State save: waking Palm");
 #endif
 
   palmHwPrepareForSleepSnapshot();
   for (int attempt = 0; attempt < 3; ++attempt) {
-#if PALM_BOOT_SERIAL_STATS
-    Serial.printf("State save: wake attempt %d\n", attempt + 1);
+#if PALM_STATE_SERIAL_STATS
+    PALM_DBG_PRINTF("State save: wake attempt %d\n", attempt + 1);
 #endif
     palmHwSetPowerButton(true);
     for (int i = 0; i < PALM_STATE_SAVE_WAKE_PULSE_SLICES; ++i) {
@@ -2528,8 +2737,8 @@ static bool wakePalmAfterStateSave() {
     }
     if (!palmHwIsAsleep()) break;
   }
-#if PALM_BOOT_SERIAL_STATS
-  Serial.printf("State save: Palm wake %s\n", !palmHwIsAsleep() ? "OK" : "timeout");
+#if PALM_STATE_SERIAL_STATS
+  PALM_DBG_PRINTF("State save: Palm wake %s\n", !palmHwIsAsleep() ? "OK" : "timeout");
 #endif
   return !palmHwIsAsleep();
 }
@@ -2554,14 +2763,14 @@ static void servicePalmStateSaveRequest() {
     palmHwPrepareForSleepSnapshot();
     saveOk = savePalmStateToSd();
   } else {
-#if PALM_BOOT_SERIAL_STATS
-    Serial.println("State save skipped: Palm sleep did not settle");
+#if PALM_STATE_SERIAL_STATS
+    PALM_DBG_PRINTLN("State save skipped: Palm sleep did not settle");
 #endif
   }
   bool wakeOk = true;
   if (sleptForSave || palmHwIsAsleep()) wakeOk = wakePalmAfterStateSave();
-#if PALM_BOOT_SERIAL_STATS
-  Serial.printf("State save result: save=%s wake=%s asleep=%u\n",
+#if PALM_STATE_SERIAL_STATS
+  PALM_DBG_PRINTF("State save result: save=%s wake=%s asleep=%u\n",
                 saveOk ? "OK" : "NO",
                 wakeOk ? "OK" : "NO",
                 palmHwIsAsleep() ? 1 : 0);
@@ -2594,8 +2803,8 @@ static void servicePalmOsResetRequest() {
   setPanelOutputEnabled(true);
   setPalmBacklightDuty();
 
-#if PALM_BOOT_SERIAL_STATS
-  Serial.println("Palm OS reset starting");
+#if PALM_STATE_SERIAL_STATS
+  PALM_DBG_PRINTLN("Palm OS reset starting");
 #endif
   cpuReady = false;
   palmHwInit();
@@ -2612,8 +2821,8 @@ static void servicePalmOsResetRequest() {
   wakeDebugLastSleep = false;
   lastFrameMs = 0;
   lastWakeStatsSlices = cpuSlices;
-#if PALM_BOOT_SERIAL_STATS
-  Serial.println("Palm OS reset complete");
+#if PALM_STATE_SERIAL_STATS
+  PALM_DBG_PRINTLN("Palm OS reset complete");
 #endif
 
   touchInputDisabled = false;
@@ -2631,16 +2840,25 @@ static void executePalmCpuSlice(uint32_t cycles) {
 #if PALM_ENABLE_MUSASHI
   if (!cpuReady || cycles == 0) return;
 
-  palmHwAdvanceCycles(cycles);
   palmHwCycle();
   uint8_t irqLevel = palmHwGetInterruptLevel();
   m68k_set_irq(irqLevel);
+  uint32_t elapsedCycles = cycles;
   if (!palmHwIsAsleep() || irqLevel > 0 || palmHwHasWakeSource()) {
-    m68k_execute(cycles);
+    int usedCycles = m68k_execute(cycles);
+    if (usedCycles <= 0) {
+      elapsedCycles = 0;
+    } else if (static_cast<uint32_t>(usedCycles) < cycles) {
+      elapsedCycles = static_cast<uint32_t>(usedCycles);
+    }
   }
+  palmHwAdvanceCycles(elapsedCycles);
   palmHwCycle();
   m68k_set_irq(palmHwGetInterruptLevel());
   ++cpuSlices;
+#if PALM_PERF_SERIAL_STATS
+  cpuExecutedCycles += elapsedCycles;
+#endif
   if ((cpuSlices & 0x0f) == 0) yield();
 #else
   (void)cycles;
@@ -2658,6 +2876,51 @@ static void runPalmCpuForBudget(unsigned long budgetMs) {
   } while (millis() - cpuStartMs < budgetMs);
 #else
   (void)budgetMs;
+#endif
+}
+
+static void maybePrintPerfStats(unsigned long now) {
+#if PALM_PERF_SERIAL_STATS
+  if (lastPerfStatsMs == 0) {
+    lastPerfStatsMs = now;
+    lastPerfCpuSlices = cpuSlices;
+    lastPerfRenderFrames = renderFrames;
+    lastPerfCpuExecutedCycles = cpuExecutedCycles;
+    lastPerfRenderMeasuredFrames = renderMeasuredFrames;
+    lastPerfRenderTotalMicros = renderTotalMicros;
+    return;
+  }
+
+  unsigned long elapsedMs = now - lastPerfStatsMs;
+  if (elapsedMs < 2000) return;
+
+  uint32_t sliceDelta = cpuSlices - lastPerfCpuSlices;
+  uint32_t renderDelta = renderFrames - lastPerfRenderFrames;
+  uint64_t cycleDelta = cpuExecutedCycles - lastPerfCpuExecutedCycles;
+  uint32_t measuredRenderDelta = renderMeasuredFrames - lastPerfRenderMeasuredFrames;
+  uint32_t renderMicrosDelta = renderTotalMicros - lastPerfRenderTotalMicros;
+  uint32_t avgRenderMicros = measuredRenderDelta == 0 ? 0 : renderMicrosDelta / measuredRenderDelta;
+
+  PALM_DBG_PRINTF("PERF t=%lu burst=%u slice/s=%lu cyc/s=%llu render/s=%lu render_us=%lu/%lu touch=%u sleep=%u\n",
+                (unsigned long)now,
+                PALM_CPU_BURST_MS,
+                (unsigned long)((static_cast<uint64_t>(sliceDelta) * 1000ULL) / elapsedMs),
+                static_cast<unsigned long long>((cycleDelta * 1000ULL) / elapsedMs),
+                (unsigned long)((static_cast<uint64_t>(renderDelta) * 1000ULL) / elapsedMs),
+                (unsigned long)avgRenderMicros,
+                (unsigned long)renderMaxMicros,
+                lastTouchDown ? 1 : 0,
+                palmHwIsAsleep() ? 1 : 0);
+
+  lastPerfStatsMs = now;
+  lastPerfCpuSlices = cpuSlices;
+  lastPerfRenderFrames = renderFrames;
+  lastPerfCpuExecutedCycles = cpuExecutedCycles;
+  lastPerfRenderMeasuredFrames = renderMeasuredFrames;
+  lastPerfRenderTotalMicros = renderTotalMicros;
+  renderMaxMicros = 0;
+#else
+  (void)now;
 #endif
 }
 
@@ -2699,19 +2962,19 @@ void setup() {
   initSerialDebug();
   bool renderBuffersOk = initRenderBuffers();
 #if PALM_BOOT_SERIAL_STATS
-  Serial.printf("Heap before Palm RAM: free=%lu max=%lu\n",
+  PALM_DBG_PRINTF("Heap before Palm RAM: free=%lu max=%lu\n",
                 (unsigned long)ESP.getFreeHeap(),
                 (unsigned long)ESP.getMaxAllocHeap());
 #if defined(ESP32)
-  Serial.printf("Render buffers: surface=%p lcd=%p %s\n",
+  PALM_DBG_PRINTF("Render buffers: surface=%p lcd=%p %s\n",
                 palmSurface,
                 palmPanelLcd,
                 renderBuffersOk ? "OK" : "FAILED");
-  Serial.printf("Panel frames: a=%p b=%p %s\n",
+  PALM_DBG_PRINTF("Panel frames: a=%p b=%p %s\n",
                 panelFrames[0],
                 panelFrames[1],
                 panelFramesInInternalRam ? "INTERNAL" : "PSRAM");
-  Serial.printf("RGB timing: pclk=%ld edge=%s idle=%s bounce=%u h=%d/%d/%d v=%d/%d/%d\n",
+  PALM_DBG_PRINTF("RGB timing: pclk=%ld edge=%s idle=%s bounce=%u h=%d/%d/%d v=%d/%d/%d\n",
                 (long)RGB_PANEL_PIXEL_CLOCK_HZ,
                 RGB_PANEL_PCLK_ACTIVE_NEG ? "neg" : "pos",
                 RGB_PANEL_PCLK_IDLE_HIGH ? "high" : "low",
@@ -2722,11 +2985,11 @@ void setup() {
                 RGB_PANEL_VSYNC_FRONT_PORCH,
                 RGB_PANEL_VSYNC_PULSE_WIDTH,
                 RGB_PANEL_VSYNC_BACK_PORCH);
-  Serial.printf("8-bit heap before Palm RAM: free=%lu max=%lu\n",
+  PALM_DBG_PRINTF("8-bit heap before Palm RAM: free=%lu max=%lu\n",
                 (unsigned long)heap_caps_get_free_size(MALLOC_CAP_8BIT),
                 (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 #if defined(MALLOC_CAP_SPIRAM)
-  Serial.printf("PSRAM before Palm RAM: free=%lu max=%lu\n",
+  PALM_DBG_PRINTF("PSRAM before Palm RAM: free=%lu max=%lu\n",
                 (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
                 (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
 #endif
@@ -2735,7 +2998,7 @@ void setup() {
 
   if (!renderBuffersOk) {
 #if PALM_BOOT_SERIAL_STATS
-    Serial.println("Render buffer allocation failed");
+    PALM_DBG_PRINTLN("Render buffer allocation failed");
 #endif
     return;
   }
@@ -2744,7 +3007,7 @@ void setup() {
   initDisplay();
   drawStaticDisplayTest();
 #if PALM_BOOT_SERIAL_STATS
-  Serial.println("Static display test active; Palm emulator is not running.");
+  PALM_DBG_PRINTLN("Static display test active; Palm emulator is not running.");
 #endif
   return;
 #endif
@@ -2752,23 +3015,23 @@ void setup() {
   bool memoryOk = palmMemoryInit();
 
 #if PALM_BOOT_SERIAL_STATS
-  Serial.println();
-  Serial.println("ESP32-PALM bring-up");
-  Serial.printf("ROM base: 0x%08lx, ROM bytes: %lu\n", (unsigned long)PALM_ROM_BASE, (unsigned long)palmRomSize());
-  Serial.printf("Initial SP: 0x%08lx\n", (unsigned long)palmRead32(PALM_ROM_BASE));
-  Serial.printf("Initial PC: 0x%08lx\n", (unsigned long)palmRead32(PALM_ROM_BASE + 4));
-  Serial.printf("Palm RAM logical: %lu bytes, alloc target: %lu bytes, allocated: %lu bytes %s\n",
+  PALM_DBG_PRINTLN();
+  PALM_DBG_PRINTLN("ESP32-PALM bring-up");
+  PALM_DBG_PRINTF("ROM base: 0x%08lx, ROM bytes: %lu\n", (unsigned long)PALM_ROM_BASE, (unsigned long)palmRomSize());
+  PALM_DBG_PRINTF("Initial SP: 0x%08lx\n", (unsigned long)palmRead32(PALM_ROM_BASE));
+  PALM_DBG_PRINTF("Initial PC: 0x%08lx\n", (unsigned long)palmRead32(PALM_ROM_BASE + 4));
+  PALM_DBG_PRINTF("Palm RAM logical: %lu bytes, alloc target: %lu bytes, allocated: %lu bytes %s\n",
                 (unsigned long)PALM_RAM_LOGICAL_SIZE,
                 (unsigned long)PALM_RAM_ALLOC_TARGET_SIZE,
                 (unsigned long)(memoryOk ? palmRamSize() : palmRamLastAllocAttemptSize()),
                 memoryOk ? "OK" : "FAILED");
-  Serial.printf("Palm RAM segments: %lu\n",
+  PALM_DBG_PRINTF("Palm RAM segments: %lu\n",
                 (unsigned long)palmRamLastAllocAttemptSegments());
-  Serial.printf("Heap after Palm RAM: free=%lu max=%lu\n",
+  PALM_DBG_PRINTF("Heap after Palm RAM: free=%lu max=%lu\n",
                 (unsigned long)ESP.getFreeHeap(),
                 (unsigned long)ESP.getMaxAllocHeap());
 #if defined(ESP32) && defined(MALLOC_CAP_SPIRAM)
-  Serial.printf("PSRAM after Palm RAM: free=%lu max=%lu\n",
+  PALM_DBG_PRINTF("PSRAM after Palm RAM: free=%lu max=%lu\n",
                 (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
                 (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
 #endif
@@ -2776,18 +3039,18 @@ void setup() {
 
   initTouch();
 #if PALM_BOOT_SERIAL_STATS
-  Serial.println("Touch initialized");
+  PALM_DBG_PRINTLN("Touch initialized");
 #endif
   initDisplay();
 #if PALM_BOOT_SERIAL_STATS
-  Serial.println("LCD initialized");
-  Serial.printf("Render task: %s core=%d\n",
+  PALM_DBG_PRINTLN("LCD initialized");
+  PALM_DBG_PRINTF("Render task: %s core=%d\n",
                 renderTaskHandle != nullptr ? "core0" : "sync",
                 renderTaskHandle != nullptr ? PALM_RENDER_TASK_CORE : -1);
 #endif
   drawBootPattern();
 #if PALM_BOOT_SERIAL_STATS
-  Serial.println("Boot pattern drawn");
+  PALM_DBG_PRINTLN("Boot pattern drawn");
 #endif
 #if PALM_BOOT_STATUS_TEXT
   char romLine[48];
@@ -2805,7 +3068,7 @@ void setup() {
 
   if (memoryOk) {
 #if PALM_BOOT_SERIAL_STATS
-    Serial.println("CPU init starting");
+    PALM_DBG_PRINTLN("CPU init starting");
 #endif
     initCpu();
     bool stateRestored = restorePalmStateFromSd();
@@ -2815,8 +3078,9 @@ void setup() {
       drawPalmFrameFromEmulatedLcd();
     }
 #if PALM_BOOT_SERIAL_STATS
-    Serial.println("CPU init complete");
+    PALM_DBG_PRINTLN("CPU init complete");
 #endif
+    releaseSerialDebugForPalmUart();
   }
 }
 
@@ -2934,9 +3198,11 @@ void loop() {
   servicePalmOsResetRequest();
   updatePalmLowPowerMode();
   updatePalmBacklightFromOs();
+  servicePalmUartBridge();
 
   unsigned long now = millis();
   maybePrintWakeHeartbeat(now);
+  maybePrintPerfStats(now);
   unsigned long nextFrameMs = lastFrameMs + PALM_LCD_REDRAW_INTERVAL_MS;
   if (!palmLowPowerModeActive && (lastFrameMs == 0 || timeReached(now, nextFrameMs))) {
     lastFrameMs = now;
@@ -2947,8 +3213,7 @@ void loop() {
 
   if (palmLowPowerModeActive) {
     palmHwCycle();
-    bool needsWakeService = !palmLowPowerRequireTouchRelease &&
-                            (wakeTouchActive || palmHwGetInterruptLevel() > 0 || palmHwHasWakeSource());
+    bool needsWakeService = palmLowPowerNeedsWakeService();
     if (needsWakeService) {
       setPalmLowPowerWakeService(true);
       runPalmCpuForBudget(PALM_CPU_BURST_MS);
@@ -2956,11 +3221,11 @@ void loop() {
         setPalmLowPowerMode(false);
       } else if (!wakeTouchActive && palmHwGetInterruptLevel() == 0 && !palmHwHasWakeSource()) {
         setPalmLowPowerWakeService(false);
-        delay(1);
+        enterPalmDeepIdle();
       }
     } else {
       setPalmLowPowerWakeService(false);
-      delay(1);
+      enterPalmDeepIdle();
     }
   } else {
     long msUntilNextFrame = static_cast<long>(nextFrameMs - now);
@@ -2970,18 +3235,19 @@ void loop() {
       runPalmCpuForBudget(cpuBudgetMs);
     }
   }
+  servicePalmUartBridge();
 
 #if PALM_RUNTIME_SERIAL_STATS
   if (now - lastStatsMs >= 1000) {
     lastStatsMs = now;
 #if PALM_ENABLE_MUSASHI
     if (!cpuReady) {
-      Serial.printf("CPU stopped, Palm RAM allocation failed. attempted=%lu seg=%lu free=%lu\n",
+      PALM_DBG_PRINTF("CPU stopped, Palm RAM allocation failed. attempted=%lu seg=%lu free=%lu\n",
                     (unsigned long)palmRamLastAllocAttemptSize(),
                     (unsigned long)palmRamLastAllocAttemptSegments(),
                     (unsigned long)ESP.getFreeHeap());
 #if defined(ESP32)
-      Serial.printf("8-bit heap now: free=%lu\n",
+      PALM_DBG_PRINTF("8-bit heap now: free=%lu\n",
                     (unsigned long)heap_caps_get_free_size(MALLOC_CAP_8BIT));
 #endif
       return;
@@ -2989,7 +3255,7 @@ void loop() {
 
     PalmLcdState lcd = palmHwGetLcdState();
     uint8_t irq = palmHwGetInterruptLevel();
-    Serial.printf("PC=%08x irq=%u slices=%lu render=%lu t=%04x/%04x/%04x im=%04x/%04x is=%04x/%04x lcd=%u/%u/%u bpp=%u panel=%02x pitch=%u touch=%u raw=%d,%d scr=%d,%d palm=%d,%d adc=%u,%u\n",
+    PALM_DBG_PRINTF("PC=%08x irq=%u slices=%lu render=%lu t=%04x/%04x/%04x im=%04x/%04x is=%04x/%04x lcd=%u/%u/%u bpp=%u panel=%02x pitch=%u touch=%u raw=%d,%d scr=%d,%d palm=%d,%d adc=%u,%u\n",
                   m68k_get_reg(nullptr, M68K_REG_PC),
                   irq,
                   (unsigned long)cpuSlices,
@@ -3017,7 +3283,7 @@ void loop() {
                   lastTouchAdcX,
                   lastTouchAdcY);
 #else
-    Serial.printf("Touch framebuffer alive, free heap=%lu\n", (unsigned long)ESP.getFreeHeap());
+    PALM_DBG_PRINTF("Touch framebuffer alive, free heap=%lu\n", (unsigned long)ESP.getFreeHeap());
 #endif
   }
 #endif

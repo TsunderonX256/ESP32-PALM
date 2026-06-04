@@ -19,6 +19,8 @@ static uint16_t lastTimerStatus = 0;
 static uint64_t systemCycles = 0;
 static double timerLastCycles = 0.0;
 static uint64_t timerLastHostMicros = 0;
+static uint64_t cyclePaceHostMicros = 0;
+static uint64_t cyclePaceBaseCycles = 0;
 static uint32_t lastRtcSecond = 0xffffffffUL;
 static uint32_t adsBitBufferIn = 0;
 static uint16_t adsBitBufferOut = 0;
@@ -32,6 +34,16 @@ static uint16_t penYRaw = 0;
 static uint16_t buttonBitsDown = 0;
 static bool cradleButtonLineLow = false;
 static uint8_t portDEdge = 0;
+static uint8_t uartRxFifo[PALM_UART_FIFO_SIZE];
+static uint8_t uartTxFifo[PALM_UART_FIFO_SIZE];
+static uint32_t uartRxHead = 0;
+static uint32_t uartRxTail = 0;
+static uint32_t uartRxCount = 0;
+static uint32_t uartTxHead = 0;
+static uint32_t uartTxTail = 0;
+static uint32_t uartTxCount = 0;
+static uint32_t uartRxOverrunCount = 0;
+static uint32_t uartTxOverrunCount = 0;
 
 static constexpr uint8_t PORT_D_POWER_FAIL = 0x80;
 static constexpr uint16_t INT_HI_PEN = 0x0010;
@@ -59,6 +71,23 @@ static constexpr uint16_t SPIM_ENABLE = 0x0200;
 static constexpr uint16_t SPIM_EXCHANGE = 0x0100;
 static constexpr uint16_t SPIM_INT_STATUS = 0x0080;
 static constexpr uint16_t SPIM_INT_ENABLE = 0x0040;
+static constexpr uint16_t UART_CONTROL_ENABLE = 0x8000;
+static constexpr uint16_t UART_CONTROL_RX_ENABLE = 0x4000;
+static constexpr uint16_t UART_CONTROL_TX_ENABLE = 0x2000;
+static constexpr uint16_t UART_CONTROL_RX_FULL_INT_ENABLE = 0x0020;
+static constexpr uint16_t UART_CONTROL_RX_HALF_INT_ENABLE = 0x0010;
+static constexpr uint16_t UART_CONTROL_RX_RDY_INT_ENABLE = 0x0008;
+static constexpr uint16_t UART_CONTROL_TX_EMPTY_INT_ENABLE = 0x0004;
+static constexpr uint16_t UART_CONTROL_TX_HALF_INT_ENABLE = 0x0002;
+static constexpr uint16_t UART_CONTROL_TX_AVAIL_INT_ENABLE = 0x0001;
+static constexpr uint16_t UART_RX_FIFO_FULL = 0x8000;
+static constexpr uint16_t UART_RX_FIFO_HALF = 0x4000;
+static constexpr uint16_t UART_RX_DATA_READY = 0x2000;
+static constexpr uint16_t UART_TX_FIFO_EMPTY = 0x8000;
+static constexpr uint16_t UART_TX_FIFO_HALF = 0x4000;
+static constexpr uint16_t UART_TX_AVAILABLE = 0x2000;
+static constexpr uint16_t UART_TX_IGNORE_CTS = 0x0800;
+static constexpr uint16_t UART_MISC_IRDA_ENABLE = 0x0020;
 static constexpr uint16_t TMR_STATUS_COMPARE = 0x0001;
 static constexpr uint16_t TMR_CONTROL_ENABLE = 0x0001;
 static constexpr uint16_t TMR_CONTROL_INT_ENABLE = 0x0010;
@@ -201,6 +230,15 @@ bool palmHwIsAsleep() {
 
 static double systemClockFrequency() {
   return PALM_SYSTEM_CLOCK_HZ;
+}
+
+static uint64_t hostMicrosToSystemCycles(uint64_t elapsedMicros) {
+  return static_cast<uint64_t>((static_cast<double>(elapsedMicros) * systemClockFrequency()) / 1000000.0);
+}
+
+static void resetCyclePacer(uint64_t nowMicros) {
+  cyclePaceHostMicros = nowMicros;
+  cyclePaceBaseCycles = systemCycles;
 }
 
 static double timerTicksPerSecond() {
@@ -447,6 +485,8 @@ static void seedRtcFromTimeRegister() {
 }
 
 static void updateRtcInterrupts() {
+  // RTC stopwatch interrupt behavior is not implemented yet. Apps that depend
+  // on DragonBall RTC stopwatch ticks may pause while Palm OS is asleep.
   uint16_t pending = get16(0xB0E) & get16(0xB10) &
                      (RTC_INT_STOPWATCH | RTC_INT_MINUTE | RTC_INT_ALARM |
                       RTC_INT_24HR | RTC_INT_SECOND | RTC_INT_HOUR);
@@ -572,6 +612,70 @@ static void updateSpimInterruptPending() {
   }
 }
 
+static void updateUartRegs() {
+  uint16_t control = get16(0x900);
+  uint16_t receive = get16(0x904) & 0x00ff;
+  uint16_t transmit = (get16(0x906) & 0x00ff) | UART_TX_IGNORE_CTS;
+
+  if (uartRxCount > 0) {
+    receive = UART_RX_DATA_READY | uartRxFifo[uartRxTail];
+    if (uartRxCount >= PALM_UART_FIFO_SIZE) receive |= UART_RX_FIFO_FULL;
+    if (uartRxCount >= PALM_UART_FIFO_SIZE / 2) receive |= UART_RX_FIFO_HALF;
+  }
+
+  transmit |= UART_TX_AVAILABLE;
+  if (uartTxCount == 0) transmit |= UART_TX_FIFO_EMPTY;
+  if (uartTxCount < PALM_UART_FIFO_SIZE / 2) transmit |= UART_TX_FIFO_HALF;
+
+  put16(0x904, receive);
+  put16(0x906, transmit);
+
+  bool pending = false;
+  if ((control & UART_CONTROL_ENABLE) != 0) {
+    if ((control & UART_CONTROL_RX_ENABLE) != 0) {
+      if ((receive & UART_RX_DATA_READY) != 0 && (control & UART_CONTROL_RX_RDY_INT_ENABLE) != 0) pending = true;
+      if ((receive & UART_RX_FIFO_HALF) != 0 && (control & UART_CONTROL_RX_HALF_INT_ENABLE) != 0) pending = true;
+      if ((receive & UART_RX_FIFO_FULL) != 0 && (control & UART_CONTROL_RX_FULL_INT_ENABLE) != 0) pending = true;
+    }
+    if ((control & UART_CONTROL_TX_ENABLE) != 0) {
+      if ((transmit & UART_TX_AVAILABLE) != 0 && (control & UART_CONTROL_TX_AVAIL_INT_ENABLE) != 0) pending = true;
+      if ((transmit & UART_TX_FIFO_HALF) != 0 && (control & UART_CONTROL_TX_HALF_INT_ENABLE) != 0) pending = true;
+      if ((transmit & UART_TX_FIFO_EMPTY) != 0 && (control & UART_CONTROL_TX_EMPTY_INT_ENABLE) != 0) pending = true;
+    }
+  }
+
+  if (pending) {
+    put16(0x312, get16(0x312) | INT_LO_UART);
+  } else {
+    put16(0x312, get16(0x312) & ~INT_LO_UART);
+  }
+  updateInterruptStatus();
+}
+
+static bool enqueueUartRxByte(uint8_t value) {
+  if (uartRxCount >= PALM_UART_FIFO_SIZE) {
+    ++uartRxOverrunCount;
+    return false;
+  }
+
+  uartRxFifo[uartRxHead] = value;
+  uartRxHead = (uartRxHead + 1) % PALM_UART_FIFO_SIZE;
+  ++uartRxCount;
+  return true;
+}
+
+static void resetUartState() {
+  uartRxHead = 0;
+  uartRxTail = 0;
+  uartRxCount = 0;
+  uartTxHead = 0;
+  uartTxTail = 0;
+  uartTxCount = 0;
+  uartRxOverrunCount = 0;
+  uartTxOverrunCount = 0;
+  put16(0x906, UART_TX_FIFO_EMPTY | UART_TX_FIFO_HALF | UART_TX_AVAILABLE | UART_TX_IGNORE_CTS);
+}
+
 void palmHwInit() {
   memset(dbRegs, 0, PALM_DB_REG_SIZE);
   adsBitBufferIn = 0;
@@ -586,6 +690,7 @@ void palmHwInit() {
   buttonBitsDown = 0;
   cradleButtonLineLow = false;
   portDEdge = 0;
+  resetUartState();
 
   // DragonBall EZ defaults copied from Cloudpilot's EmRegsEZ reset image.
   dbRegs[0x000] = 0x1c;        // system control
@@ -634,6 +739,7 @@ void palmHwInit() {
   dbRegs[0xA31] = 0xb9;        // frame rate
   dbRegs[0xA33] = 0x84;        // gray palette
   put16(0xA36, 0x0000);        // contrast PWM
+  put16(0x906, UART_TX_FIFO_EMPTY | UART_TX_FIFO_HALF | UART_TX_AVAILABLE | UART_TX_IGNORE_CTS);
 
   updateLcdWriteRange();
   lcdDirty = true;
@@ -644,6 +750,7 @@ void palmHwInit() {
   systemCycles = 0;
   timerLastCycles = 0.0;
   timerLastHostMicros = hostMonotonicMicros();
+  resetCyclePacer(timerLastHostMicros);
   seedRtcFromTimeRegister();
   memset(&hwDebug, 0, sizeof(hwDebug));
 }
@@ -656,6 +763,7 @@ bool palmHwLoadState(const uint8_t *regs, size_t regSize, const PalmHwSavedState
   systemCycles = state.systemCycles;
   timerLastCycles = state.timerLastCycles;
   timerLastHostMicros = hostMonotonicMicros();
+  resetCyclePacer(timerLastHostMicros);
   seedRtcFromTimeRegister();
 
   adsBitBufferIn = state.adsBitBufferIn;
@@ -680,6 +788,7 @@ bool palmHwLoadState(const uint8_t *regs, size_t regSize, const PalmHwSavedState
   memset(&hwDebug, 0, sizeof(hwDebug));
   updatePortDInterrupts();
   updateRtcInterrupts();
+  updateUartRegs();
   updateInterruptStatus();
   return true;
 }
@@ -794,7 +903,24 @@ void palmHwSetButtonBits(uint16_t bits, bool down) {
 }
 
 void palmHwAdvanceCycles(uint32_t cycles) {
-  systemCycles += cycles;
+  uint64_t requestedCycles = systemCycles + cycles;
+  uint64_t nowMicros = hostMonotonicMicros();
+
+  if (palmHwIsAsleep()) {
+    systemCycles = requestedCycles;
+    resetCyclePacer(nowMicros);
+    return;
+  }
+
+  if (cyclePaceHostMicros == 0 || nowMicros < cyclePaceHostMicros) {
+    resetCyclePacer(nowMicros);
+  }
+
+  uint64_t elapsedMicros = nowMicros - cyclePaceHostMicros;
+  uint64_t maxCycles = cyclePaceBaseCycles + hostMicrosToSystemCycles(elapsedMicros);
+  if (maxCycles < systemCycles) maxCycles = systemCycles;
+
+  systemCycles = requestedCycles > maxCycles ? maxCycles : requestedCycles;
 }
 
 void palmHwCycle() {
@@ -841,6 +967,18 @@ uint8_t palmHwRead8(uint32_t address) {
     return readPortData(offset);
   }
   if (offset >= 0x30C && offset <= 0x313) updateInterruptStatus();
+  if (offset >= 0x900 && offset <= 0x909) updateUartRegs();
+  if (offset == 0x904 || offset == 0x905) {
+    uint16_t receive = get16(0x904);
+    uint8_t value = dbRegs[offset];
+    if (offset == 0x905 && (receive & UART_RX_DATA_READY) != 0 && uartRxCount > 0) {
+      value = uartRxFifo[uartRxTail];
+      uartRxTail = (uartRxTail + 1) % PALM_UART_FIFO_SIZE;
+      --uartRxCount;
+      updateUartRegs();
+    }
+    return value;
+  }
   if (offset >= 0x608 && offset <= 0x60B) updateTimer();
   if (offset >= 0xB00 && offset <= 0xB03) updateRtcTime();
   if (offset >= 0x60A && offset <= 0x60B) {
@@ -889,6 +1027,17 @@ void palmHwWrite8(uint32_t address, uint8_t value) {
   }
   if (offset == 0x803) completeSpiExchange();
   if (offset == 0x802 || offset == 0x803) updateSpimInterruptPending();
+  if (offset == 0x907) {
+    if (uartTxCount < PALM_UART_FIFO_SIZE) {
+      uartTxFifo[uartTxHead] = value;
+      uartTxHead = (uartTxHead + 1) % PALM_UART_FIFO_SIZE;
+      ++uartTxCount;
+    } else {
+      ++uartTxOverrunCount;
+    }
+    updateUartRegs();
+  }
+  if (offset >= 0x900 && offset <= 0x909) updateUartRegs();
   if (offset == 0x60A || offset == 0x60B) {
     uint16_t status = get16(0x60A);
     status &= value | ~lastTimerStatus;
@@ -952,6 +1101,100 @@ PalmLcdState palmHwGetLcdState() {
 }
 
 PalmHwDebug palmHwGetDebug() { return hwDebug; }
+
+uint32_t palmHwUartWriteRx(const uint8_t *buffer, uint32_t count) {
+  if (buffer == nullptr || count == 0) return 0;
+
+  uint32_t written = 0;
+  while (written < count) {
+    if (!enqueueUartRxByte(buffer[written])) break;
+    ++written;
+  }
+  if (written < count) uartRxOverrunCount += count - written - 1;
+  updateUartRegs();
+  return written;
+}
+
+uint32_t palmHwUartReadTx(uint8_t *buffer, uint32_t count) {
+  if (buffer == nullptr || count == 0) return 0;
+
+  uint32_t read = 0;
+  while (read < count && uartTxCount > 0) {
+    buffer[read++] = uartTxFifo[uartTxTail];
+    uartTxTail = (uartTxTail + 1) % PALM_UART_FIFO_SIZE;
+    --uartTxCount;
+  }
+  updateUartRegs();
+  return read;
+}
+
+uint32_t palmHwUartRxCount() { return uartRxCount; }
+
+uint32_t palmHwUartRxFree() {
+  return uartRxCount >= PALM_UART_FIFO_SIZE ? 0 : PALM_UART_FIFO_SIZE - uartRxCount;
+}
+
+uint32_t palmHwUartTxCount() { return uartTxCount; }
+uint32_t palmHwUartRxOverrunCount() { return uartRxOverrunCount; }
+uint32_t palmHwUartTxOverrunCount() { return uartTxOverrunCount; }
+uint16_t palmHwUartMisc() { return get16(0x908); }
+bool palmHwUartIsIrda() { return (get16(0x908) & UART_MISC_IRDA_ENABLE) != 0; }
+
+static uint32_t loadUartQueue(uint8_t *dst, const uint8_t *src, uint32_t sourceSize,
+                              uint32_t sourceTail, uint32_t sourceCount) {
+  memset(dst, 0, PALM_UART_FIFO_SIZE);
+  if (src == nullptr || sourceSize == 0) return 0;
+  const uint32_t copyCount =
+      sourceCount > PALM_UART_FIFO_SIZE ? PALM_UART_FIFO_SIZE : sourceCount;
+  for (uint32_t i = 0; i < copyCount; ++i) {
+    dst[i] = src[(sourceTail + i) % sourceSize];
+  }
+  return copyCount;
+}
+
+static uint32_t saveUartQueue(uint8_t *dst, const uint8_t *src, uint32_t sourceTail,
+                              uint32_t sourceCount) {
+  if (dst == nullptr) return 0;
+  const uint32_t copyCount =
+      sourceCount > PALM_UART_FIFO_SIZE ? PALM_UART_FIFO_SIZE : sourceCount;
+  for (uint32_t i = 0; i < copyCount; ++i) {
+    dst[i] = src[(sourceTail + i) % PALM_UART_FIFO_SIZE];
+  }
+  return copyCount;
+}
+
+void palmHwLoadUartState(const uint8_t *rxFifo, const uint8_t *txFifo,
+                         uint32_t sourceFifoSize,
+                         uint32_t rxHead, uint32_t rxTail, uint32_t rxCount,
+                         uint32_t txHead, uint32_t txTail, uint32_t txCount,
+                         uint32_t rxOverrun, uint32_t txOverrun) {
+  (void)rxHead;
+  (void)txHead;
+  uartRxTail = 0;
+  uartRxCount = loadUartQueue(uartRxFifo, rxFifo, sourceFifoSize, rxTail, rxCount);
+  uartRxHead = uartRxCount % PALM_UART_FIFO_SIZE;
+  uartTxTail = 0;
+  uartTxCount = loadUartQueue(uartTxFifo, txFifo, sourceFifoSize, txTail, txCount);
+  uartTxHead = uartTxCount % PALM_UART_FIFO_SIZE;
+  uartRxOverrunCount = rxOverrun;
+  uartTxOverrunCount = txOverrun;
+  updateUartRegs();
+}
+
+void palmHwSaveUartState(uint8_t *rxFifo, uint8_t *txFifo,
+                         uint32_t &rxHead, uint32_t &rxTail, uint32_t &rxCount,
+                         uint32_t &txHead, uint32_t &txTail, uint32_t &txCount,
+                         uint32_t &rxOverrun, uint32_t &txOverrun) {
+  updateUartRegs();
+  rxCount = saveUartQueue(rxFifo, uartRxFifo, uartRxTail, uartRxCount);
+  rxTail = 0;
+  rxHead = rxCount;
+  txCount = saveUartQueue(txFifo, uartTxFifo, uartTxTail, uartTxCount);
+  txTail = 0;
+  txHead = txCount;
+  rxOverrun = uartRxOverrunCount;
+  txOverrun = uartTxOverrunCount;
+}
 
 uint8_t palmHwPeekReg8(uint16_t offset) {
   return offset < PALM_DB_REG_SIZE ? dbRegs[offset] : 0xff;
