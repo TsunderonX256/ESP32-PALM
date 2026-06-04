@@ -218,35 +218,8 @@ static double timerTicksPerSecond() {
   }
 }
 
-static void updateTimer() {
-  uint16_t control = get16(0x600);
-  uint64_t nowMicros = hostMonotonicMicros();
-  if ((control & TMR_CONTROL_ENABLE) == 0) {
-    timerLastCycles = static_cast<double>(systemCycles);
-    timerLastHostMicros = nowMicros;
-    return;
-  }
-
-  double timerHz = timerTicksPerSecond();
-  if (timerHz <= 0.0) {
-    timerLastCycles = static_cast<double>(systemCycles);
-    timerLastHostMicros = nowMicros;
-    return;
-  }
-
-  if (timerLastHostMicros == 0) {
-    timerLastHostMicros = nowMicros;
-    timerLastCycles = static_cast<double>(systemCycles);
-    return;
-  }
-
-  uint64_t elapsedMicros = nowMicros - timerLastHostMicros;
-  uint32_t ticks = static_cast<uint32_t>((static_cast<double>(elapsedMicros) * timerHz) / 1000000.0);
+static void applyTimerTicks(uint16_t control, uint32_t ticks) {
   if (ticks == 0) return;
-
-  timerLastHostMicros += static_cast<uint64_t>((static_cast<double>(ticks) * 1000000.0) / timerHz);
-  timerLastCycles += static_cast<double>(ticks) / timerHz * systemClockFrequency();
-
   uint32_t updatedCounter = static_cast<uint32_t>(get16(0x608)) + ticks;
   uint16_t compare = get16(0x604);
   put16(0x608, static_cast<uint16_t>(updatedCounter));
@@ -260,6 +233,58 @@ static void updateTimer() {
       updateInterruptStatus();
     }
   }
+}
+
+static void resetTimerBaselines(uint64_t nowMicros) {
+  timerLastCycles = static_cast<double>(systemCycles);
+  timerLastHostMicros = nowMicros;
+}
+
+static void updateTimer() {
+  uint16_t control = get16(0x600);
+  uint64_t nowMicros = hostMonotonicMicros();
+  if ((control & TMR_CONTROL_ENABLE) == 0) {
+    resetTimerBaselines(nowMicros);
+    return;
+  }
+
+  double timerHz = timerTicksPerSecond();
+  if (timerHz <= 0.0) {
+    resetTimerBaselines(nowMicros);
+    return;
+  }
+
+  if (palmHwIsAsleep()) {
+    if (timerLastHostMicros == 0) {
+      resetTimerBaselines(nowMicros);
+      return;
+    }
+
+    uint64_t elapsedMicros = nowMicros - timerLastHostMicros;
+    uint32_t ticks = static_cast<uint32_t>((static_cast<double>(elapsedMicros) * timerHz) / 1000000.0);
+    if (ticks == 0) return;
+
+    timerLastHostMicros += static_cast<uint64_t>((static_cast<double>(ticks) * 1000000.0) / timerHz);
+    timerLastCycles = static_cast<double>(systemCycles);
+    applyTimerTicks(control, ticks);
+    return;
+  }
+
+  double elapsedCycles = static_cast<double>(systemCycles) - timerLastCycles;
+  if (elapsedCycles <= 0.0) {
+    timerLastHostMicros = nowMicros;
+    return;
+  }
+
+  uint32_t ticks = static_cast<uint32_t>((elapsedCycles / systemClockFrequency()) * timerHz);
+  if (ticks == 0) {
+    timerLastHostMicros = nowMicros;
+    return;
+  }
+
+  timerLastCycles += (static_cast<double>(ticks) / timerHz) * systemClockFrequency();
+  timerLastHostMicros = nowMicros;
+  applyTimerTicks(control, ticks);
 }
 
 static bool keyRowF(uint8_t bit) {

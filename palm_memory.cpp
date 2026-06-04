@@ -11,6 +11,10 @@
 #define PALM_MEM_FAST
 #endif
 
+#ifndef PALM_MEMORY_COMPATIBLE_ACCESS
+#define PALM_MEMORY_COMPATIBLE_ACCESS 0
+#endif
+
 extern "C" {
 extern const uint8_t palm_rom_start[];
 extern const uint8_t palm_rom_end[];
@@ -568,12 +572,18 @@ static bool romOffset(uint32_t address, uint32_t &offset) {
 
 uint8_t PALM_MEM_FAST palmRead8(uint32_t address) {
   uint32_t offset;
+#if !PALM_MEMORY_COMPATIBLE_ACCESS
   const uint8_t *direct = cachedReadPointer(address, 1);
   if (direct != nullptr) return direct[0];
   const uint8_t *rom = romPointerForAddress(address, 1);
   if (rom != nullptr) return rom[0];
   uint8_t *ram = ramPointerForAddress(address, 1);
   if (ram != nullptr) return ram[0];
+#else
+  if (romOffset(address, offset)) return palm_rom_start[offset];
+  if (palmHwInRegisterSpace(address)) return palmHwRead8(address);
+  if (ramOffset(address, offset)) return *ramPointer(offset);
+#endif
   if (palmHwInRegisterSpace(address)) return palmHwRead8(address);
   if (ramSizeProbeAddress(address)) return 0x00;
 #if PALM_MIRROR_LOGICAL_RAM
@@ -605,6 +615,10 @@ uint8_t PALM_MEM_FAST palmRead8(uint32_t address) {
 }
 
 uint16_t PALM_MEM_FAST palmRead16(uint32_t address) {
+#if PALM_MEMORY_COMPATIBLE_ACCESS
+  return (static_cast<uint16_t>(palmRead8(address)) << 8) |
+         static_cast<uint16_t>(palmRead8(address + 1));
+#else
   uint32_t offset;
   uint32_t nextOffset;
   const uint8_t *direct = cachedReadPointer(address, 2);
@@ -647,9 +661,14 @@ uint16_t PALM_MEM_FAST palmRead16(uint32_t address) {
 #endif
   return (static_cast<uint16_t>(palmRead8(address)) << 8) |
          static_cast<uint16_t>(palmRead8(address + 1));
+#endif
 }
 
 uint32_t PALM_MEM_FAST palmRead32(uint32_t address) {
+#if PALM_MEMORY_COMPATIBLE_ACCESS
+  return (static_cast<uint32_t>(palmRead16(address)) << 16) |
+         static_cast<uint32_t>(palmRead16(address + 2));
+#else
   uint32_t offset;
   uint32_t lastOffset;
   const uint8_t *direct = cachedReadPointer(address, 4);
@@ -676,16 +695,19 @@ uint32_t PALM_MEM_FAST palmRead32(uint32_t address) {
 #endif
   return (static_cast<uint32_t>(palmRead16(address)) << 16) |
          static_cast<uint32_t>(palmRead16(address + 2));
+#endif
 }
 
 void PALM_MEM_FAST palmWrite8(uint32_t address, uint8_t value) {
   uint32_t offset;
+#if !PALM_MEMORY_COMPATIBLE_ACCESS
   uint8_t *direct = cachedWritePointer(address, 1);
   if (direct != nullptr) {
     direct[0] = value;
     palmHwNotifyMemoryWrite(address);
     return;
   }
+#endif
   if (palmHwInRegisterSpace(address)) {
     palmHwWrite8(address, value);
     return;
@@ -735,6 +757,10 @@ void PALM_MEM_FAST palmWrite8(uint32_t address, uint8_t value) {
 }
 
 void PALM_MEM_FAST palmWrite16(uint32_t address, uint16_t value) {
+#if PALM_MEMORY_COMPATIBLE_ACCESS
+  palmWrite8(address, value >> 8);
+  palmWrite8(address + 1, value & 0xff);
+#else
   uint32_t offset;
   uint32_t nextOffset;
   uint8_t *direct = cachedWritePointer(address, 2);
@@ -789,9 +815,14 @@ void PALM_MEM_FAST palmWrite16(uint32_t address, uint16_t value) {
 #endif
   palmWrite8(address, value >> 8);
   palmWrite8(address + 1, value & 0xff);
+#endif
 }
 
 void PALM_MEM_FAST palmWrite32(uint32_t address, uint32_t value) {
+#if PALM_MEMORY_COMPATIBLE_ACCESS
+  palmWrite16(address, value >> 16);
+  palmWrite16(address + 2, value & 0xffff);
+#else
   uint32_t offset;
   uint32_t lastOffset;
   uint8_t *direct = cachedWritePointer(address, 4);
@@ -840,6 +871,7 @@ void PALM_MEM_FAST palmWrite32(uint32_t address, uint32_t value) {
 #endif
   palmWrite16(address, value >> 16);
   palmWrite16(address + 2, value & 0xffff);
+#endif
 }
 
 extern "C" unsigned int PALM_MEM_FAST m68k_read_memory_8(unsigned int address) {
@@ -857,8 +889,10 @@ extern "C" unsigned int PALM_MEM_FAST m68k_read_memory_32(unsigned int address) 
 extern "C" unsigned int PALM_MEM_FAST palm_read_instr_16(unsigned int address) {
   uint32_t offset;
   uint32_t nextOffset;
+#if !PALM_MEMORY_COMPATIBLE_ACCESS
   const uint8_t *direct = cachedReadPointer(address, 2);
   if (direct != nullptr) return readBe16(direct);
+#endif
   const uint8_t *rom = romPointerForAddress(address, 2);
   if (rom != nullptr) {
     return readBe16(rom);

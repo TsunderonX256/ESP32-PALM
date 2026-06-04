@@ -8,6 +8,8 @@ obj/
 NativeMusashi/build*/
 PalmDesktopHarness/bin/
 PalmDesktopHarness/obj/
+PalmBeamCom/bin/
+PalmBeamCom/obj/
 PalmRamProbe/bin/
 PalmRamProbe/obj/
 Tools/M68kDasm/build*/
