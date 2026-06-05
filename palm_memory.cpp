@@ -73,6 +73,7 @@ static PalmMemoryDebug memoryDebug;
 static uint8_t sed1375Regs[PALM_SED1375_REG_SIZE];
 static uint8_t *sed1375Vram = nullptr;
 static uint32_t sed1375Clut[256];
+static uint16_t sed1375Clut565[256];
 static uint8_t sed1375LutEntry = 0;
 static uint8_t sed1375LutColor = 0;
 static bool sed1375Dirty = true;
@@ -372,6 +373,17 @@ static bool sed1375VramOffset(uint32_t address, uint32_t &offset) {
   return false;
 }
 
+static uint16_t argbTo565(uint32_t argb) {
+  uint8_t r = static_cast<uint8_t>((argb >> 16) & 0xff);
+  uint8_t g = static_cast<uint8_t>((argb >> 8) & 0xff);
+  uint8_t b = static_cast<uint8_t>(argb & 0xff);
+  return static_cast<uint16_t>(((r & 0xf8) << 8) | ((g & 0xfc) << 3) | (b >> 3));
+}
+
+static void updateSed1375Clut565(uint8_t index) {
+  sed1375Clut565[index] = argbTo565(sed1375Clut[index]);
+}
+
 static void markSed1375Dirty() {
   sed1375Dirty = true;
   ++sed1375DirtyGeneration;
@@ -405,6 +417,7 @@ static bool initSed1375() {
   sed1375LutColor = 0;
   for (uint32_t i = 0; i < 256; ++i) {
     sed1375Clut[i] = 0xff000000UL | (i << 16) | (i << 8) | i;
+    updateSed1375Clut565(static_cast<uint8_t>(i));
   }
   sed1375Dirty = true;
   sed1375DirtyGeneration = 1;
@@ -446,18 +459,12 @@ static void sed1375WriteReg(uint32_t offset, uint8_t value) {
     } else {
       entry = (entry & 0xffffff00UL) | expanded;
     }
+    updateSed1375Clut565(sed1375LutEntry);
     sed1375LutColor = (sed1375LutColor + 1) % 3;
     if (sed1375LutColor == 0) ++sed1375LutEntry;
   }
 
   if (offset >= 0x01 && offset <= 0x1c) markSed1375Dirty();
-}
-
-static uint16_t argbTo565(uint32_t argb) {
-  uint8_t r = static_cast<uint8_t>((argb >> 16) & 0xff);
-  uint8_t g = static_cast<uint8_t>((argb >> 8) & 0xff);
-  uint8_t b = static_cast<uint8_t>(argb & 0xff);
-  return static_cast<uint16_t>(((r & 0xf8) << 8) | ((g & 0xfc) << 3) | (b >> 3));
 }
 #endif
 
@@ -1129,10 +1136,25 @@ void palmSed1375MarkClean() {
 
 uint16_t palmSed1375PaletteColor565(uint8_t index) {
 #if PALM_HAS_SED1375
-  return argbTo565(sed1375Clut[index]);
+  return sed1375Clut565[index];
 #else
   (void)index;
   return 0;
+#endif
+}
+
+const uint8_t *palmSed1375VramPointer(uint32_t address, uint32_t count) {
+#if PALM_HAS_SED1375
+  uint32_t offset = 0;
+  if (count == 0 || sed1375Vram == nullptr || !sed1375VramOffset(address, offset) ||
+      offset >= PALM_SED1375_VRAM_SIZE || count > PALM_SED1375_VRAM_SIZE - offset) {
+    return nullptr;
+  }
+  return sed1375Vram + offset;
+#else
+  (void)address;
+  (void)count;
+  return nullptr;
 #endif
 }
 
@@ -1181,6 +1203,7 @@ static void sed1375SetStateByte(uint32_t offset, uint8_t value) {
     uint32_t &entry = sed1375Clut[clutOffset / sizeof(uint32_t)];
     uint8_t shift = static_cast<uint8_t>((3U - (clutOffset & 3U)) * 8U);
     entry = (entry & ~(0xffUL << shift)) | (static_cast<uint32_t>(value) << shift);
+    updateSed1375Clut565(static_cast<uint8_t>(clutOffset / sizeof(uint32_t)));
     return;
   }
   if (offset < SED1375_STATE_SIZE && sed1375Vram != nullptr) {

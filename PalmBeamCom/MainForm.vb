@@ -16,6 +16,7 @@ Namespace PalmBeamCom
         Private ReadOnly connectButton As Button
         Private ReadOnly refreshButton As Button
         Private ReadOnly beamButton As Button
+        Private ReadOnly fullDiagnosticsCheck As CheckBox
         Private ReadOnly captureBox As TextBox
         Private ReadOnly browseButton As Button
         Private ReadOnly traceBox As TextBox
@@ -60,6 +61,7 @@ Namespace PalmBeamCom
         Private irdaBeamEmptyEndBodySent As Boolean
         Private irdaBeamRemoteObexLsap As Byte = IrdaObexLsap
         Private irdaBeamIasQueryIndex As Integer
+        Private irdaBeamLastBodyProgressPercent As Integer = -1
 
         Private Const IrdaSirBof As Byte = &HC0
         Private Const IrdaSirEof As Byte = &HC1
@@ -142,7 +144,7 @@ Namespace PalmBeamCom
             portRow.Controls.Add(New Label With {.Text = "Baud", .AutoSize = True, .Margin = New Padding(12, 7, 4, 0)})
             baudCombo = New ComboBox With {.DropDownStyle = ComboBoxStyle.DropDownList, .Width = 100}
             baudCombo.Items.AddRange(New Object() {"9600", "19200", "38400", "57600", "115200"})
-            baudCombo.SelectedItem = "9600"
+            baudCombo.SelectedItem = "115200"
             portRow.Controls.Add(baudCombo)
             refreshButton = New Button With {.Text = "Refresh", .Width = 80}
             AddHandler refreshButton.Click, Sub() RefreshPorts()
@@ -153,6 +155,12 @@ Namespace PalmBeamCom
             beamButton = New Button With {.Text = "Beam File...", .Width = 100, .Enabled = False}
             AddHandler beamButton.Click, AddressOf BeamButton_Click
             portRow.Controls.Add(beamButton)
+            fullDiagnosticsCheck = New CheckBox With {
+                .Text = "Full diagnostics",
+                .AutoSize = True,
+                .Margin = New Padding(12, 6, 0, 0)
+            }
+            portRow.Controls.Add(fullDiagnosticsCheck)
             statusLabel = New Label With {.Text = "Disconnected", .AutoSize = True, .Margin = New Padding(12, 7, 0, 0)}
             portRow.Controls.Add(statusLabel)
             root.Controls.Add(portRow, 0, 0)
@@ -212,7 +220,7 @@ Namespace PalmBeamCom
             End If
 
             Dim baud As Integer
-            If Not Integer.TryParse(CStr(baudCombo.SelectedItem), baud) Then baud = 9600
+            If Not Integer.TryParse(CStr(baudCombo.SelectedItem), baud) Then baud = 115200
 
             Try
                 serial = New SerialPort(portName, baud, Parity.None, 8, StopBits.One) With {
@@ -744,6 +752,7 @@ Namespace PalmBeamCom
             irdaBeamEmptyEndBodySent = False
             irdaBeamState = IrdaBeamSendState.Discover
             irdaBeamLastProgressTick = 0
+            irdaBeamLastBodyProgressPercent = -1
             Append($"Beam send starting: {irdaBeamFileName} ({irdaBeamFileBytes.Length} bytes).")
             SendIrdaBeamDiscovery()
         End Sub
@@ -766,7 +775,9 @@ Namespace PalmBeamCom
 
         Private Function HandleIrdaBeamSenderFrame(frame As Byte()) As Boolean
             If frame.Length < 2 Then Return False
-            Append($"RX beam state={irdaBeamState} addr=${frame(0):X2} ctrl=${frame(1):X2} len={frame.Length}.")
+            If fullDiagnosticsCheck.Checked OrElse irdaBeamState <> IrdaBeamSendState.ObexPutBody Then
+                Append($"RX beam state={irdaBeamState} addr=${frame(0):X2} ctrl=${frame(1):X2} len={frame.Length}.")
+            End If
 
             If irdaBeamState = IrdaBeamSendState.Discover AndAlso
                 frame.Length >= 13 AndAlso frame(0) = IrdaDiscoveryResponseAddress AndAlso frame(1) = IrdaXidResponseControl Then
@@ -866,10 +877,10 @@ Namespace PalmBeamCom
                     If IsObexResponse(data, &H90) Then
                         SendIrdaBeamNextBodyChunk()
                     ElseIf IsObexResponse(data, &HA0) Then
-                        Append("Beam body accepted; disconnecting.")
+                        If fullDiagnosticsCheck.Checked Then Append("Beam body accepted; disconnecting.")
                         irdaBeamState = IrdaBeamSendState.ObexDisconnect
                         SendIrdaBeamInformation(WrapTinyTpObex(New Byte() {&H81, &H0, &H3}), "OBEX-DISCONNECT")
-                    Else
+                    ElseIf fullDiagnosticsCheck.Checked Then
                         Append($"Beam unexpected body response: {FormatBytes(data.Take(Math.Min(data.Length, 16)))}")
                     End If
                 Case IrdaBeamSendState.ObexDisconnect
@@ -980,8 +991,24 @@ Namespace PalmBeamCom
             Dim finalChunk = irdaBeamOffset >= irdaBeamFileBytes.Length
             Dim opcode As Byte = If(finalChunk, CByte(&H82), CByte(&H2))
             Dim headerId As Byte = If(finalChunk, CByte(&H49), CByte(&H48))
-            SendIrdaBeamInformation(WrapTinyTpObex(BuildObexPacket(opcode, BuildObexBodyHeader(headerId, body))), $"OBEX-PUT-BODY {irdaBeamOffset}/{irdaBeamFileBytes.Length}")
+            SendIrdaBeamInformation(WrapTinyTpObex(BuildObexPacket(opcode, BuildObexBodyHeader(headerId, body))), BuildIrdaBeamBodyProgressLabel(finalChunk))
         End Sub
+
+        Private Function BuildIrdaBeamBodyProgressLabel(finalChunk As Boolean) As String
+            If irdaBeamFileBytes Is Nothing OrElse irdaBeamFileBytes.Length = 0 Then Return "OBEX-PUT-BODY 100%"
+
+            Dim totalPackets = CInt(Math.Ceiling(irdaBeamFileBytes.Length / CDbl(IrdaBeamBodyChunkSize)))
+            Dim sentPackets = CInt(Math.Ceiling(irdaBeamOffset / CDbl(IrdaBeamBodyChunkSize)))
+            Dim percent = CInt(Math.Floor((sentPackets * 100.0R) / Math.Max(1, totalPackets)))
+            Dim progressPercent = If(finalChunk, 100, Math.Min(100, (percent \ 5) * 5))
+
+            If progressPercent >= 5 AndAlso progressPercent > irdaBeamLastBodyProgressPercent Then
+                irdaBeamLastBodyProgressPercent = progressPercent
+                Return $"OBEX-PUT-BODY {progressPercent}% ({sentPackets}/{totalPackets} packets, {irdaBeamOffset}/{irdaBeamFileBytes.Length} bytes)"
+            End If
+
+            Return "OBEX-PUT-BODY"
+        End Function
 
         Private Sub ResetLinkState()
             SyncLock serialLock
@@ -1025,17 +1052,24 @@ Namespace PalmBeamCom
             irdaBeamEmptyEndBodySent = False
             irdaBeamRemoteObexLsap = IrdaObexLsap
             irdaBeamIasQueryIndex = 0
+            irdaBeamLastBodyProgressPercent = -1
         End Sub
 
         Private Sub WriteSerial(bytes As Byte(), label As String)
             If serial Is Nothing OrElse Not serial.IsOpen OrElse bytes Is Nothing OrElse bytes.Length = 0 Then Return
             Try
                 serial.Write(bytes, 0, bytes.Length)
-                If Not label.StartsWith("BEAM-XID", StringComparison.Ordinal) Then Append($"TX {label} ({bytes.Length} bytes).")
+                If ShouldLogSerialLabel(label) Then Append($"TX {label} ({bytes.Length} bytes).")
             Catch ex As Exception
                 Append($"TX failed: {ex.Message}")
             End Try
         End Sub
+
+        Private Function ShouldLogSerialLabel(label As String) As Boolean
+            If label.StartsWith("BEAM-XID", StringComparison.Ordinal) Then Return False
+            If Not fullDiagnosticsCheck.Checked AndAlso label.StartsWith("OBEX-PUT-BODY ctrl=", StringComparison.Ordinal) Then Return False
+            Return True
+        End Function
 
         Private Shared Function BuildLmpConnectPayload(destinationLsap As Byte, sourceLsap As Byte, initialCredit As Byte) As Byte()
             If initialCredit = 0 Then

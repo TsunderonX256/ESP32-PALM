@@ -45,6 +45,7 @@ PalmMemoryDebug palmMemoryGetDebug();
 bool palmSed1375GetLcdState(PalmLcdState &lcd);
 void palmSed1375MarkClean();
 uint16_t palmSed1375PaletteColor565(uint8_t index);
+const uint8_t *palmSed1375VramPointer(uint32_t address, uint32_t count);
 size_t palmSed1375StateSize();
 bool palmSed1375ReadStateBytes(uint32_t offset, uint8_t *dest, size_t count);
 bool palmSed1375WriteStateBytes(uint32_t offset, const uint8_t *src, size_t count);

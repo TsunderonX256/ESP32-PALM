@@ -1980,6 +1980,7 @@ static bool drawPalmFrameFromEmulatedLcd() {
 
   for (uint16_t y = 0; y < drawH; ++y) {
     uint32_t srcLine = lcd.startAddr + static_cast<uint32_t>(y) * lcd.bytesPerLine;
+    const uint8_t *srcBytes = useSed1375 ? palmSed1375VramPointer(srcLine, lcd.bytesPerLine) : nullptr;
     uint32_t cachedByteIndex = 0xffffffffUL;
     uint8_t cachedByte = 0;
     for (uint16_t x = 0; x < drawW; ++x) {
@@ -1989,7 +1990,7 @@ static bool drawPalmFrameFromEmulatedLcd() {
         uint32_t byteIndex = bitIndex >> 3;
         if (byteIndex != cachedByteIndex) {
           cachedByteIndex = byteIndex;
-          cachedByte = palmRead8(srcLine + byteIndex);
+          cachedByte = srcBytes != nullptr ? srcBytes[byteIndex] : palmRead8(srcLine + byteIndex);
         }
         uint8_t shift = 8 - lcd.bpp - (bitIndex & 7);
         value = (cachedByte >> shift) & ((1 << lcd.bpp) - 1);
