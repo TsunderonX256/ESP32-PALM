@@ -11,6 +11,8 @@ size_t palmRamLastAllocAttemptSegments();
 bool palmRamWriteBytes(uint32_t offset, const uint8_t *data, uint32_t count);
 bool palmRamReadBytes(uint32_t offset, uint8_t *data, uint32_t count);
 
+struct PalmLcdState;
+
 uint8_t palmRead8(uint32_t address);
 uint16_t palmRead16(uint32_t address);
 uint32_t palmRead32(uint32_t address);
@@ -40,6 +42,12 @@ struct PalmMemoryDebug {
 };
 
 PalmMemoryDebug palmMemoryGetDebug();
+bool palmSed1375GetLcdState(PalmLcdState &lcd);
+void palmSed1375MarkClean();
+uint16_t palmSed1375PaletteColor565(uint8_t index);
+size_t palmSed1375StateSize();
+bool palmSed1375ReadStateBytes(uint32_t offset, uint8_t *dest, size_t count);
+bool palmSed1375WriteStateBytes(uint32_t offset, const uint8_t *src, size_t count);
 
 extern "C" {
 unsigned int m68k_read_memory_8(unsigned int address);

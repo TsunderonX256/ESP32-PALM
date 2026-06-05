@@ -5,7 +5,7 @@
 #define PALM_ENABLE_MUSASHI 1
 #define PALM_STATIC_DISPLAY_TEST 0
 
-#define PALM_HARDWARE_PROFILE PALM_PROFILE_M100_EXPERIMENTAL
+#define PALM_HARDWARE_PROFILE PALM_PROFILE_IIIC_EXPERIMENTAL
 #include "palm_profile.h"
 
 // ESP32 target: ESP32-4827S043C with 16 MB flash, 8 MB PSRAM,
@@ -20,9 +20,8 @@
 #define PALM_RAM_STATIC_FALLBACK_SIZE 0
 
 // The embedded ROM is supplied by the user and assembled into flash by
-// palm_rom.S. The m100 ROM uses the same Big ROM card mapping as the IIIx path:
-// file offset 0 maps to PALM_ROM_BASE, with the low card-header alias handled
-// by palm_memory.cpp.
+// palm_rom.S. Big ROM file offset 0 maps to PALM_ROM_BASE, with the low
+// card-header alias handled by palm_memory.cpp.
 
 #define PALM_CPU_SLICE_CYCLES 100000
 #define PALM_CPU_BURST_MS 12
@@ -35,6 +34,9 @@
 #define PALM_UART_HOST_SERIAL_BRIDGE 1
 #define PALM_UART_HOST_SERIAL_BAUD 115200
 #define PALM_UART_BRIDGE_CHUNK 64
+#define PALM_UART_IRDA_PROBE_ECHO 1
+#define PALM_UART_IRDA_PROBE_ECHO_BYTES 8
+#define PALM_UART_IRDA_PROBE_ECHO_MS 200
 
 // Keep the ESP32 target as thin as possible. The VB harness is the place for
 // heavy diagnostics; this build spends RAM on Palm state and simple LCD blits.

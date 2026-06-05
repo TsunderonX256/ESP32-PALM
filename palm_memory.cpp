@@ -69,6 +69,21 @@ static size_t palmRamLastAttemptBytes = 0;
 static size_t palmRamLastAttemptSegments = 0;
 static PalmMemoryDebug memoryDebug;
 
+#if PALM_HAS_SED1375
+static uint8_t sed1375Regs[PALM_SED1375_REG_SIZE];
+static uint8_t *sed1375Vram = nullptr;
+static uint32_t sed1375Clut[256];
+static uint8_t sed1375LutEntry = 0;
+static uint8_t sed1375LutColor = 0;
+static bool sed1375Dirty = true;
+static uint32_t sed1375DirtyGeneration = 1;
+static constexpr uint32_t SED1375_STATE_REGS_OFFSET = 0;
+static constexpr uint32_t SED1375_STATE_LUT_OFFSET = SED1375_STATE_REGS_OFFSET + PALM_SED1375_REG_SIZE;
+static constexpr uint32_t SED1375_STATE_CLUT_OFFSET = SED1375_STATE_LUT_OFFSET + 4;
+static constexpr uint32_t SED1375_STATE_VRAM_OFFSET = SED1375_STATE_CLUT_OFFSET + 256UL * sizeof(uint32_t);
+static constexpr uint32_t SED1375_STATE_SIZE = SED1375_STATE_VRAM_OFFSET + PALM_SED1375_VRAM_SIZE;
+#endif
+
 static inline size_t PALM_MEM_FAST currentRomSize() {
   return static_cast<size_t>(palm_rom_end - palm_rom_start);
 }
@@ -102,6 +117,16 @@ static void *palmAllocInternal(size_t size) {
 }
 
 static void freeRamPages() {
+#if PALM_HAS_SED1375
+  if (sed1375Vram != nullptr) {
+#if defined(ESP32)
+    heap_caps_free(sed1375Vram);
+#else
+    free(sed1375Vram);
+#endif
+    sed1375Vram = nullptr;
+  }
+#endif
 #if !PALM_RAM_STATIC_BACKING
   for (size_t i = 0; i < palmRamSegmentCount; ++i) {
     bool staticSegment =
@@ -328,6 +353,114 @@ static uint32_t mirroredRamOffset(uint32_t logicalOffset) {
   return palmRamSizeBytes == 0 ? 0 : logicalOffset % palmRamSizeBytes;
 }
 
+#if PALM_HAS_SED1375
+static bool sed1375RegOffset(uint32_t address, uint32_t &offset) {
+  if (address >= PALM_SED1375_REG_BASE &&
+      address < PALM_SED1375_REG_BASE + PALM_SED1375_REG_SIZE) {
+    offset = address - PALM_SED1375_REG_BASE;
+    return true;
+  }
+  return false;
+}
+
+static bool sed1375VramOffset(uint32_t address, uint32_t &offset) {
+  if (address >= PALM_SED1375_BASE &&
+      address < PALM_SED1375_BASE + PALM_SED1375_VRAM_SIZE) {
+    offset = address - PALM_SED1375_BASE;
+    return true;
+  }
+  return false;
+}
+
+static void markSed1375Dirty() {
+  sed1375Dirty = true;
+  ++sed1375DirtyGeneration;
+  if (sed1375DirtyGeneration == 0) sed1375DirtyGeneration = 1;
+}
+
+static bool ensureSed1375Allocated() {
+  if (sed1375Vram != nullptr) return true;
+#if defined(ESP32) && defined(MALLOC_CAP_SPIRAM)
+  sed1375Vram = static_cast<uint8_t *>(
+      heap_caps_malloc(PALM_SED1375_VRAM_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (sed1375Vram == nullptr) {
+    sed1375Vram = static_cast<uint8_t *>(
+        heap_caps_malloc(PALM_SED1375_VRAM_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  }
+#else
+  sed1375Vram = static_cast<uint8_t *>(malloc(PALM_SED1375_VRAM_SIZE));
+#endif
+  return sed1375Vram != nullptr;
+}
+
+static bool initSed1375() {
+  if (!ensureSed1375Allocated()) return false;
+  memset(sed1375Regs, 0, sizeof(sed1375Regs));
+  memset(sed1375Vram, 0, PALM_SED1375_VRAM_SIZE);
+  sed1375Regs[0x00] = 0x24;
+  sed1375Regs[0x04] = 19;
+  sed1375Regs[0x05] = 159;
+  sed1375Regs[0x12] = 20;
+  sed1375LutEntry = 0;
+  sed1375LutColor = 0;
+  for (uint32_t i = 0; i < 256; ++i) {
+    sed1375Clut[i] = 0xff000000UL | (i << 16) | (i << 8) | i;
+  }
+  sed1375Dirty = true;
+  sed1375DirtyGeneration = 1;
+  return true;
+}
+
+static uint8_t sed1375ReadReg(uint32_t offset) {
+  if (offset == 0x0a) return sed1375Regs[offset] | 0x80;
+  if (offset == 0x17) {
+    uint32_t entry = sed1375Clut[sed1375LutEntry];
+    uint8_t value = 0;
+    if (sed1375LutColor == 0) value = static_cast<uint8_t>((entry >> 16) & 0xf0);
+    else if (sed1375LutColor == 1) value = static_cast<uint8_t>((entry >> 8) & 0xf0);
+    else value = static_cast<uint8_t>(entry & 0xf0);
+    sed1375LutColor = (sed1375LutColor + 1) % 3;
+    if (sed1375LutColor == 0) ++sed1375LutEntry;
+    return value;
+  }
+  return offset < PALM_SED1375_REG_SIZE ? sed1375Regs[offset] : 0xff;
+}
+
+static void sed1375WriteReg(uint32_t offset, uint8_t value) {
+  if (offset == 0x00 || offset >= PALM_SED1375_REG_SIZE) return;
+  sed1375Regs[offset] = value;
+
+  if (offset == 0x15) {
+    sed1375LutEntry = value;
+    sed1375LutColor = 0;
+    return;
+  }
+
+  if (offset == 0x17) {
+    uint32_t expanded = static_cast<uint32_t>(((value & 0xf0) >> 4) * 0x11);
+    uint32_t &entry = sed1375Clut[sed1375LutEntry];
+    if (sed1375LutColor == 0) {
+      entry = (entry & 0xff00ffffUL) | (expanded << 16);
+    } else if (sed1375LutColor == 1) {
+      entry = (entry & 0xffff00ffUL) | (expanded << 8);
+    } else {
+      entry = (entry & 0xffffff00UL) | expanded;
+    }
+    sed1375LutColor = (sed1375LutColor + 1) % 3;
+    if (sed1375LutColor == 0) ++sed1375LutEntry;
+  }
+
+  if (offset >= 0x01 && offset <= 0x1c) markSed1375Dirty();
+}
+
+static uint16_t argbTo565(uint32_t argb) {
+  uint8_t r = static_cast<uint8_t>((argb >> 16) & 0xff);
+  uint8_t g = static_cast<uint8_t>((argb >> 8) & 0xff);
+  uint8_t b = static_cast<uint8_t>(argb & 0xff);
+  return static_cast<uint16_t>(((r & 0xf8) << 8) | ((g & 0xfc) << 3) | (b >> 3));
+}
+#endif
+
 static bool inLogicalRam(uint32_t address, uint32_t &offset) {
   if (address >= PALM_RAM_BASE && address < PALM_RAM_BASE + PALM_RAM_LOGICAL_SIZE) {
     offset = address - PALM_RAM_BASE;
@@ -461,6 +594,12 @@ bool palmMemoryInit() {
   palmRamLastAttemptSegments = palmRamSegmentCount;
   memset(&memoryDebug, 0, sizeof(memoryDebug));
   resetPageCache();
+#if PALM_HAS_SED1375
+  if (!initSed1375()) {
+    freeRamPages();
+    return false;
+  }
+#endif
   palmHwInit();
   return true;
 }
@@ -585,6 +724,10 @@ uint8_t PALM_MEM_FAST palmRead8(uint32_t address) {
   if (ramOffset(address, offset)) return *ramPointer(offset);
 #endif
   if (palmHwInRegisterSpace(address)) return palmHwRead8(address);
+#if PALM_HAS_SED1375
+  if (sed1375RegOffset(address, offset)) return sed1375ReadReg(offset);
+  if (sed1375VramOffset(address, offset) && sed1375Vram != nullptr) return sed1375Vram[offset];
+#endif
   if (ramSizeProbeAddress(address)) return 0x00;
 #if PALM_MIRROR_LOGICAL_RAM
   if (inLogicalRam(address, offset)) {
@@ -712,6 +855,19 @@ void PALM_MEM_FAST palmWrite8(uint32_t address, uint8_t value) {
     palmHwWrite8(address, value);
     return;
   }
+
+#if PALM_HAS_SED1375
+  if (sed1375RegOffset(address, offset)) {
+    sed1375WriteReg(offset, value);
+    return;
+  }
+
+  if (sed1375VramOffset(address, offset) && sed1375Vram != nullptr) {
+    sed1375Vram[offset] = value;
+    markSed1375Dirty();
+    return;
+  }
+#endif
 
   if (romOffset(address, offset)) {
     return;
@@ -898,6 +1054,9 @@ extern "C" unsigned int PALM_MEM_FAST palm_read_instr_16(unsigned int address) {
     return readBe16(rom);
   }
   if (palmHwInRegisterSpace(address)) return palmHwRead8(address) << 8 | palmHwRead8(address + 1);
+#if PALM_HAS_SED1375
+  if (sed1375RegOffset(address, offset)) return sed1375ReadReg(offset) << 8 | sed1375ReadReg(offset + 1);
+#endif
   uint8_t *ram = ramPointerForAddress(address, 2);
   if (ram != nullptr) {
     return readBe16(ram);
@@ -930,3 +1089,139 @@ extern "C" void PALM_MEM_FAST m68k_write_memory_32(unsigned int address, unsigne
 }
 
 PalmMemoryDebug palmMemoryGetDebug() { return memoryDebug; }
+
+bool palmSed1375GetLcdState(PalmLcdState &lcd) {
+#if PALM_HAS_SED1375
+  uint32_t startOffset = ((static_cast<uint32_t>(sed1375Regs[0x11] & 0x03) << 17) |
+                          (static_cast<uint32_t>(sed1375Regs[0x0d]) << 9) |
+                          (static_cast<uint32_t>(sed1375Regs[0x0c]) << 1));
+  if (startOffset >= PALM_SED1375_VRAM_SIZE) startOffset = 0;
+
+  uint8_t bpp = static_cast<uint8_t>(1U << ((sed1375Regs[0x02] & 0xc0) >> 6));
+  uint16_t width = static_cast<uint16_t>((sed1375Regs[0x04] + 1U) * 8U);
+  uint16_t height = static_cast<uint16_t>((static_cast<uint16_t>(sed1375Regs[0x06]) << 8) |
+                                          sed1375Regs[0x05]);
+  lcd.startAddr = PALM_SED1375_BASE + startOffset;
+  lcd.width = width == 0 ? PALM_LCD_W : width;
+  lcd.height = static_cast<uint16_t>(height + 1U);
+  lcd.bytesPerLine = static_cast<uint16_t>((static_cast<uint32_t>(lcd.width) * bpp + 7U) / 8U);
+  lcd.bpp = bpp;
+  lcd.margin = 0;
+  lcd.panelControl = sed1375Regs[0x02];
+  lcd.dirtyGeneration = sed1375DirtyGeneration;
+  lcd.dirty = sed1375Dirty;
+  lcd.frameReady = sed1375Dirty;
+  lcd.valid = sed1375Vram != nullptr && lcd.width > 0 && lcd.width <= 320 &&
+              lcd.height > 0 && lcd.height <= 320 &&
+              lcd.bytesPerLine > 0 && (bpp == 1 || bpp == 2 || bpp == 4 || bpp == 8);
+  return lcd.valid;
+#else
+  (void)lcd;
+  return false;
+#endif
+}
+
+void palmSed1375MarkClean() {
+#if PALM_HAS_SED1375
+  sed1375Dirty = false;
+#endif
+}
+
+uint16_t palmSed1375PaletteColor565(uint8_t index) {
+#if PALM_HAS_SED1375
+  return argbTo565(sed1375Clut[index]);
+#else
+  (void)index;
+  return 0;
+#endif
+}
+
+size_t palmSed1375StateSize() {
+#if PALM_HAS_SED1375
+  return SED1375_STATE_SIZE;
+#else
+  return 0;
+#endif
+}
+
+#if PALM_HAS_SED1375
+static uint8_t sed1375StateByte(uint32_t offset) {
+  if (offset < PALM_SED1375_REG_SIZE) return sed1375Regs[offset];
+  if (offset == SED1375_STATE_LUT_OFFSET) return sed1375LutEntry;
+  if (offset == SED1375_STATE_LUT_OFFSET + 1) return sed1375LutColor;
+  if (offset < SED1375_STATE_CLUT_OFFSET) return 0;
+  if (offset < SED1375_STATE_VRAM_OFFSET) {
+    uint32_t clutOffset = offset - SED1375_STATE_CLUT_OFFSET;
+    uint32_t entry = sed1375Clut[clutOffset / sizeof(uint32_t)];
+    uint8_t shift = static_cast<uint8_t>((3U - (clutOffset & 3U)) * 8U);
+    return static_cast<uint8_t>((entry >> shift) & 0xffU);
+  }
+  if (offset < SED1375_STATE_SIZE && sed1375Vram != nullptr) {
+    return sed1375Vram[offset - SED1375_STATE_VRAM_OFFSET];
+  }
+  return 0;
+}
+
+static void sed1375SetStateByte(uint32_t offset, uint8_t value) {
+  if (offset < PALM_SED1375_REG_SIZE) {
+    sed1375Regs[offset] = value;
+    return;
+  }
+  if (offset == SED1375_STATE_LUT_OFFSET) {
+    sed1375LutEntry = value;
+    return;
+  }
+  if (offset == SED1375_STATE_LUT_OFFSET + 1) {
+    sed1375LutColor = value % 3U;
+    return;
+  }
+  if (offset < SED1375_STATE_CLUT_OFFSET) return;
+  if (offset < SED1375_STATE_VRAM_OFFSET) {
+    uint32_t clutOffset = offset - SED1375_STATE_CLUT_OFFSET;
+    uint32_t &entry = sed1375Clut[clutOffset / sizeof(uint32_t)];
+    uint8_t shift = static_cast<uint8_t>((3U - (clutOffset & 3U)) * 8U);
+    entry = (entry & ~(0xffUL << shift)) | (static_cast<uint32_t>(value) << shift);
+    return;
+  }
+  if (offset < SED1375_STATE_SIZE && sed1375Vram != nullptr) {
+    sed1375Vram[offset - SED1375_STATE_VRAM_OFFSET] = value;
+  }
+}
+#endif
+
+bool palmSed1375ReadStateBytes(uint32_t offset, uint8_t *dest, size_t count) {
+#if PALM_HAS_SED1375
+  if (dest == nullptr || offset > SED1375_STATE_SIZE ||
+      count > SED1375_STATE_SIZE - offset) {
+    return false;
+  }
+  if (!ensureSed1375Allocated()) return false;
+  for (size_t i = 0; i < count; ++i) {
+    dest[i] = sed1375StateByte(offset + static_cast<uint32_t>(i));
+  }
+  return true;
+#else
+  (void)offset;
+  (void)dest;
+  return count == 0;
+#endif
+}
+
+bool palmSed1375WriteStateBytes(uint32_t offset, const uint8_t *src, size_t count) {
+#if PALM_HAS_SED1375
+  if (src == nullptr || offset > SED1375_STATE_SIZE ||
+      count > SED1375_STATE_SIZE - offset) {
+    return false;
+  }
+  if (!ensureSed1375Allocated()) return false;
+  for (size_t i = 0; i < count; ++i) {
+    sed1375SetStateByte(offset + static_cast<uint32_t>(i), src[i]);
+  }
+  markSed1375Dirty();
+  return true;
+#else
+  (void)offset;
+  (void)src;
+  return count == 0;
+#endif
+}

@@ -17,7 +17,7 @@ The current embedded target is the ESP32-4827S043C board with 16 MB flash,
 - Desktop Palm m100 profile boots and works well in normal use.
 - Palm IIIx profile is still supported by the native core and harness.
 - Palm IIIc support is experimental. It uses the Palm IIIc/Austin hardware
-  profile, 8 MB RAM, and the SED1375 color LCD path.
+  profile, 4 MB RAM, and the SED1375 color LCD path.
 - ESP32 performance is still below real hardware in CPU-heavy apps. The current
   focus is improving Musashi and memory-map speed while keeping touch and LCD
   timing stable.
@@ -174,7 +174,7 @@ The m100 profile includes the m100/Calvin hardware identity, 160x220 digitizer
 geometry, m100 key matrix, and LCD contrast PWM register. The m100 ROM shows
 Brightness rather than Contrast in the Pen shortcut list, but contrast writes
 are still modeled for display rendering. The IIIc profile adds the SED1375
-color LCD path and 8 MB RAM map. The IIIx profile keeps desktop LCD contrast
+color LCD path and a 4 MB RAM map. The IIIx profile keeps desktop LCD contrast
 fixed at maximum because its ROM does not normally expose that software
 control.
 

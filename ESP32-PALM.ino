@@ -197,10 +197,19 @@ static constexpr int TOUCH_ADC_Y_MAX_VALUE = PALM_DIGITIZER_H - 1;
 static constexpr uint16_t SYS_TRAP_EVT_ENQUEUE_PEN_POINT = 0xa126;
 static constexpr uint16_t SYS_TRAP_EVT_WAKEUP = 0xa12f;
 static constexpr uint32_t PALM_CALL_STUB_ADDRESS = PALM_RAM_BASE + PALM_RAM_LOGICAL_SIZE - 0x100;
+#if PALM_HARDWARE_PROFILE == PALM_PROFILE_IIIC_EXPERIMENTAL
+static constexpr const char *PALM_STATE_SD_PATH = "/palm_iiic_state.bin";
+static constexpr const char *PALM_STATE_SD_TEMP_PATH = "/palm_iiic_state.tmp";
+#else
 static constexpr const char *PALM_STATE_SD_PATH = "/palm_m100_state.bin";
 static constexpr const char *PALM_STATE_SD_TEMP_PATH = "/palm_m100_state.tmp";
+#endif
 static constexpr uint32_t PALM_STATE_MAGIC = 0x50414c4dUL;
+#if PALM_HAS_SED1375
+static constexpr uint32_t PALM_STATE_VERSION = 3;
+#else
 static constexpr uint32_t PALM_STATE_VERSION = 2;
+#endif
 static constexpr uint32_t PALM_STATE_SD_SPI_HZ = 10000000UL;
 static constexpr uint32_t PALM_NATIVE_STATE_HEADER_SIZE = 8560;
 static constexpr int VIRTUAL_BUTTON_MARGIN_GAP = 10;
@@ -650,7 +659,7 @@ static bool palmOsResetInProgress = false;
 static bool resetButtonHoldActive = false;
 static bool resetButtonHoldTriggered = false;
 static unsigned long resetButtonHoldStartMs = 0;
-static uint16_t lastPalmBacklightRegister = 0xffff;
+static uint8_t lastPalmBacklightDuty = 0xff;
 #if PALM_UART_HOST_SERIAL_BRIDGE
 static bool palmUartBridgeActive = false;
 static uint8_t palmUartBridgeBuffer[PALM_UART_BRIDGE_CHUNK];
@@ -1477,32 +1486,25 @@ static void setBacklightDuty(uint8_t duty) {
 #endif
 }
 
-static uint8_t palmContrastRegisterByte(uint16_t registerValue) {
-  if (registerValue == 0) return 255;
-
-  uint8_t lowByte = registerValue & 0xff;
-  if (lowByte != 0) return lowByte;
-
-  return (registerValue >> 8) & 0xff;
-}
-
 static uint8_t palmBacklightDutyFromOs() {
-  uint8_t level = palmContrastRegisterByte(palmHwPeekReg16(0xA36));
+  uint8_t level = palmHwDisplayBrightnessLevel();
   uint16_t span = BACKLIGHT_PALM_MAX_DUTY - BACKLIGHT_PALM_MIN_DUTY;
   return BACKLIGHT_PALM_MIN_DUTY + ((static_cast<uint16_t>(level) * span + 127) / 255);
 }
 
 static void setPalmBacklightDuty() {
-  setBacklightDuty(palmBacklightDutyFromOs());
+  uint8_t duty = palmBacklightDutyFromOs();
+  lastPalmBacklightDuty = duty;
+  setBacklightDuty(duty);
 }
 
 static void updatePalmBacklightFromOs() {
   if (!cpuReady || palmLowPowerModeActive || palmStateSaveInProgress || palmOsResetInProgress) return;
 
-  uint16_t contrast = palmHwPeekReg16(0xA36);
-  if (contrast == lastPalmBacklightRegister) return;
-  lastPalmBacklightRegister = contrast;
-  setPalmBacklightDuty();
+  uint8_t duty = palmBacklightDutyFromOs();
+  if (duty == lastPalmBacklightDuty) return;
+  lastPalmBacklightDuty = duty;
+  setBacklightDuty(duty);
 }
 
 static void setBacklightEnabled(bool enabled) {
@@ -1956,7 +1958,13 @@ static bool drawPalmFrameFromEmulatedLcd() {
 #if PALM_PERF_SERIAL_STATS
   uint32_t renderStartMicros = micros();
 #endif
+#if PALM_HAS_SED1375
+  PalmLcdState lcd;
+  bool useSed1375 = palmSed1375GetLcdState(lcd);
+#else
   PalmLcdState lcd = palmHwGetLcdState();
+  bool useSed1375 = false;
+#endif
   if (!lcd.valid) {
     drawWaitingFrame();
     return false;
@@ -1986,13 +1994,19 @@ static bool drawPalmFrameFromEmulatedLcd() {
         uint8_t shift = 8 - lcd.bpp - (bitIndex & 7);
         value = (cachedByte >> shift) & ((1 << lcd.bpp) - 1);
       }
-      surfaceSetPixel(x, y, lcdPixelColor(value, lcd.bpp));
+      uint16_t color = useSed1375 ? palmSed1375PaletteColor565(value) :
+                                    lcdPixelColor(value, lcd.bpp);
+      surfaceSetPixel(x, y, color);
     }
   }
   unlockRenderSurface();
 
   requestPanelRender();
-  palmHwMarkLcdClean();
+  if (useSed1375) {
+    palmSed1375MarkClean();
+  } else {
+    palmHwMarkLcdClean();
+  }
 #if PALM_PERF_SERIAL_STATS
   uint32_t renderMicros = micros() - renderStartMicros;
   renderTotalMicros += renderMicros;
@@ -2228,6 +2242,60 @@ static bool copyStateRamToFile(File &file, uint32_t ramSize) {
   return true;
 }
 
+static uint32_t palmStateExtraDeviceBytes() {
+  return static_cast<uint32_t>(palmSed1375StateSize());
+}
+
+static bool copyExtraDeviceStateFromFile(File &file, uint32_t stateSize) {
+  uint32_t offset = 0;
+  while (offset < stateSize) {
+    uint32_t remaining = stateSize - offset;
+    uint32_t chunk = remaining > sizeof(stateIoBuffer) ? sizeof(stateIoBuffer) : remaining;
+    if (!readExact(file, stateIoBuffer, chunk)) {
+#if PALM_BOOT_SERIAL_STATS
+      PALM_DBG_PRINTF("State restore failed: device read stopped at %lu/%lu\n",
+                    (unsigned long)offset, (unsigned long)stateSize);
+#endif
+      return false;
+    }
+    if (!palmSed1375WriteStateBytes(offset, stateIoBuffer, chunk)) {
+#if PALM_BOOT_SERIAL_STATS
+      PALM_DBG_PRINTF("State restore failed: device write stopped at %lu/%lu\n",
+                    (unsigned long)offset, (unsigned long)stateSize);
+#endif
+      return false;
+    }
+    offset += chunk;
+    yield();
+  }
+  return true;
+}
+
+static bool copyExtraDeviceStateToFile(File &file, uint32_t stateSize) {
+  uint32_t offset = 0;
+  while (offset < stateSize) {
+    uint32_t remaining = stateSize - offset;
+    uint32_t chunk = remaining > sizeof(stateIoBuffer) ? sizeof(stateIoBuffer) : remaining;
+    if (!palmSed1375ReadStateBytes(offset, stateIoBuffer, chunk)) {
+#if PALM_STATE_SERIAL_STATS
+      PALM_DBG_PRINTF("State save failed: device read stopped at %lu/%lu\n",
+                    (unsigned long)offset, (unsigned long)stateSize);
+#endif
+      return false;
+    }
+    if (!writeExact(file, stateIoBuffer, chunk)) {
+#if PALM_STATE_SERIAL_STATS
+      PALM_DBG_PRINTF("State save failed: device write stopped at %lu/%lu\n",
+                    (unsigned long)offset, (unsigned long)stateSize);
+#endif
+      return false;
+    }
+    offset += chunk;
+    yield();
+  }
+  return true;
+}
+
 static void restoreCpuFromState(const PalmNativeStateHeader &header) {
 #if PALM_ENABLE_MUSASHI
   for (int i = 0; i < 8; ++i) {
@@ -2396,7 +2464,8 @@ static bool fillNativeStateHeaderForSave(PalmNativeStateHeader &header,
   header.magic = PALM_STATE_MAGIC;
   header.version = PALM_STATE_VERSION;
   header.totalSize = static_cast<uint32_t>(sizeof(PalmNativeStateHeader) +
-                                           PALM_DB_REG_SIZE + palmRamSize());
+                                           PALM_DB_REG_SIZE + palmRamSize() +
+                                           palmStateExtraDeviceBytes());
   header.ramSize = palmRamSize();
   header.regSize = PALM_DB_REG_SIZE;
   header.romSize = palmRomSize();
@@ -2486,7 +2555,8 @@ static bool restoreNativeStateFromFile(File &file, uint64_t fileSize) {
   }
 
   const uint32_t expectedTotal =
-      static_cast<uint32_t>(sizeof(PalmNativeStateHeader) + PALM_DB_REG_SIZE + palmRamSize());
+      static_cast<uint32_t>(sizeof(PalmNativeStateHeader) + PALM_DB_REG_SIZE +
+                            palmRamSize() + palmStateExtraDeviceBytes());
 #if PALM_BOOT_SERIAL_STATS
   PALM_DBG_PRINTF("State header: magic=0x%08lx version=%lu total=%lu ram=%lu regs=%lu rom=%lu pc=0x%08lx\n",
                 (unsigned long)stateHeaderBuffer.magic,
@@ -2506,10 +2576,11 @@ static bool restoreNativeStateFromFile(File &file, uint64_t fileSize) {
       stateHeaderBuffer.romSize != palmRomSize() ||
       fileSize < stateHeaderBuffer.totalSize) {
 #if PALM_BOOT_SERIAL_STATS
-    PALM_DBG_PRINTF("State restore rejected: expected total=%lu ram=%lu regs=%lu rom=%lu file=%lu\n",
+    PALM_DBG_PRINTF("State restore rejected: expected total=%lu ram=%lu regs=%lu extra=%lu rom=%lu file=%lu\n",
                   (unsigned long)expectedTotal,
                   (unsigned long)palmRamSize(),
                   (unsigned long)PALM_DB_REG_SIZE,
+                  (unsigned long)palmStateExtraDeviceBytes(),
                   (unsigned long)palmRomSize(),
                   (unsigned long)fileSize);
 #endif
@@ -2541,6 +2612,7 @@ static bool restoreNativeStateFromFile(File &file, uint64_t fileSize) {
                       stateHeaderBuffer.uartRxOverrunCount,
                       stateHeaderBuffer.uartTxOverrunCount);
   if (!copyStateRamFromFile(file, stateHeaderBuffer.ramSize)) return false;
+  if (!copyExtraDeviceStateFromFile(file, palmStateExtraDeviceBytes())) return false;
   restoreCpuFromState(stateHeaderBuffer);
   restoredStateLoaded = true;
   lastWakeStatsSlices = cpuSlices;
@@ -2628,7 +2700,8 @@ static bool savePalmStateToSd() {
   bool ok = writeExact(stateFile, reinterpret_cast<const uint8_t *>(&stateHeaderBuffer),
                        sizeof(stateHeaderBuffer)) &&
             writeExact(stateFile, stateIoBuffer, PALM_DB_REG_SIZE) &&
-            copyStateRamToFile(stateFile, stateHeaderBuffer.ramSize);
+            copyStateRamToFile(stateFile, stateHeaderBuffer.ramSize) &&
+            copyExtraDeviceStateToFile(stateFile, palmStateExtraDeviceBytes());
   stateFile.flush();
   stateFile.close();
   if (!ok) {
@@ -2808,7 +2881,7 @@ static void servicePalmOsResetRequest() {
 #endif
   cpuReady = false;
   palmHwInit();
-  lastPalmBacklightRegister = 0xffff;
+  lastPalmBacklightDuty = 0xff;
   initCpu();
   cpuReady = true;
   restoredStateLoaded = false;

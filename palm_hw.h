@@ -70,6 +70,7 @@ void palmHwCycle();
 uint8_t palmHwGetInterruptLevel();
 bool palmHwIsAsleep();
 bool palmHwHasWakeSource();
+uint8_t palmHwDisplayBrightnessLevel();
 void palmHwNotifyMemoryWrite(uint32_t address);
 PalmLcdState palmHwGetLcdState();
 PalmHwDebug palmHwGetDebug();

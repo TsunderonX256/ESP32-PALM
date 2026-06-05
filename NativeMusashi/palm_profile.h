@@ -45,7 +45,7 @@
  * an external Epson SED1375 color LCD controller mapped at 0x1f000000.
  */
 #define PALM_PROFILE_NAME "Palm IIIc experimental"
-#define PALM_RAM_LOGICAL_SIZE (8u * 1024u * 1024u)
+#define PALM_RAM_LOGICAL_SIZE (4u * 1024u * 1024u)
 #define PALM_HAS_SED1375 1
 #define PALM_SED1375_BASE 0x1f000000u
 #define PALM_SED1375_REG_BASE 0x1f01ffe0u

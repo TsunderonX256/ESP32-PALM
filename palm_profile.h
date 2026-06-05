@@ -31,10 +31,9 @@
 #define PALM_SYSTEM_CLOCK_HZ 16000000.0
 
 #elif PALM_HARDWARE_PROFILE == PALM_PROFILE_IIIC_EXPERIMENTAL
-// Desktop profile parity only. The ESP32/CYD path does not currently emulate
-// the IIIc's external SED1375 color LCD controller.
+// Experimental ESP32 profile with a minimal SED1375 color LCD controller model.
 #define PALM_PROFILE_NAME "Palm IIIc experimental"
-#define PALM_RAM_LOGICAL_SIZE (8UL * 1024UL * 1024UL)
+#define PALM_RAM_LOGICAL_SIZE (4UL * 1024UL * 1024UL)
 #define PALM_HAS_SED1375 1
 #define PALM_SED1375_BASE 0x1f000000UL
 #define PALM_SED1375_REG_BASE 0x1f01ffe0UL

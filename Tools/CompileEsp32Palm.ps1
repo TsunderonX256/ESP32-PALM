@@ -2,6 +2,7 @@ param(
     [string]$ArduinoCli = "",
     [string]$Fqbn = "",
     [string]$BuildRoot = "",
+    [string]$RomFileName = "",
     [string]$Port = "",
     [switch]$CodeCheckOnly,
     [switch]$LargeApp,
@@ -11,7 +12,17 @@ param(
 $ErrorActionPreference = "Stop"
 
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
-$romFileName = "Palm-m100-3.51-en.rom"
+$configText = Get-Content -LiteralPath (Join-Path $repoRoot "palm_config.h") -Raw
+if ([string]::IsNullOrWhiteSpace($RomFileName)) {
+    if ($configText -match "PALM_HARDWARE_PROFILE\s+PALM_PROFILE_IIIC_EXPERIMENTAL") {
+        $RomFileName = "Palm-IIIc-4.1-en.rom"
+    } elseif ($configText -match "PALM_HARDWARE_PROFILE\s+PALM_PROFILE_M100_EXPERIMENTAL") {
+        $RomFileName = "Palm-m100-3.51-en.rom"
+    } else {
+        $RomFileName = "Palm-IIIx-3.1.rom"
+    }
+}
+$romFileName = $RomFileName
 $romPath = Join-Path $repoRoot $romFileName
 $partitionCsv = Join-Path $repoRoot "Tools\esp32_palm_16mb_partitions.csv"
 

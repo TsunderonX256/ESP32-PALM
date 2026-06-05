@@ -44,6 +44,10 @@ static uint32_t uartTxTail = 0;
 static uint32_t uartTxCount = 0;
 static uint32_t uartRxOverrunCount = 0;
 static uint32_t uartTxOverrunCount = 0;
+static bool uartIrdaEnabledLast = false;
+static uint16_t uartIrdaProbeEchoBudget = 0;
+static uint32_t uartIrdaProbeEchoUntilMs = 0;
+static uint8_t displayBrightnessLevel = 255;
 
 static constexpr uint8_t PORT_D_POWER_FAIL = 0x80;
 static constexpr uint16_t INT_HI_PEN = 0x0010;
@@ -88,6 +92,9 @@ static constexpr uint16_t UART_TX_FIFO_HALF = 0x4000;
 static constexpr uint16_t UART_TX_AVAILABLE = 0x2000;
 static constexpr uint16_t UART_TX_IGNORE_CTS = 0x0800;
 static constexpr uint16_t UART_MISC_IRDA_ENABLE = 0x0020;
+static constexpr uint8_t IRDA_SIR_BOF = 0xc0;
+static constexpr uint8_t IRDA_SIR_EOF = 0xc1;
+static constexpr uint8_t IRDA_SIR_ESCAPE = 0x7d;
 static constexpr uint16_t TMR_STATUS_COMPARE = 0x0001;
 static constexpr uint16_t TMR_CONTROL_ENABLE = 0x0001;
 static constexpr uint16_t TMR_CONTROL_INT_ENABLE = 0x0010;
@@ -106,11 +113,14 @@ static constexpr uint16_t KEY_BIT_HARD1 = 0x0008;
 static constexpr uint16_t KEY_BIT_HARD2 = 0x0010;
 static constexpr uint16_t KEY_BIT_HARD3 = 0x0020;
 static constexpr uint16_t KEY_BIT_HARD4 = 0x0040;
+static constexpr uint16_t KEY_BIT_CONTRAST = 0x0080;
 static constexpr uint8_t PORT_G_ID_DETECT = 0x04;
 #if PALM_HARDWARE_PROFILE == PALM_PROFILE_M100_EXPERIMENTAL
 static constexpr uint8_t HARDWARE_ID_KEY_STATE = 0xfa;  // m100 ID1 and ID3 active-low.
+#elif PALM_HARDWARE_PROFILE == PALM_PROFILE_IIIC_EXPERIMENTAL
+static constexpr uint8_t HARDWARE_ID_KEY_STATE = 0xf6;  // IIIc/Austin ID1 and ID4 active-low.
 #else
-static constexpr uint8_t HARDWARE_ID_KEY_STATE = 0xff;
+static constexpr uint8_t HARDWARE_ID_KEY_STATE = 0xf2;  // IIIx/Brad ID1, ID3, and ID4 active-low.
 #endif
 static constexpr uint16_t PEN_RAW_LEFT = 3800;
 static constexpr uint16_t PEN_RAW_RIGHT = 300;
@@ -232,6 +242,23 @@ static double systemClockFrequency() {
   return PALM_SYSTEM_CLOCK_HZ;
 }
 
+static void updateDisplayBrightnessLevel() {
+#if PALM_HAS_SED1375
+  // Palm IIIc brightness is not wired to the DragonBall contrast register.
+  // Keep it fixed until the real ROM preference/hardware path is mapped.
+  displayBrightnessLevel = 255;
+#else
+  uint16_t contrast = get16(0xA36);
+  if (contrast == 0) {
+    displayBrightnessLevel = 255;
+    return;
+  }
+
+  uint8_t lowByte = contrast & 0xff;
+  displayBrightnessLevel = lowByte != 0 ? lowByte : ((contrast >> 8) & 0xff);
+#endif
+}
+
 static uint64_t hostMicrosToSystemCycles(uint64_t elapsedMicros) {
   return static_cast<uint64_t>((static_cast<double>(elapsedMicros) * systemClockFrequency()) / 1000000.0);
 }
@@ -343,6 +370,10 @@ static uint8_t portDKeyBits() {
   bool row0 = keyRowB(0x01);
   bool row1 = keyRowB(0x08);
   bool row2 = keyRowB(0x40);
+#elif PALM_HARDWARE_PROFILE == PALM_PROFILE_IIIC_EXPERIMENTAL
+  bool row0 = keyRowC(0x01);
+  bool row1 = keyRowC(0x02);
+  bool row2 = keyRowC(0x04);
 #else
   bool row0 = keyRowF(0x10) || keyRowC(0x01) || keyRowB(0x01);
   bool row1 = keyRowF(0x20) || keyRowC(0x02) || keyRowB(0x08);
@@ -367,10 +398,26 @@ static uint8_t portDKeyBits() {
       if (buttonBitsDown & KEY_BIT_POWER) bits |= 0x01;
 #if PALM_HARDWARE_PROFILE == PALM_PROFILE_M100_EXPERIMENTAL
       if (buttonBitsDown & KEY_BIT_PAGE_UP) bits |= 0x02;
+#elif PALM_HARDWARE_PROFILE == PALM_PROFILE_IIIC_EXPERIMENTAL
+      if (buttonBitsDown & KEY_BIT_CONTRAST) bits |= 0x02;
 #endif
       if (buttonBitsDown & KEY_BIT_HARD2) bits |= 0x04;
   }
   return bits;
+}
+
+static uint8_t sleepingKeyEdgeColumns(uint16_t bits) {
+#if PALM_HARDWARE_PROFILE == PALM_PROFILE_IIIC_EXPERIMENTAL
+  uint8_t columns = 0;
+  if (bits & (KEY_BIT_HARD1 | KEY_BIT_PAGE_UP | KEY_BIT_POWER)) columns |= 0x01;
+  if (bits & (KEY_BIT_HARD2 | KEY_BIT_PAGE_DOWN | KEY_BIT_CONTRAST)) columns |= 0x02;
+  if (bits & KEY_BIT_HARD3) columns |= 0x04;
+  if (bits & KEY_BIT_HARD4) columns |= 0x08;
+  return columns;
+#else
+  (void)bits;
+  return 0;
+#endif
 }
 
 static bool idDetectAsserted() {
@@ -381,6 +428,10 @@ static bool idDetectAsserted() {
 }
 
 static uint8_t portInputValue(char port) {
+#if PALM_HARDWARE_PROFILE == PALM_PROFILE_IIIC_EXPERIMENTAL
+  if (port == 'C') return 0x08;  // Not charging, active-low cradle input.
+  if (port == 'F') return 0x82;  // FIXTRNL2 plus LCD-powered input.
+#endif
   if (port == 'D') return idDetectAsserted() ? HARDWARE_ID_KEY_STATE : portDKeyBits();
   if (port == 'F') return penDown ? 0x00 : 0x02;  // Sumo/Brad PenIO is active low.
   if (port == 'E') return 0xff;  // Brad/Palm IIIx hardware sub-ID is zero.
@@ -388,6 +439,9 @@ static uint8_t portInputValue(char port) {
 }
 
 static uint8_t portInternalValue(char port) {
+#if PALM_HARDWARE_PROFILE == PALM_PROFILE_IIIC_EXPERIMENTAL
+  if (port == 'D') return PORT_D_POWER_FAIL | 0x40;  // Not in cradle.
+#endif
   if (port == 'D') return PORT_D_POWER_FAIL;
   return 0x00;
 }
@@ -420,7 +474,15 @@ static uint8_t readPortData(uint16_t offset) {
   internal &= ~sel;
   output &= sel & dir;
   input &= sel & ~dir;
-  return output | input | internal;
+  uint8_t value = output | input | internal;
+#if PALM_HARDWARE_PROFILE == PALM_PROFILE_IIIC_EXPERIMENTAL
+  if (port == 'F') {
+    // Austin waits for the SED1375 LCD-powered input during display wake.
+    // Force it visible even if GPIO select/dir would otherwise hide it.
+    value |= 0x81;
+  }
+#endif
+  return value;
 }
 
 static void updatePortDInterrupts() {
@@ -532,12 +594,12 @@ static void updateRtcTime() {
 static void completeSpiExchange() {
   uint16_t control = get16(0x802);
   if ((control & (SPIM_ENABLE | SPIM_EXCHANGE)) != (SPIM_ENABLE | SPIM_EXCHANGE)) return;
+  uint16_t spiData = get16(0x800);
+  uint16_t numBits = (control & 0x000f) + 1;
 
   if ((dbRegs[0x431] & 0x20) == 0) {
-    uint16_t numBits = (control & 0x000f) + 1;
     uint32_t oldBitsMask = 0xffffffffUL << numBits;
     uint32_t newBitsMask = ~oldBitsMask;
-    uint16_t spiData = get16(0x800);
     uint16_t result = 0;
 
     adsBitBufferIn = ((adsBitBufferIn << numBits) & oldBitsMask) | (spiData & newBitsMask);
@@ -664,6 +726,44 @@ static bool enqueueUartRxByte(uint8_t value) {
   return true;
 }
 
+static bool uartIrdaEnabled() {
+  return (get16(0x908) & UART_MISC_IRDA_ENABLE) != 0;
+}
+
+static void updateUartIrdaProbeEchoState() {
+#if PALM_UART_IRDA_PROBE_ECHO
+  bool enabled = uartIrdaEnabled();
+  if (enabled && !uartIrdaEnabledLast) {
+    uartIrdaProbeEchoBudget = PALM_UART_IRDA_PROBE_ECHO_BYTES;
+    uartIrdaProbeEchoUntilMs = millis() + PALM_UART_IRDA_PROBE_ECHO_MS;
+  } else if (!enabled) {
+    uartIrdaProbeEchoBudget = 0;
+  }
+  uartIrdaEnabledLast = enabled;
+#else
+  uartIrdaEnabledLast = uartIrdaEnabled();
+  uartIrdaProbeEchoBudget = 0;
+  uartIrdaProbeEchoUntilMs = 0;
+#endif
+}
+
+static void enqueueUartIrdaEcho(uint8_t value) {
+#if PALM_UART_IRDA_PROBE_ECHO
+  if (!uartIrdaEnabled() || uartIrdaProbeEchoBudget == 0) return;
+  if (static_cast<int32_t>(millis() - uartIrdaProbeEchoUntilMs) > 0) {
+    uartIrdaProbeEchoBudget = 0;
+    return;
+  }
+  if (value == IRDA_SIR_BOF || value == IRDA_SIR_EOF || value == IRDA_SIR_ESCAPE) {
+    uartIrdaProbeEchoBudget = 0;
+    return;
+  }
+  if (enqueueUartRxByte(value)) --uartIrdaProbeEchoBudget;
+#else
+  (void)value;
+#endif
+}
+
 static void resetUartState() {
   uartRxHead = 0;
   uartRxTail = 0;
@@ -673,6 +773,9 @@ static void resetUartState() {
   uartTxCount = 0;
   uartRxOverrunCount = 0;
   uartTxOverrunCount = 0;
+  uartIrdaEnabledLast = false;
+  uartIrdaProbeEchoBudget = 0;
+  uartIrdaProbeEchoUntilMs = 0;
   put16(0x906, UART_TX_FIFO_EMPTY | UART_TX_FIFO_HALF | UART_TX_AVAILABLE | UART_TX_IGNORE_CTS);
 }
 
@@ -740,6 +843,8 @@ void palmHwInit() {
   dbRegs[0xA33] = 0x84;        // gray palette
   put16(0xA36, 0x0000);        // contrast PWM
   put16(0x906, UART_TX_FIFO_EMPTY | UART_TX_FIFO_HALF | UART_TX_AVAILABLE | UART_TX_IGNORE_CTS);
+  displayBrightnessLevel = 255;
+  updateDisplayBrightnessLevel();
 
   updateLcdWriteRange();
   lcdDirty = true;
@@ -765,6 +870,11 @@ bool palmHwLoadState(const uint8_t *regs, size_t regSize, const PalmHwSavedState
   timerLastHostMicros = hostMonotonicMicros();
   resetCyclePacer(timerLastHostMicros);
   seedRtcFromTimeRegister();
+  uartIrdaEnabledLast = uartIrdaEnabled();
+  uartIrdaProbeEchoBudget = 0;
+  uartIrdaProbeEchoUntilMs = 0;
+  displayBrightnessLevel = 255;
+  updateDisplayBrightnessLevel();
 
   adsBitBufferIn = state.adsBitBufferIn;
   adsBitBufferOut = state.adsBitBufferOut;
@@ -899,6 +1009,9 @@ void palmHwSetButtonBits(uint16_t bits, bool down) {
 
   uint8_t newKeyBits = portDKeyBits();
   portDEdge |= newKeyBits & static_cast<uint8_t>(~oldKeyBits);
+  if (down && palmHwIsAsleep()) {
+    portDEdge |= sleepingKeyEdgeColumns(bits);
+  }
   updatePortDInterrupts();
 }
 
@@ -1032,12 +1145,19 @@ void palmHwWrite8(uint32_t address, uint8_t value) {
       uartTxFifo[uartTxHead] = value;
       uartTxHead = (uartTxHead + 1) % PALM_UART_FIFO_SIZE;
       ++uartTxCount;
+      enqueueUartIrdaEcho(value);
     } else {
       ++uartTxOverrunCount;
     }
     updateUartRegs();
   }
+  if (offset == 0x908 || offset == 0x909) updateUartIrdaProbeEchoState();
   if (offset >= 0x900 && offset <= 0x909) updateUartRegs();
+  if ((offset >= 0x500 && offset <= 0x504) ||
+      offset == 0x410 || offset == 0x411 || offset == 0x413 ||
+      offset == 0xA36 || offset == 0xA37) {
+    updateDisplayBrightnessLevel();
+  }
   if (offset == 0x60A || offset == 0x60B) {
     uint16_t status = get16(0x60A);
     status &= value | ~lastTimerStatus;
@@ -1101,6 +1221,8 @@ PalmLcdState palmHwGetLcdState() {
 }
 
 PalmHwDebug palmHwGetDebug() { return hwDebug; }
+
+uint8_t palmHwDisplayBrightnessLevel() { return displayBrightnessLevel; }
 
 uint32_t palmHwUartWriteRx(const uint8_t *buffer, uint32_t count) {
   if (buffer == nullptr || count == 0) return 0;

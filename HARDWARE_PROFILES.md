@@ -25,7 +25,7 @@ LCD geometry, digitizer geometry, and device identity.
   when the ROM writes it.
 - The IIIx profile keeps desktop contrast fixed at maximum because this ROM
   does not expose a software brightness/contrast control in normal use.
-- The IIIc profile uses an 8 MB RAM map and the external Epson SED1375 color
+- The IIIc profile uses a 4 MB RAM map and the external Epson SED1375 color
   LCD controller at `$1F000000`. This is intentionally separate from the
   DragonBall EZ LCD path used by IIIx and m100.
 
