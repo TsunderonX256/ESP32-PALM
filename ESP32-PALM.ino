@@ -51,6 +51,7 @@ static constexpr uint8_t BACKLIGHT_PALM_MAX_DUTY = BACKLIGHT_DEFAULT_DUTY;
 static constexpr uint8_t BACKLIGHT_SAVE_DUTY = 13;
 static constexpr unsigned long PALM_STATE_SAVE_HOLD_MS = 1000;
 static constexpr unsigned long PALM_OS_RESET_HOLD_MS = 1000;
+static constexpr unsigned long PALM_BUTTON_HOLD_RELEASE_GRACE_MS = 350;
 static constexpr int PALM_STATE_SAVE_SLEEP_PULSE_SLICES = 220;
 static constexpr int PALM_STATE_SAVE_WAKE_PULSE_SLICES = 220;
 static constexpr unsigned long PALM_STATE_SAVE_SLEEP_SETTLE_MS = 1000;
@@ -151,6 +152,13 @@ static int cachedTouchPalmY = -1;
 #define PALM_DBG_PRINTF(...) do {} while (0)
 #define PALM_DBG_PRINTLN(...) do {} while (0)
 #endif
+#if PALM_BUTTON_HOLD_SERIAL_STATS
+#define PALM_HOLD_DBG_PRINTF(...) PALM_DBG_PRINTF(__VA_ARGS__)
+#define PALM_HOLD_DBG_PRINTLN(...) PALM_DBG_PRINTLN(__VA_ARGS__)
+#else
+#define PALM_HOLD_DBG_PRINTF(...) do {} while (0)
+#define PALM_HOLD_DBG_PRINTLN(...) do {} while (0)
+#endif
 
 static bool nativePenDown = false;
 static uint16_t nativePenAdcX = 0xffff;
@@ -235,6 +243,8 @@ static constexpr uint16_t VIRTUAL_BUTTON_PAGE_DOWN = 0x0004;
 static constexpr uint16_t VIRTUAL_BUTTON_RESET_OS = 0x2000;
 static constexpr uint16_t VIRTUAL_BUTTON_SAVE_STATE = 0x4000;
 static constexpr uint16_t VIRTUAL_BUTTON_TOP_UNUSED = 0x8000;
+static constexpr uint16_t VIRTUAL_BUTTON_HOLD_MASK = VIRTUAL_BUTTON_RESET_OS |
+                                                     VIRTUAL_BUTTON_SAVE_STATE;
 static constexpr uint16_t VIRTUAL_BUTTON_HW_MASK = VIRTUAL_BUTTON_POWER |
                                                    VIRTUAL_BUTTON_HARD1 |
                                                    VIRTUAL_BUTTON_HARD2 |
@@ -653,12 +663,20 @@ static bool palmStateSaveInProgress = false;
 static bool touchInputDisabled = false;
 static bool saveButtonHoldActive = false;
 static bool saveButtonHoldTriggered = false;
+static bool saveButtonReleaseRequired = false;
 static unsigned long saveButtonHoldStartMs = 0;
+static unsigned long saveButtonHoldLastLogMs = 0;
 static bool palmOsResetRequested = false;
 static bool palmOsResetInProgress = false;
 static bool resetButtonHoldActive = false;
 static bool resetButtonHoldTriggered = false;
+static bool resetButtonReleaseRequired = false;
 static unsigned long resetButtonHoldStartMs = 0;
+static unsigned long resetButtonHoldLastLogMs = 0;
+static uint16_t latchedHoldButtonBits = 0;
+static int latchedHoldRawX = -1;
+static int latchedHoldRawY = -1;
+static unsigned long holdButtonLastSeenMs = 0;
 static uint8_t lastPalmBacklightDuty = 0xff;
 #if PALM_UART_HOST_SERIAL_BRIDGE
 static bool palmUartBridgeActive = false;
@@ -1275,6 +1293,49 @@ static uint16_t virtualButtonBitsForRaw(int rawX, int rawY, int &index) {
   return virtualButtonBitsForIndex(index);
 }
 
+static bool rawInSystemStrip(int rawX, int rawY) {
+  return rawX >= VIRTUAL_POWER_STRIP_X0 && rawX < VIRTUAL_POWER_STRIP_X1 &&
+         rawY >= 0 && rawY < SCREEN_H;
+}
+
+static bool rawNearLatchedHold(int rawX, int rawY) {
+  if (latchedHoldButtonBits == 0) return false;
+  if (!rawInSystemStrip(rawX, rawY)) return false;
+
+  int slotH = SCREEN_H / VIRTUAL_BUTTON_COUNT;
+  int maxYDrift = slotH + slotH / 2;
+  int maxXDrift = max(12, VIRTUAL_POWER_STRIP_X1 - VIRTUAL_POWER_STRIP_X0);
+  return abs(rawX - latchedHoldRawX) <= maxXDrift &&
+         abs(rawY - latchedHoldRawY) <= maxYDrift;
+}
+
+static uint16_t applySystemHoldLatch(uint16_t buttonBits, int &buttonIndex,
+                                     int rawX, int rawY) {
+  uint16_t holdBits = buttonBits & VIRTUAL_BUTTON_HOLD_MASK;
+
+  if (latchedHoldButtonBits != 0) {
+    if (rawNearLatchedHold(rawX, rawY)) {
+      if ((latchedHoldButtonBits & VIRTUAL_BUTTON_SAVE_STATE) != 0) {
+        buttonIndex = VIRTUAL_SAVE_BUTTON_INDEX;
+      } else {
+        buttonIndex = VIRTUAL_RESET_BUTTON_INDEX;
+      }
+      return latchedHoldButtonBits;
+    }
+    latchedHoldButtonBits = 0;
+    latchedHoldRawX = -1;
+    latchedHoldRawY = -1;
+  }
+
+  if (holdBits != 0) {
+    latchedHoldButtonBits = holdBits;
+    latchedHoldRawX = rawX;
+    latchedHoldRawY = rawY;
+  }
+
+  return buttonBits;
+}
+
 static bool virtualPowerButtonDown() {
   return (virtualButtonBitsDown & VIRTUAL_BUTTON_POWER) != 0;
 }
@@ -1313,29 +1374,99 @@ static void setVirtualButtonBits(uint16_t bits, int index, int rawX, int rawY) {
   }
 #else
   (void)oldIndex;
+#if !PALM_BUTTON_HOLD_SERIAL_STATS
   (void)rawX;
   (void)rawY;
+#endif
+#endif
+
+#if PALM_BUTTON_HOLD_SERIAL_STATS
+  if (((oldBits ^ bits) & VIRTUAL_BUTTON_HOLD_MASK) != 0) {
+    PALM_HOLD_DBG_PRINTF("Hold button change old=0x%04x new=0x%04x oldIdx=%d newIdx=%d raw=%d,%d save(active=%u trig=%u gate=%u) reset(active=%u trig=%u gate=%u)\n",
+                         oldBits,
+                         bits,
+                         oldIndex,
+                         index,
+                         rawX,
+                         rawY,
+                         saveButtonHoldActive ? 1 : 0,
+                         saveButtonHoldTriggered ? 1 : 0,
+                         saveButtonReleaseRequired ? 1 : 0,
+                         resetButtonHoldActive ? 1 : 0,
+                         resetButtonHoldTriggered ? 1 : 0,
+                         resetButtonReleaseRequired ? 1 : 0);
+  }
 #endif
 
   virtualButtonBitsDown = bits;
   virtualButtonIndexDown = bits != 0 ? index : -1;
 }
 
-static void resetSaveButtonHold() {
+static void resetSaveButtonHold(bool clearReleaseGate = true) {
+  if (saveButtonHoldActive || saveButtonHoldTriggered || saveButtonReleaseRequired) {
+    PALM_HOLD_DBG_PRINTF("Save hold reset clearGate=%u active=%u trig=%u gate=%u raw=%d,%d\n",
+                         clearReleaseGate ? 1 : 0,
+                         saveButtonHoldActive ? 1 : 0,
+                         saveButtonHoldTriggered ? 1 : 0,
+                         saveButtonReleaseRequired ? 1 : 0,
+                         lastTouchRawX,
+                         lastTouchRawY);
+  }
   saveButtonHoldActive = false;
   saveButtonHoldTriggered = false;
   saveButtonHoldStartMs = 0;
+  saveButtonHoldLastLogMs = 0;
+  if (clearReleaseGate) saveButtonReleaseRequired = false;
+  if (latchedHoldButtonBits == VIRTUAL_BUTTON_SAVE_STATE) {
+    latchedHoldButtonBits = 0;
+    latchedHoldRawX = -1;
+    latchedHoldRawY = -1;
+  }
 }
 
-static void resetResetButtonHold() {
+static void resetResetButtonHold(bool clearReleaseGate = true) {
+  if (resetButtonHoldActive || resetButtonHoldTriggered || resetButtonReleaseRequired) {
+    PALM_HOLD_DBG_PRINTF("Reset hold reset clearGate=%u active=%u trig=%u gate=%u raw=%d,%d\n",
+                         clearReleaseGate ? 1 : 0,
+                         resetButtonHoldActive ? 1 : 0,
+                         resetButtonHoldTriggered ? 1 : 0,
+                         resetButtonReleaseRequired ? 1 : 0,
+                         lastTouchRawX,
+                         lastTouchRawY);
+  }
   resetButtonHoldActive = false;
   resetButtonHoldTriggered = false;
   resetButtonHoldStartMs = 0;
+  resetButtonHoldLastLogMs = 0;
+  if (clearReleaseGate) resetButtonReleaseRequired = false;
+  if (latchedHoldButtonBits == VIRTUAL_BUTTON_RESET_OS) {
+    latchedHoldButtonBits = 0;
+    latchedHoldRawX = -1;
+    latchedHoldRawY = -1;
+  }
 }
 
 static void updateSaveButtonHold(bool down, unsigned long now) {
-  if (!down || palmStateSaveInProgress || touchInputDisabled) {
+  if (!down) {
     resetSaveButtonHold();
+    return;
+  }
+
+  if (palmStateSaveInProgress || touchInputDisabled) {
+    PALM_HOLD_DBG_PRINTF("Save hold blocked busy save=%u touchDisabled=%u\n",
+                         palmStateSaveInProgress ? 1 : 0,
+                         touchInputDisabled ? 1 : 0);
+    resetSaveButtonHold(false);
+    return;
+  }
+
+  if (saveButtonReleaseRequired) {
+    if (now - saveButtonHoldLastLogMs >= 500) {
+      saveButtonHoldLastLogMs = now;
+      PALM_HOLD_DBG_PRINTF("Save hold waiting release raw=%d,%d\n",
+                           lastTouchRawX,
+                           lastTouchRawY);
+    }
     return;
   }
 
@@ -1343,24 +1474,50 @@ static void updateSaveButtonHold(bool down, unsigned long now) {
     saveButtonHoldActive = true;
     saveButtonHoldTriggered = false;
     saveButtonHoldStartMs = now;
-#if PALM_TOUCH_EDGE_SERIAL_STATS
-    PALM_DBG_PRINTLN("State save hold started");
-#endif
+    saveButtonHoldLastLogMs = now;
+    PALM_HOLD_DBG_PRINTF("Save hold start raw=%d,%d\n", lastTouchRawX, lastTouchRawY);
     return;
+  }
+
+  if (!saveButtonHoldTriggered && now - saveButtonHoldLastLogMs >= 250) {
+    saveButtonHoldLastLogMs = now;
+    PALM_HOLD_DBG_PRINTF("Save hold progress %lu/%lu raw=%d,%d\n",
+                         static_cast<unsigned long>(now - saveButtonHoldStartMs),
+                         PALM_STATE_SAVE_HOLD_MS,
+                         lastTouchRawX,
+                         lastTouchRawY);
   }
 
   if (!saveButtonHoldTriggered && now - saveButtonHoldStartMs >= PALM_STATE_SAVE_HOLD_MS) {
     saveButtonHoldTriggered = true;
+    saveButtonReleaseRequired = true;
     palmStateSaveRequested = true;
-#if PALM_TOUCH_EDGE_SERIAL_STATS
-    PALM_DBG_PRINTLN("State save hold accepted");
-#endif
+    PALM_HOLD_DBG_PRINTF("Save hold accepted after %lu ms\n",
+                         static_cast<unsigned long>(now - saveButtonHoldStartMs));
   }
 }
 
 static void updateResetButtonHold(bool down, unsigned long now) {
-  if (!down || palmOsResetInProgress || touchInputDisabled) {
+  if (!down) {
     resetResetButtonHold();
+    return;
+  }
+
+  if (palmOsResetInProgress || touchInputDisabled) {
+    PALM_HOLD_DBG_PRINTF("Reset hold blocked busy reset=%u touchDisabled=%u\n",
+                         palmOsResetInProgress ? 1 : 0,
+                         touchInputDisabled ? 1 : 0);
+    resetResetButtonHold(false);
+    return;
+  }
+
+  if (resetButtonReleaseRequired) {
+    if (now - resetButtonHoldLastLogMs >= 500) {
+      resetButtonHoldLastLogMs = now;
+      PALM_HOLD_DBG_PRINTF("Reset hold waiting release raw=%d,%d\n",
+                           lastTouchRawX,
+                           lastTouchRawY);
+    }
     return;
   }
 
@@ -1368,18 +1525,26 @@ static void updateResetButtonHold(bool down, unsigned long now) {
     resetButtonHoldActive = true;
     resetButtonHoldTriggered = false;
     resetButtonHoldStartMs = now;
-#if PALM_TOUCH_EDGE_SERIAL_STATS
-    PALM_DBG_PRINTLN("Palm reset hold started");
-#endif
+    resetButtonHoldLastLogMs = now;
+    PALM_HOLD_DBG_PRINTF("Reset hold start raw=%d,%d\n", lastTouchRawX, lastTouchRawY);
     return;
+  }
+
+  if (!resetButtonHoldTriggered && now - resetButtonHoldLastLogMs >= 250) {
+    resetButtonHoldLastLogMs = now;
+    PALM_HOLD_DBG_PRINTF("Reset hold progress %lu/%lu raw=%d,%d\n",
+                         static_cast<unsigned long>(now - resetButtonHoldStartMs),
+                         PALM_OS_RESET_HOLD_MS,
+                         lastTouchRawX,
+                         lastTouchRawY);
   }
 
   if (!resetButtonHoldTriggered && now - resetButtonHoldStartMs >= PALM_OS_RESET_HOLD_MS) {
     resetButtonHoldTriggered = true;
+    resetButtonReleaseRequired = true;
     palmOsResetRequested = true;
-#if PALM_TOUCH_EDGE_SERIAL_STATS
-    PALM_DBG_PRINTLN("Palm reset hold accepted");
-#endif
+    PALM_HOLD_DBG_PRINTF("Reset hold accepted after %lu ms\n",
+                         static_cast<unsigned long>(now - resetButtonHoldStartMs));
   }
 }
 
@@ -1616,8 +1781,8 @@ static bool getPalmScreenTouch(int &screenX, int &screenY) {
   unsigned long now = millis();
   if (touchInputDisabled) {
     setVirtualButtonBits(0, -1, lastTouchRawX, lastTouchRawY);
-    resetSaveButtonHold();
-    resetResetButtonHold();
+    resetSaveButtonHold(false);
+    resetResetButtonHold(false);
     cachedTouchDown = false;
     touchCandidateActive = false;
     lastTouchDown = false;
@@ -1631,10 +1796,12 @@ static bool getPalmScreenTouch(int &screenX, int &screenY) {
     if (controllerDown) {
       int rawX = gt911.points[0].x;
       int rawY = gt911.points[0].y;
+      lastTouchRawX = rawX;
+      lastTouchRawY = rawY;
       if (palmLowPowerModeActive && palmLowPowerRequireTouchRelease) {
         setVirtualButtonBits(0, -1, rawX, rawY);
-        lastTouchRawX = rawX;
-        lastTouchRawY = rawY;
+        resetSaveButtonHold(false);
+        resetResetButtonHold(false);
         cachedTouchDown = false;
         touchCandidateActive = false;
         lastTouchDown = false;
@@ -1643,22 +1810,22 @@ static bool getPalmScreenTouch(int &screenX, int &screenY) {
 
       int buttonIndex;
       uint16_t buttonBits = virtualButtonBitsForRaw(rawX, rawY, buttonIndex);
+      buttonBits = applySystemHoldLatch(buttonBits, buttonIndex, rawX, rawY);
       if (buttonBits != 0) {
         if (palmHwIsAsleep()) {
           setVirtualButtonBits(0, -1, rawX, rawY);
           buttonBits = 0;
         } else {
           setVirtualButtonBits(buttonBits, buttonIndex, rawX, rawY);
+          if ((buttonBits & VIRTUAL_BUTTON_HOLD_MASK) != 0) holdButtonLastSeenMs = now;
           updateSaveButtonHold((buttonBits & VIRTUAL_BUTTON_SAVE_STATE) != 0, now);
           updateResetButtonHold((buttonBits & VIRTUAL_BUTTON_RESET_OS) != 0, now);
         }
       } else {
-        resetSaveButtonHold();
-        resetResetButtonHold();
+        resetSaveButtonHold(false);
+        resetResetButtonHold(false);
       }
       if (buttonBits != 0) {
-        lastTouchRawX = rawX;
-        lastTouchRawY = rawY;
         cachedTouchDown = false;
         touchCandidateActive = false;
         lastTouchDown = false;
@@ -1668,8 +1835,6 @@ static bool getPalmScreenTouch(int &screenX, int &screenY) {
       int palmX;
       int palmY;
       rawTouchToPalm(rawX, rawY, palmX, palmY);
-      lastTouchRawX = rawX;
-      lastTouchRawY = rawY;
       bool bypassStableTouch = palmHwIsAsleep();
       if (!cachedTouchDown && !bypassStableTouch) {
         if (!touchCandidateActive ||
@@ -1689,6 +1854,21 @@ static bool getPalmScreenTouch(int &screenX, int &screenY) {
       cachedTouchDown = true;
       lastControllerTouchMs = now;
     } else {
+      if ((virtualButtonBitsDown & VIRTUAL_BUTTON_HOLD_MASK) != 0 &&
+          now - holdButtonLastSeenMs <= PALM_BUTTON_HOLD_RELEASE_GRACE_MS) {
+        PALM_HOLD_DBG_PRINTF("Hold button dropout grace %lu/%lu bits=0x%04x raw=%d,%d\n",
+                             static_cast<unsigned long>(now - holdButtonLastSeenMs),
+                             PALM_BUTTON_HOLD_RELEASE_GRACE_MS,
+                             virtualButtonBitsDown,
+                             lastTouchRawX,
+                             lastTouchRawY);
+        updateSaveButtonHold((virtualButtonBitsDown & VIRTUAL_BUTTON_SAVE_STATE) != 0, now);
+        updateResetButtonHold((virtualButtonBitsDown & VIRTUAL_BUTTON_RESET_OS) != 0, now);
+        cachedTouchDown = false;
+        touchCandidateActive = false;
+        lastTouchDown = false;
+        return false;
+      }
       resetSaveButtonHold();
       resetResetButtonHold();
       palmLowPowerRequireTouchRelease = false;
@@ -2073,6 +2253,7 @@ static void releaseSerialDebugForPalmUart() {
     !PALM_RUNTIME_SERIAL_STATS && \
     !PALM_PERF_SERIAL_STATS && \
     !PALM_TOUCH_EDGE_SERIAL_STATS && \
+    !PALM_BUTTON_HOLD_SERIAL_STATS && \
     !PALM_WAKE_SERIAL_STATS
   if (debugSerialActive) {
     PALM_DBG_PRINTLN("Debug serial released for Palm UART");
@@ -2723,8 +2904,8 @@ static void executePalmCpuSlice(uint32_t cycles);
 
 static void releaseTouchForStateSave() {
   setVirtualButtonBits(0, -1, lastTouchRawX, lastTouchRawY);
-  resetSaveButtonHold();
-  resetResetButtonHold();
+  resetSaveButtonHold(false);
+  resetResetButtonHold(false);
   cachedTouchDown = false;
   touchCandidateActive = false;
   lastTouchDown = false;
@@ -2819,6 +3000,7 @@ static bool wakePalmAfterStateSave() {
 
 static void servicePalmStateSaveRequest() {
   if (!palmStateSaveRequested || palmStateSaveInProgress) return;
+  PALM_HOLD_DBG_PRINTLN("Save service start");
   palmStateSaveRequested = false;
   palmStateSaveInProgress = true;
   touchInputDisabled = true;
@@ -2858,14 +3040,13 @@ static void servicePalmStateSaveRequest() {
   }
   lastFrameMs = 0;
   touchInputDisabled = false;
-  saveButtonHoldActive = true;
-  saveButtonHoldTriggered = true;
-  saveButtonHoldStartMs = millis();
   palmStateSaveInProgress = false;
+  PALM_HOLD_DBG_PRINTLN("Save service end");
 }
 
 static void servicePalmOsResetRequest() {
   if (!palmOsResetRequested || palmOsResetInProgress || palmStateSaveInProgress) return;
+  PALM_HOLD_DBG_PRINTLN("Reset service start");
   palmOsResetRequested = false;
   palmOsResetInProgress = true;
   touchInputDisabled = true;
@@ -2900,10 +3081,8 @@ static void servicePalmOsResetRequest() {
 #endif
 
   touchInputDisabled = false;
-  resetButtonHoldActive = true;
-  resetButtonHoldTriggered = true;
-  resetButtonHoldStartMs = millis();
   palmOsResetInProgress = false;
+  PALM_HOLD_DBG_PRINTLN("Reset service end");
 }
 
 static bool timeReached(unsigned long now, unsigned long target) {
