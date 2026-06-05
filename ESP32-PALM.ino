@@ -46,8 +46,8 @@ extern "C" void m68k_pulse_reset(void);
 static constexpr uint32_t BACKLIGHT_PWM_HZ = 5000;
 static constexpr uint8_t BACKLIGHT_PWM_BITS = 8;
 static constexpr uint8_t BACKLIGHT_DEFAULT_DUTY = 128;
-static constexpr uint8_t BACKLIGHT_PALM_MIN_DUTY = 8;
-static constexpr uint8_t BACKLIGHT_PALM_MAX_DUTY = BACKLIGHT_DEFAULT_DUTY;
+static constexpr uint8_t BACKLIGHT_PALM_MIN_DUTY = 26;   // 10%
+static constexpr uint8_t BACKLIGHT_PALM_MAX_DUTY = 128;  // 50%
 static constexpr uint8_t BACKLIGHT_SAVE_DUTY = 13;
 static constexpr unsigned long PALM_STATE_SAVE_HOLD_MS = 1000;
 static constexpr unsigned long PALM_OS_RESET_HOLD_MS = 1000;
@@ -752,11 +752,19 @@ static void surfaceSetPixel(int x, int y, uint16_t color) {
   palmSurface[static_cast<uint32_t>(y) * PALM_SURFACE_W + x] = color;
 }
 
-static uint16_t lcdPixelColor(uint8_t value, uint8_t bpp) {
+static uint16_t gray565(uint8_t shade) {
+  return static_cast<uint16_t>(((shade & 0xf8) << 8) | ((shade & 0xfc) << 3) | (shade >> 3));
+}
+
+static void buildLcdPalette(uint16_t *palette, uint8_t bpp, bool backlightOn) {
   uint8_t maxValue = (bpp >= 8) ? 0xff : ((1 << bpp) - 1);
   if (maxValue == 0) maxValue = 1;
-  uint8_t shade = 255 - ((static_cast<uint16_t>(value) * 255) / maxValue);
-  return ((shade & 0xf8) << 8) | ((shade & 0xf8) << 3) | (shade >> 3);
+
+  for (uint16_t i = 0; i <= maxValue; ++i) {
+    uint8_t normalShade = 255 - ((i * 255U) / maxValue);
+    uint8_t backlitShade = (i * 255U) / maxValue;
+    palette[i] = gray565(backlightOn ? backlitShade : normalShade);
+  }
 }
 
 static uint8_t readPackedLcdPixel(uint32_t rowAddress, uint16_t x, uint8_t bpp, uint8_t pan) {
@@ -2156,7 +2164,11 @@ static bool drawPalmFrameFromEmulatedLcd() {
 
   uint16_t drawW = min<uint16_t>(PALM_LCD_W, lcd.width);
   uint16_t drawH = min<uint16_t>(PALM_LCD_H, lcd.height);
-  surfaceFillRect(0, 0, PALM_LCD_W, PALM_LCD_H, TFT_WHITE);
+  bool lcdBacklightOn = !useSed1375 && palmHwLcdBacklightOn();
+  uint16_t lcdPalette[256];
+  if (!useSed1375) buildLcdPalette(lcdPalette, lcd.bpp, lcdBacklightOn);
+  uint16_t lcdBackground = useSed1375 ? TFT_WHITE : lcdPalette[0];
+  surfaceFillRect(0, 0, PALM_LCD_W, PALM_LCD_H, lcdBackground);
 
   for (uint16_t y = 0; y < drawH; ++y) {
     uint32_t srcLine = lcd.startAddr + static_cast<uint32_t>(y) * lcd.bytesPerLine;
@@ -2176,7 +2188,7 @@ static bool drawPalmFrameFromEmulatedLcd() {
         value = (cachedByte >> shift) & ((1 << lcd.bpp) - 1);
       }
       uint16_t color = useSed1375 ? palmSed1375PaletteColor565(value) :
-                                    lcdPixelColor(value, lcd.bpp);
+                                    lcdPalette[value];
       surfaceSetPixel(x, y, color);
     }
   }
@@ -2254,7 +2266,8 @@ static void releaseSerialDebugForPalmUart() {
     !PALM_PERF_SERIAL_STATS && \
     !PALM_TOUCH_EDGE_SERIAL_STATS && \
     !PALM_BUTTON_HOLD_SERIAL_STATS && \
-    !PALM_WAKE_SERIAL_STATS
+    !PALM_WAKE_SERIAL_STATS && \
+    !PALM_CONTRAST_SERIAL_STATS
   if (debugSerialActive) {
     PALM_DBG_PRINTLN("Debug serial released for Palm UART");
     Serial.flush();
@@ -2362,30 +2375,48 @@ static bool writeExact(File &file, const uint8_t *src, size_t count) {
   return true;
 }
 
-static bool copyStateRamFromFile(File &file, uint32_t ramSize) {
+static bool readRamStateChunk(uint32_t offset, uint8_t *dest, uint32_t count) {
+  return palmRamReadBytes(offset, dest, count);
+}
+
+static bool writeRamStateChunk(uint32_t offset, const uint8_t *src, uint32_t count) {
+  return palmRamWriteBytes(offset, src, count);
+}
+
+static bool readExtraDeviceStateChunk(uint32_t offset, uint8_t *dest, uint32_t count) {
+  return palmSed1375ReadStateBytes(offset, dest, count);
+}
+
+static bool writeExtraDeviceStateChunk(uint32_t offset, const uint8_t *src, uint32_t count) {
+  return palmSed1375WriteStateBytes(offset, src, count);
+}
+
+static bool copyStateChunksFromFile(File &file, uint32_t totalSize,
+                                    bool (*writeChunk)(uint32_t, const uint8_t *, uint32_t),
+                                    const char *label, bool printRamProgress) {
   uint32_t offset = 0;
-  while (offset < ramSize) {
-    uint32_t remaining = ramSize - offset;
+  while (offset < totalSize) {
+    uint32_t remaining = totalSize - offset;
     uint32_t chunk = remaining > sizeof(stateIoBuffer) ? sizeof(stateIoBuffer) : remaining;
     if (!readExact(file, stateIoBuffer, chunk)) {
 #if PALM_BOOT_SERIAL_STATS
-      PALM_DBG_PRINTF("State restore failed: RAM read stopped at %lu/%lu\n",
-                    (unsigned long)offset, (unsigned long)ramSize);
+      PALM_DBG_PRINTF("State restore failed: %s read stopped at %lu/%lu\n",
+                    label, (unsigned long)offset, (unsigned long)totalSize);
 #endif
       return false;
     }
-    if (!palmRamWriteBytes(offset, stateIoBuffer, chunk)) {
+    if (!writeChunk(offset, stateIoBuffer, chunk)) {
 #if PALM_BOOT_SERIAL_STATS
-      PALM_DBG_PRINTF("State restore failed: RAM write stopped at %lu/%lu\n",
-                    (unsigned long)offset, (unsigned long)ramSize);
+      PALM_DBG_PRINTF("State restore failed: %s write stopped at %lu/%lu\n",
+                    label, (unsigned long)offset, (unsigned long)totalSize);
 #endif
       return false;
     }
     offset += chunk;
 #if PALM_BOOT_SERIAL_STATS
-    if ((offset & 0x3ffffUL) == 0) {
+    if (printRamProgress && (offset & 0x3ffffUL) == 0) {
       PALM_DBG_PRINTF("State RAM restored: %lu/%lu\n",
-                    (unsigned long)offset, (unsigned long)ramSize);
+                    (unsigned long)offset, (unsigned long)totalSize);
     }
 #endif
     yield();
@@ -2393,35 +2424,45 @@ static bool copyStateRamFromFile(File &file, uint32_t ramSize) {
   return true;
 }
 
-static bool copyStateRamToFile(File &file, uint32_t ramSize) {
+static bool copyStateChunksToFile(File &file, uint32_t totalSize,
+                                  bool (*readChunk)(uint32_t, uint8_t *, uint32_t),
+                                  const char *label, bool printRamProgress) {
   uint32_t offset = 0;
-  while (offset < ramSize) {
-    uint32_t remaining = ramSize - offset;
+  while (offset < totalSize) {
+    uint32_t remaining = totalSize - offset;
     uint32_t chunk = remaining > sizeof(stateIoBuffer) ? sizeof(stateIoBuffer) : remaining;
-    if (!palmRamReadBytes(offset, stateIoBuffer, chunk)) {
+    if (!readChunk(offset, stateIoBuffer, chunk)) {
 #if PALM_STATE_SERIAL_STATS
-      PALM_DBG_PRINTF("State save failed: RAM read stopped at %lu/%lu\n",
-                    (unsigned long)offset, (unsigned long)ramSize);
+      PALM_DBG_PRINTF("State save failed: %s read stopped at %lu/%lu\n",
+                    label, (unsigned long)offset, (unsigned long)totalSize);
 #endif
       return false;
     }
     if (!writeExact(file, stateIoBuffer, chunk)) {
 #if PALM_STATE_SERIAL_STATS
-      PALM_DBG_PRINTF("State save failed: RAM write stopped at %lu/%lu\n",
-                    (unsigned long)offset, (unsigned long)ramSize);
+      PALM_DBG_PRINTF("State save failed: %s write stopped at %lu/%lu\n",
+                    label, (unsigned long)offset, (unsigned long)totalSize);
 #endif
       return false;
     }
     offset += chunk;
 #if PALM_STATE_SERIAL_STATS
-    if ((offset & 0x3ffffUL) == 0) {
+    if (printRamProgress && (offset & 0x3ffffUL) == 0) {
       PALM_DBG_PRINTF("State RAM saved: %lu/%lu\n",
-                    (unsigned long)offset, (unsigned long)ramSize);
+                    (unsigned long)offset, (unsigned long)totalSize);
     }
 #endif
     yield();
   }
   return true;
+}
+
+static bool copyStateRamFromFile(File &file, uint32_t ramSize) {
+  return copyStateChunksFromFile(file, ramSize, writeRamStateChunk, "RAM", true);
+}
+
+static bool copyStateRamToFile(File &file, uint32_t ramSize) {
+  return copyStateChunksToFile(file, ramSize, readRamStateChunk, "RAM", true);
 }
 
 static uint32_t palmStateExtraDeviceBytes() {
@@ -2429,53 +2470,13 @@ static uint32_t palmStateExtraDeviceBytes() {
 }
 
 static bool copyExtraDeviceStateFromFile(File &file, uint32_t stateSize) {
-  uint32_t offset = 0;
-  while (offset < stateSize) {
-    uint32_t remaining = stateSize - offset;
-    uint32_t chunk = remaining > sizeof(stateIoBuffer) ? sizeof(stateIoBuffer) : remaining;
-    if (!readExact(file, stateIoBuffer, chunk)) {
-#if PALM_BOOT_SERIAL_STATS
-      PALM_DBG_PRINTF("State restore failed: device read stopped at %lu/%lu\n",
-                    (unsigned long)offset, (unsigned long)stateSize);
-#endif
-      return false;
-    }
-    if (!palmSed1375WriteStateBytes(offset, stateIoBuffer, chunk)) {
-#if PALM_BOOT_SERIAL_STATS
-      PALM_DBG_PRINTF("State restore failed: device write stopped at %lu/%lu\n",
-                    (unsigned long)offset, (unsigned long)stateSize);
-#endif
-      return false;
-    }
-    offset += chunk;
-    yield();
-  }
-  return true;
+  return copyStateChunksFromFile(file, stateSize, writeExtraDeviceStateChunk,
+                                 "device", false);
 }
 
 static bool copyExtraDeviceStateToFile(File &file, uint32_t stateSize) {
-  uint32_t offset = 0;
-  while (offset < stateSize) {
-    uint32_t remaining = stateSize - offset;
-    uint32_t chunk = remaining > sizeof(stateIoBuffer) ? sizeof(stateIoBuffer) : remaining;
-    if (!palmSed1375ReadStateBytes(offset, stateIoBuffer, chunk)) {
-#if PALM_STATE_SERIAL_STATS
-      PALM_DBG_PRINTF("State save failed: device read stopped at %lu/%lu\n",
-                    (unsigned long)offset, (unsigned long)stateSize);
-#endif
-      return false;
-    }
-    if (!writeExact(file, stateIoBuffer, chunk)) {
-#if PALM_STATE_SERIAL_STATS
-      PALM_DBG_PRINTF("State save failed: device write stopped at %lu/%lu\n",
-                    (unsigned long)offset, (unsigned long)stateSize);
-#endif
-      return false;
-    }
-    offset += chunk;
-    yield();
-  }
-  return true;
+  return copyStateChunksToFile(file, stateSize, readExtraDeviceStateChunk,
+                               "device", false);
 }
 
 static void restoreCpuFromState(const PalmNativeStateHeader &header) {

@@ -21,8 +21,15 @@ LCD geometry, digitizer geometry, and device identity.
   app buttons, row 1 column 1 is Page Down, and row 2 contains Power, Page Up,
   and app button 2.
 - The m100 ROM exposes **Brightness** in the Pen shortcut list. Contrast still
-  exists as a lower-level LCD/PWM register path and is used by the renderer
-  when the ROM writes it.
+  exists as a lower-level LCD/PWM register path. On the tested m100 ROM the
+  slider writes `$A36 = 0x0180` at minimum and `$A36 = 0x01aa` at maximum; the
+  ESP32 target clamps that raw `0x80..0xaa` byte range into the full 10-50%
+  physical backlight PWM range.
+- Real m100 LCD backlight enable is DragonBall EZ Port F data bit `0x20`
+  (`hwrEZPortFBacklightOn`, active high). The ESP32 renderer uses that bit to
+  switch the DragonBall LCD palette: normal mode maps low pixels bright and high
+  pixels dark, while backlit mode inverts the grayscale palette for all supported
+  LCD bpp values.
 - The IIIx profile keeps desktop contrast fixed at maximum because this ROM
   does not expose a software brightness/contrast control in normal use.
 - The IIIc profile uses a 4 MB RAM map and the external Epson SED1375 color
@@ -126,6 +133,11 @@ palette:
 Profiles also choose whether the renderer follows the DragonBall EZ LCD
 contrast register. m100 enables it for the ROM's **Brightness** shortcut; IIIx
 uses a fixed maximum contrast value.
+
+On ESP32, the m100 renderer also follows the hardware backlight GPIO. Port F
+data bit `0x20` selects the inverted backlit DragonBall LCD palette, and the
+observed `$A36` raw byte range `0x80..0xaa` is expanded to the configured
+physical backlight PWM span.
 
 | Purpose | RGB |
 | --- | --- |

@@ -48,8 +48,14 @@ static bool uartIrdaEnabledLast = false;
 static uint16_t uartIrdaProbeEchoBudget = 0;
 static uint32_t uartIrdaProbeEchoUntilMs = 0;
 static uint8_t displayBrightnessLevel = 255;
+#if PALM_CONTRAST_SERIAL_STATS
+static uint16_t lastContrastTraceValue = 0xffff;
+#endif
 
 static constexpr uint8_t PORT_D_POWER_FAIL = 0x80;
+static constexpr uint8_t PORT_F_BACKLIGHT_ON = 0x20;
+static constexpr uint8_t M100_CONTRAST_LEVEL_MIN = 0x80;
+static constexpr uint8_t M100_CONTRAST_LEVEL_MAX = 0xaa;
 static constexpr uint16_t INT_HI_PEN = 0x0010;
 static constexpr uint16_t INT_HI_IRQ6 = 0x0008;
 static constexpr uint16_t INT_HI_IRQ3 = 0x0004;
@@ -249,13 +255,31 @@ static void updateDisplayBrightnessLevel() {
   displayBrightnessLevel = 255;
 #else
   uint16_t contrast = get16(0xA36);
-  if (contrast == 0) {
-    displayBrightnessLevel = 255;
-    return;
-  }
-
   uint8_t lowByte = contrast & 0xff;
-  displayBrightnessLevel = lowByte != 0 ? lowByte : ((contrast >> 8) & 0xff);
+  uint8_t rawLevel = lowByte != 0 ? lowByte : ((contrast >> 8) & 0xff);
+#if PALM_HARDWARE_PROFILE == PALM_PROFILE_M100_EXPERIMENTAL
+  if (rawLevel <= M100_CONTRAST_LEVEL_MIN) {
+    displayBrightnessLevel = 0;
+  } else if (rawLevel >= M100_CONTRAST_LEVEL_MAX) {
+    displayBrightnessLevel = 255;
+  } else {
+    uint16_t span = M100_CONTRAST_LEVEL_MAX - M100_CONTRAST_LEVEL_MIN;
+    displayBrightnessLevel =
+        ((static_cast<uint16_t>(rawLevel - M100_CONTRAST_LEVEL_MIN) * 255U) + span / 2U) / span;
+  }
+#else
+  displayBrightnessLevel = rawLevel;
+#endif
+#if PALM_CONTRAST_SERIAL_STATS
+  if (contrast != lastContrastTraceValue) {
+    lastContrastTraceValue = contrast;
+    Serial.printf("A36 contrast=%04x raw=%u level=%u backlight=%u\n",
+                  contrast,
+                  rawLevel,
+                  displayBrightnessLevel,
+                  (dbRegs[0x429] & PORT_F_BACKLIGHT_ON) != 0 ? 1 : 0);
+  }
+#endif
 #endif
 }
 
@@ -1223,6 +1247,14 @@ PalmLcdState palmHwGetLcdState() {
 PalmHwDebug palmHwGetDebug() { return hwDebug; }
 
 uint8_t palmHwDisplayBrightnessLevel() { return displayBrightnessLevel; }
+
+bool palmHwLcdBacklightOn() {
+#if PALM_HARDWARE_PROFILE == PALM_PROFILE_M100_EXPERIMENTAL
+  return (dbRegs[0x429] & PORT_F_BACKLIGHT_ON) != 0;
+#else
+  return false;
+#endif
+}
 
 uint32_t palmHwUartWriteRx(const uint8_t *buffer, uint32_t count) {
   if (buffer == nullptr || count == 0) return 0;

@@ -171,12 +171,14 @@ Short version:
 Rebuild both the native DLL and the VB harness after switching.
 
 The m100 profile includes the m100/Calvin hardware identity, 160x220 digitizer
-geometry, m100 key matrix, and LCD contrast PWM register. The m100 ROM shows
-Brightness rather than Contrast in the Pen shortcut list, but contrast writes
-are still modeled for display rendering. The IIIc profile adds the SED1375
-color LCD path and a 4 MB RAM map. The IIIx profile keeps desktop LCD contrast
-fixed at maximum because its ROM does not normally expose that software
-control.
+geometry, m100 key matrix, LCD contrast PWM register, and Port F backlight
+enable line. The m100 ROM shows Brightness rather than Contrast in the Pen
+shortcut list; observed `$A36` values run from `0x0180` to `0x01aa` and the
+ESP32 target maps that range onto a 10-50% physical backlight PWM span. Port F
+data bit `0x20` switches the emulated LCD palette between normal grayscale and
+inverted backlit grayscale. The IIIc profile adds the SED1375 color LCD path and
+a 4 MB RAM map. The IIIx profile keeps desktop LCD contrast fixed at maximum
+because its ROM does not normally expose that software control.
 
 The desktop LCD palette is also profile-owned in
 `PalmDesktopHarness/PalmConfig.vb`; see
@@ -212,7 +214,10 @@ The ESP32 path keeps:
 - virtual app/up/down buttons on the left side of the panel
 - virtual power, save snapshot, and reset controls on the right side of the
   panel
-- Palm OS brightness/contrast writes mapped to the real ESP32 backlight PWM
+- Palm OS m100 brightness/contrast writes mapped from `$A36 = 0x0180..0x01aa`
+  to a 10-50% ESP32 backlight PWM range
+- m100 Port F bit `0x20` backlight state mapped to the LCD render palette, so
+  backlit mode inverts all DragonBall LCD bpp modes through a per-frame palette
 - automatic restore from `/palm_m100_state.bin` on the SD card, with wake from
   saved sleep state
 - low-power Palm sleep mode that turns off the display/backlight, lowers CPU

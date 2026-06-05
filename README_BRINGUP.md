@@ -60,6 +60,10 @@ What is wired now:
 - Virtual hardware buttons are placed in the unused side panel areas. The left
   strip exposes the four app buttons plus up/down; the right strip exposes
   power, hold-to-save snapshot, and reset.
+- m100 backlight behavior follows the real hardware split: Port F bit `0x20`
+  switches the LCD render palette into inverted backlit mode, while the ROM's
+  `$A36` contrast values (`0x0180..0x01aa` observed) are mapped to 10-50% ESP32
+  backlight PWM.
 - Snapshot save/restore uses `/palm_m100_state.bin` on the SD card. Restored
   sleep states are woken automatically.
 - Palm sleep turns off display/backlight, lowers ESP32 CPU frequency, and uses
