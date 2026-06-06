@@ -7,6 +7,10 @@
 #include <esp_lcd_panel_rgb.h>
 #include <esp_lcd_panel_ops.h>
 #include <esp_sleep.h>
+#if PALM_DISABLE_UNUSED_RADIOS
+#include <esp_bt.h>
+#include <esp_wifi.h>
+#endif
 #endif
 
 #include "palm_config.h"
@@ -34,6 +38,14 @@ extern "C" void m68k_pulse_reset(void);
 #define SD_MOSI       11
 #define SD_SCK        12
 #define SD_MISO       13
+
+// Some ESP32-4827S043C boards populate an unused XPT2046 resistive touch
+// controller on the SD-card SPI bus. Its CS is shared with the GT911 reset
+// line on this board, so power it down before GT911 initialization.
+#define XPT2046_CS    38
+#define XPT2046_MOSI  SD_MOSI
+#define XPT2046_SCK   SD_SCK
+#define XPT2046_MISO  SD_MISO
 
 #define TFT_BLACK     0x0000
 #define TFT_WHITE     0xffff
@@ -2375,6 +2387,58 @@ static bool writeExact(File &file, const uint8_t *src, size_t count) {
   return true;
 }
 
+static void releaseSdBusPins() {
+  pinMode(SD_CS, OUTPUT);
+  digitalWrite(SD_CS, HIGH);
+  pinMode(SD_SCK, INPUT);
+  pinMode(SD_MOSI, INPUT);
+  pinMode(SD_MISO, INPUT);
+}
+
+static bool beginPalmStateSd() {
+  pinMode(SD_CS, OUTPUT);
+  digitalWrite(SD_CS, HIGH);
+  sdSpi.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  if (!SD.begin(SD_CS, sdSpi, PALM_STATE_SD_SPI_HZ)) {
+    sdSpi.end();
+    releaseSdBusPins();
+    return false;
+  }
+  return true;
+}
+
+static void endPalmStateSd() {
+  SD.end();
+  sdSpi.end();
+  releaseSdBusPins();
+}
+
+static void powerDownOptionalXpt2046() {
+#if XPT2046_CS >= 0
+  pinMode(XPT2046_CS, OUTPUT);
+  digitalWrite(XPT2046_CS, HIGH);
+  sdSpi.begin(XPT2046_SCK, XPT2046_MISO, XPT2046_MOSI, XPT2046_CS);
+  digitalWrite(XPT2046_CS, LOW);
+  sdSpi.transfer(0x90);  // Touch read command with PD1:PD0 = 00 powers down after conversion.
+  sdSpi.transfer(0x00);
+  sdSpi.transfer(0x00);
+  digitalWrite(XPT2046_CS, HIGH);
+  sdSpi.end();
+  pinMode(XPT2046_SCK, INPUT);
+  pinMode(XPT2046_MOSI, INPUT);
+  pinMode(XPT2046_MISO, INPUT);
+#endif
+}
+
+static void disableUnusedRadios() {
+#if defined(ESP32) && PALM_DISABLE_UNUSED_RADIOS
+  esp_wifi_stop();
+  esp_wifi_deinit();
+  btStop();
+  esp_bt_controller_mem_release(ESP_BT_MODE_BTDM);
+#endif
+}
+
 static bool readRamStateChunk(uint32_t offset, uint8_t *dest, uint32_t count) {
   return palmRamReadBytes(offset, dest, count);
 }
@@ -2812,10 +2876,7 @@ static bool restoreNativeStateFromFile(File &file, uint64_t fileSize) {
 }
 
 static bool restorePalmStateFromSd() {
-  pinMode(SD_CS, OUTPUT);
-  digitalWrite(SD_CS, HIGH);
-  sdSpi.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
-  if (!SD.begin(SD_CS, sdSpi, PALM_STATE_SD_SPI_HZ)) {
+  if (!beginPalmStateSd()) {
 #if PALM_BOOT_SERIAL_STATS
     PALM_DBG_PRINTLN("SD state restore skipped: SD init failed");
 #endif
@@ -2827,6 +2888,7 @@ static bool restorePalmStateFromSd() {
 #if PALM_BOOT_SERIAL_STATS
     PALM_DBG_PRINTF("SD state restore skipped: %s not found\n", PALM_STATE_SD_PATH);
 #endif
+    endPalmStateSd();
     return false;
   }
 
@@ -2838,16 +2900,14 @@ static bool restorePalmStateFromSd() {
   bool restored = restoreNativeStateFromFile(stateFile, fileSize);
   if (!restored) restored = restoreRawRamFromFile(stateFile, fileSize);
   stateFile.close();
+  endPalmStateSd();
   return restored;
 }
 
 static bool savePalmStateToSd() {
   if (!cpuReady || palmRamSize() == 0) return false;
 
-  pinMode(SD_CS, OUTPUT);
-  digitalWrite(SD_CS, HIGH);
-  sdSpi.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
-  if (!SD.begin(SD_CS, sdSpi, PALM_STATE_SD_SPI_HZ)) {
+  if (!beginPalmStateSd()) {
 #if PALM_STATE_SERIAL_STATS
     PALM_DBG_PRINTLN("State save failed: SD init failed");
 #endif
@@ -2860,6 +2920,7 @@ static bool savePalmStateToSd() {
 #if PALM_STATE_SERIAL_STATS
     PALM_DBG_PRINTLN("State save failed: could not capture emulator state");
 #endif
+    endPalmStateSd();
     return false;
   }
 
@@ -2877,6 +2938,7 @@ static bool savePalmStateToSd() {
 #if PALM_STATE_SERIAL_STATS
     PALM_DBG_PRINTF("State save failed: could not open %s\n", PALM_STATE_SD_TEMP_PATH);
 #endif
+    endPalmStateSd();
     return false;
   }
 
@@ -2889,6 +2951,7 @@ static bool savePalmStateToSd() {
   stateFile.close();
   if (!ok) {
     SD.remove(PALM_STATE_SD_TEMP_PATH);
+    endPalmStateSd();
     return false;
   }
 
@@ -2898,6 +2961,7 @@ static bool savePalmStateToSd() {
   PALM_DBG_PRINTLN(ok ? "State save complete" : "State save failed: rename failed");
 #endif
   if (!ok) SD.remove(PALM_STATE_SD_TEMP_PATH);
+  endPalmStateSd();
   return ok;
 }
 
@@ -3214,6 +3278,8 @@ static void autoWakeRestoredPalm() {
 void setup() {
   initPins();
   initSerialDebug();
+  disableUnusedRadios();
+  powerDownOptionalXpt2046();
   bool renderBuffersOk = initRenderBuffers();
 #if PALM_BOOT_SERIAL_STATS
   PALM_DBG_PRINTF("Heap before Palm RAM: free=%lu max=%lu\n",

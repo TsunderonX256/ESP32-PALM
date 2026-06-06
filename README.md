@@ -221,13 +221,25 @@ The ESP32 path keeps:
 - automatic restore from `/palm_m100_state.bin` on the SD card, with wake from
   saved sleep state
 - low-power Palm sleep mode that turns off the display/backlight, lowers CPU
-  frequency, and uses light sleep between lower-rate touch polls
+  frequency, and uses light sleep between 250 ms touch polls
+- SD snapshot access is short-lived: the firmware mounts the card only for
+  save/restore, then calls `SD.end()`, stops the SPI bus, holds CS high, and
+  releases the SD SPI pins to input
+- the unused XPT2046 controller fitted on some ESP32-4827S043C boards is sent a
+  startup power-down command; its CS is IO38 on the same SPI bus as the SD card
 - raw Palm UART emulation bridged to the board's host serial port at 115200 baud
 - room for future ESP32 LEDC output for Palm buzzer PWM
 
 The ESP32 path intentionally keeps most runtime serial logging compiled out or
 disabled after boot so the host serial port can be handed to the emulated Palm
 UART.
+
+Measured on the ESP32-4827S043C board, the current firmware is roughly 250 mA
+while awake and roughly 40 mA while Palm OS is asleep. The remaining sleep draw
+appears to be board/peripheral baseline rather than emulator activity: GT911 INT
+is tied to ground on this PCB, so wake still needs low-rate polling, and deeper
+savings would require hardware power gating for the LCD, touch, SD card, or
+other always-powered board loads.
 
 `Silkscreen.png` is the editable source for the side silkscreen artwork.
 `silkscreen_asset.h` is the generated packed 4bpp PROGMEM copy used by the
