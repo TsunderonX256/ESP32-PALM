@@ -70,8 +70,11 @@ if ($useCustomPartition) {
     Copy-Item -LiteralPath $partitionCsv -Destination (Join-Path $sketchRoot "partitions.csv") -Force
 }
 
-if ($CodeCheckOnly -and -not (Test-Path -LiteralPath (Join-Path $sketchRoot $romFileName))) {
-    [IO.File]::WriteAllBytes((Join-Path $sketchRoot $romFileName), [byte[]](0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+$currentRomPath = Join-Path $sketchRoot "palm_current.rom"
+if ($CodeCheckOnly) {
+    [IO.File]::WriteAllBytes($currentRomPath, [byte[]](0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+} else {
+    Copy-Item -LiteralPath $romPath -Destination $currentRomPath -Force
 }
 
 Push-Location -LiteralPath $sketchRoot

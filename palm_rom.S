@@ -4,6 +4,6 @@
     .global palm_rom_end
 
 palm_rom_start:
-    .incbin "Palm-m100-3.51-en.rom"
+    .incbin "palm_current.rom"
 palm_rom_end:
     .byte 0

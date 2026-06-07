@@ -34,14 +34,33 @@ What is wired now:
 - Musashi core updated to the ESP32-friendly fork used by `likeablob/cydintosh`,
   configured for a 68000-only static decode table so the opcode table lives in
   flash instead of consuming about 256 KB of ESP32 DRAM.
+- Musashi separate immediate/PC-relative read callbacks are enabled. Immediate
+  reads use the Palm instruction-read helper so opcode extension words avoid
+  part of the generic data-read path.
+- `M68K_STRICT_68000_FASTPATH` trims the ESP32 build for the DragonBall's
+  68EC000-class CPU. It also aliases static opcode-table entries that are not
+  valid for plain 68000 back to Musashi's illegal-instruction handler, dropping
+  about 14 KB of unused handler code in the current Arduino build.
+- The direct RAM/ROM page cache uses a small XOR page-index hash. This does not
+  add RAM, but reduces simple low-bit collisions between distant RAM, ROM, and
+  alias pages.
 - First DragonBall EZ LCD register bridge at `0xfffff000`, based on Cloudpilot's
   Palm IIIx/EZ register model. The ESP32 renderer now reads the LCD start
   address, width, height, page width, panel control, and panning registers.
 - Direct 1-bit LCD rendering from emulated Palm memory. There is no extra local
   160x160 framebuffer copy; this saves 3200 bytes of ESP32 RAM and avoids touch
   input scribbling static into the Palm display area.
-- Palm RAM is allocated before LCD initialization to reduce heap fragmentation.
-  The current m100 build tries to keep the low 128 KB in internal DRAM and the
+- The fixed-interval LCD renderer no longer keeps RAM-write dirty tracking or
+  unchanged-frame hash checks; it simply redraws the Palm LCD area on its fixed
+  schedule.
+- `PALM_PANEL_INDEXED_FRAMEBUFFER` stores the two full-screen RGB-panel frames
+  as 8-bit palette indices. This halves the PSRAM panel-frame footprint, while
+  keeping the RGB565 palette/cache in internal DRAM and expanding each scanline
+  back to RGB565 in the ESP RGB-panel bounce callback.
+- Palm RAM is allocated before render-buffer and LCD initialization so the hot
+  low RAM segment gets first claim on contiguous internal DRAM. The current
+  target is controlled by `PALM_RAM_INTERNAL_LOW_SIZE`; allocation steps down in
+  16 KB chunks if the requested internal block is not available, and keeps the
   rest in PSRAM.
 - If the ESP32 cannot allocate all logical Palm RAM, the missing logical range is
   mirrored into the real paged RAM backing store. This follows Cloudpilot's SRAM

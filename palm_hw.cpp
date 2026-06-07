@@ -7,17 +7,10 @@
 #endif
 
 static uint8_t dbRegs[PALM_DB_REG_SIZE];
-static bool lcdDirty = true;
-static bool lcdFrameReady = true;
-static uint32_t lcdDirtyGeneration = 1;
-static uint32_t lcdLastDirtyMillis = 0;
-static bool lcdWriteRangeValid = false;
-static uint32_t lcdWriteRangeStart = 0;
-static uint32_t lcdWriteRangeEnd = 0;
 static PalmHwDebug hwDebug;
 static uint16_t lastTimerStatus = 0;
 static uint64_t systemCycles = 0;
-static double timerLastCycles = 0.0;
+static uint64_t timerLastCycles = 0;
 static uint64_t timerLastHostMicros = 0;
 static uint64_t cyclePaceHostMicros = 0;
 static uint64_t cyclePaceBaseCycles = 0;
@@ -48,12 +41,39 @@ static bool uartIrdaEnabledLast = false;
 static uint16_t uartIrdaProbeEchoBudget = 0;
 static uint32_t uartIrdaProbeEchoUntilMs = 0;
 static uint8_t displayBrightnessLevel = 255;
+#if PALM_HARDWARE_PROFILE == PALM_PROFILE_IIIC_EXPERIMENTAL
+static constexpr uint16_t IIIC_BRIGHTNESS_RAW_MIN = 0x020;
+static constexpr uint16_t IIIC_BRIGHTNESS_RAW_MAX = 0x0a0;
+static uint16_t iiicBrightnessRaw = IIIC_BRIGHTNESS_RAW_MIN;
+#endif
 #if PALM_CONTRAST_SERIAL_STATS
 static uint16_t lastContrastTraceValue = 0xffff;
+#endif
+#if PALM_HARDWARE_PROFILE == PALM_PROFILE_IIIC_EXPERIMENTAL
+static uint8_t iiicBrightnessLastPortBData = 0xff;
+static uint8_t iiicBrightnessSed03 = 0;
+static uint32_t iiicBrightnessPortBWrites = 0;
+static uint32_t iiicBrightnessPortCWrites = 0;
+static uint32_t iiicBrightnessSyncEdges = 0;
+static uint32_t iiicBrightnessSyncFallingEdges = 0;
+static uint32_t iiicBrightnessSpiTransfers = 0;
+static uint16_t iiicBrightnessLastSpiData = 0;
+static uint8_t iiicBrightnessLastSpiBits = 0;
+static uint64_t iiicBrightnessLastPrintMicros = 0;
+static bool iiicBrightnessTraceDirty = false;
 #endif
 
 static constexpr uint8_t PORT_D_POWER_FAIL = 0x80;
 static constexpr uint8_t PORT_F_BACKLIGHT_ON = 0x20;
+#if PALM_HARDWARE_PROFILE == PALM_PROFILE_IIIC_EXPERIMENTAL
+static constexpr uint8_t PORT_B_LCD_BRIGHT_SYNC = 0x08;
+static constexpr uint8_t PORT_C_BACKLIGHT_ENABLE = 0x10;
+static constexpr uint8_t PORT_C_ENABLE_5V = 0x40;
+static constexpr uint8_t PORT_F_LCD_POWERED = 0x01;
+static constexpr uint8_t PORT_F_PEN_IO = 0x02;
+static constexpr uint8_t PORT_F_VIDEO_CLK_ENABLE = 0x20;
+static constexpr uint8_t PORT_F_IXTRNL2 = 0x80;
+#endif
 static constexpr uint8_t M100_CONTRAST_LEVEL_MIN = 0x80;
 static constexpr uint8_t M100_CONTRAST_LEVEL_MAX = 0xaa;
 static constexpr uint16_t INT_HI_PEN = 0x0010;
@@ -121,6 +141,8 @@ static constexpr uint16_t KEY_BIT_HARD3 = 0x0020;
 static constexpr uint16_t KEY_BIT_HARD4 = 0x0040;
 static constexpr uint16_t KEY_BIT_CONTRAST = 0x0080;
 static constexpr uint8_t PORT_G_ID_DETECT = 0x04;
+static constexpr uint32_t SYSTEM_CLOCK_HZ = static_cast<uint32_t>(PALM_SYSTEM_CLOCK_HZ + 0.5);
+static constexpr uint64_t MICROS_PER_SECOND = 1000000ULL;
 #if PALM_HARDWARE_PROFILE == PALM_PROFILE_M100_EXPERIMENTAL
 static constexpr uint8_t HARDWARE_ID_KEY_STATE = 0xfa;  // m100 ID1 and ID3 active-low.
 #elif PALM_HARDWARE_PROFILE == PALM_PROFILE_IIIC_EXPERIMENTAL
@@ -163,6 +185,158 @@ static uint64_t hostMonotonicMicros() {
 #endif
 }
 
+#if PALM_HARDWARE_PROFILE == PALM_PROFILE_IIIC_EXPERIMENTAL
+static bool iiicGpioOutputHigh(uint16_t dirOffset, uint16_t dataOffset,
+                               uint16_t selectOffset, uint8_t bit) {
+  return (dbRegs[selectOffset] & bit) != 0 &&
+         (dbRegs[dirOffset] & bit) != 0 &&
+         (dbRegs[dataOffset] & bit) != 0;
+}
+
+static bool iiicBrightnessSyncAsserted() {
+  return (dbRegs[0x40B] & PORT_B_LCD_BRIGHT_SYNC) != 0 &&
+         (dbRegs[0x408] & PORT_B_LCD_BRIGHT_SYNC) != 0 &&
+         (dbRegs[0x409] & PORT_B_LCD_BRIGHT_SYNC) == 0;
+}
+
+static void updateIiicBrightnessLevel() {
+  uint16_t raw = iiicBrightnessRaw;
+  if (raw <= IIIC_BRIGHTNESS_RAW_MIN) {
+    displayBrightnessLevel = 255;
+  } else if (raw >= IIIC_BRIGHTNESS_RAW_MAX) {
+    displayBrightnessLevel = 0;
+  } else {
+    uint16_t span = IIIC_BRIGHTNESS_RAW_MAX - IIIC_BRIGHTNESS_RAW_MIN;
+    uint16_t scaled =
+        ((static_cast<uint16_t>(raw - IIIC_BRIGHTNESS_RAW_MIN) * 255U) + span / 2U) / span;
+    displayBrightnessLevel = static_cast<uint8_t>(255U - scaled);
+  }
+}
+
+static bool applyIiicBrightnessSpiTransfer(uint16_t data, uint8_t bits) {
+  if (bits != 16 || !iiicBrightnessSyncAsserted()) return false;
+  iiicBrightnessRaw = static_cast<uint16_t>(data >> 4);
+  updateIiicBrightnessLevel();
+  return true;
+}
+
+#if PALM_IIIC_BRIGHTNESS_SERIAL_STATS
+static void resetIiicBrightnessTrace() {
+  iiicBrightnessLastPortBData = dbRegs[0x409];
+  iiicBrightnessSed03 = 0;
+  iiicBrightnessPortBWrites = 0;
+  iiicBrightnessPortCWrites = 0;
+  iiicBrightnessSyncEdges = 0;
+  iiicBrightnessSyncFallingEdges = 0;
+  iiicBrightnessSpiTransfers = 0;
+  iiicBrightnessLastSpiData = 0;
+  iiicBrightnessLastSpiBits = 0;
+  iiicBrightnessLastPrintMicros = hostMonotonicMicros();
+  iiicBrightnessTraceDirty = true;
+}
+
+static void printIiicBrightnessTrace(bool force) {
+  if (!iiicBrightnessTraceDirty) return;
+
+  uint64_t now = hostMonotonicMicros();
+  if (!force && now - iiicBrightnessLastPrintMicros < 250000ULL) return;
+
+  bool syncRawHigh = (dbRegs[0x409] & PORT_B_LCD_BRIGHT_SYNC) != 0;
+  bool syncAsserted = iiicBrightnessSyncAsserted();
+  bool backlightEnable = iiicGpioOutputHigh(0x410, 0x411, 0x413, PORT_C_BACKLIGHT_ENABLE);
+  bool enable5v = iiicGpioOutputHigh(0x410, 0x411, 0x413, PORT_C_ENABLE_5V);
+
+  Serial.printf("IIIC BRI B=%02x/%02x/%02x sync=%u asserted=%u edges=%lu fall=%lu bw=%lu "
+                "spi=%lu last=%u:%04x C=%02x/%02x/%02x bl=%u 5v=%u cw=%lu "
+                "sed03=%02x ps=%u level=%u\n",
+                dbRegs[0x408],
+                dbRegs[0x409],
+                dbRegs[0x40B],
+                syncRawHigh ? 1 : 0,
+                syncAsserted ? 1 : 0,
+                static_cast<unsigned long>(iiicBrightnessSyncEdges),
+                static_cast<unsigned long>(iiicBrightnessSyncFallingEdges),
+                static_cast<unsigned long>(iiicBrightnessPortBWrites),
+                static_cast<unsigned long>(iiicBrightnessSpiTransfers),
+                iiicBrightnessLastSpiBits,
+                iiicBrightnessLastSpiData,
+                dbRegs[0x410],
+                dbRegs[0x411],
+                dbRegs[0x413],
+                backlightEnable ? 1 : 0,
+                enable5v ? 1 : 0,
+                static_cast<unsigned long>(iiicBrightnessPortCWrites),
+                iiicBrightnessSed03,
+                (iiicBrightnessSed03 & 0x04) != 0 ? 1 : 0,
+                displayBrightnessLevel);
+
+  iiicBrightnessLastPrintMicros = now;
+  iiicBrightnessPortBWrites = 0;
+  iiicBrightnessPortCWrites = 0;
+  iiicBrightnessSyncEdges = 0;
+  iiicBrightnessSyncFallingEdges = 0;
+  iiicBrightnessSpiTransfers = 0;
+  iiicBrightnessTraceDirty = false;
+}
+
+static void traceIiicBrightnessPortWrite(uint16_t offset) {
+  if (offset == 0x408 || offset == 0x409 || offset == 0x40B) {
+    ++iiicBrightnessPortBWrites;
+    uint8_t currentPortBData = dbRegs[0x409];
+    uint8_t changed = currentPortBData ^ iiicBrightnessLastPortBData;
+    if ((changed & PORT_B_LCD_BRIGHT_SYNC) != 0) {
+      ++iiicBrightnessSyncEdges;
+      if ((currentPortBData & PORT_B_LCD_BRIGHT_SYNC) == 0) ++iiicBrightnessSyncFallingEdges;
+    }
+    iiicBrightnessLastPortBData = currentPortBData;
+    iiicBrightnessTraceDirty = true;
+  } else if (offset == 0x410 || offset == 0x411 || offset == 0x413) {
+    ++iiicBrightnessPortCWrites;
+    iiicBrightnessTraceDirty = true;
+  }
+
+  printIiicBrightnessTrace(false);
+}
+
+static void traceIiicBrightnessSpiTransfer(uint16_t data, uint8_t bits) {
+  if (!applyIiicBrightnessSpiTransfer(data, bits)) return;
+
+  ++iiicBrightnessSpiTransfers;
+  iiicBrightnessLastSpiData = data;
+  iiicBrightnessLastSpiBits = bits;
+  iiicBrightnessTraceDirty = true;
+  printIiicBrightnessTrace(false);
+}
+#else
+static void resetIiicBrightnessTrace() {}
+static void printIiicBrightnessTrace(bool force) { (void)force; }
+static void traceIiicBrightnessPortWrite(uint16_t offset) { (void)offset; }
+static void traceIiicBrightnessSpiTransfer(uint16_t data, uint8_t bits) {
+  applyIiicBrightnessSpiTransfer(data, bits);
+}
+#endif
+#else
+static void resetIiicBrightnessTrace() {}
+static void printIiicBrightnessTrace(bool force) { (void)force; }
+static void traceIiicBrightnessPortWrite(uint16_t offset) { (void)offset; }
+static void traceIiicBrightnessSpiTransfer(uint16_t data, uint8_t bits) {
+  (void)data;
+  (void)bits;
+}
+#endif
+
+void palmHwNotifySed1375RegWrite(uint8_t offset, uint8_t value) {
+#if PALM_HARDWARE_PROFILE == PALM_PROFILE_IIIC_EXPERIMENTAL && PALM_IIIC_BRIGHTNESS_SERIAL_STATS
+  if (offset != 0x03) return;
+  iiicBrightnessSed03 = value;
+  iiicBrightnessTraceDirty = true;
+  printIiicBrightnessTrace(false);
+#else
+  (void)offset;
+  (void)value;
+#endif
+}
+
 static bool irq1IsEdgeTriggered() {
   return (get16(0x302) & ICR_ET1) != 0;
 }
@@ -196,32 +370,6 @@ bool palmHwHasWakeSource() {
   return ((hiPending & wakeHi) != 0) || ((loPending & wakeLo) != 0);
 }
 
-static void markLcdDirty() {
-  if (!lcdDirty || lcdFrameReady) {
-    lcdLastDirtyMillis = millis();
-  }
-  lcdDirty = true;
-  lcdFrameReady = false;
-  ++lcdDirtyGeneration;
-}
-
-static void updateLcdWriteRange() {
-  uint32_t start = get32(0xA00) & 0x1ffffffeUL;
-  uint16_t width = get16(0xA08);
-  uint16_t height = get16(0xA0A) + 1;
-  uint16_t bytesPerLine = static_cast<uint16_t>(dbRegs[0xA05]) * 2;
-  uint8_t bpp = 1 << (dbRegs[0xA20] & 0x03);
-  uint32_t frameBytes = static_cast<uint32_t>(bytesPerLine) * height;
-
-  lcdWriteRangeValid = start != 0 && width > 0 && width <= 320 &&
-                       height > 0 && height <= 320 &&
-                       bytesPerLine > 0 && bpp <= 4 &&
-                       frameBytes > 0 &&
-                       start <= 0xffffffffUL - frameBytes;
-  lcdWriteRangeStart = start;
-  lcdWriteRangeEnd = start + frameBytes;
-}
-
 uint8_t palmHwGetInterruptLevel() {
   uint16_t hi = get16(0x30C);
   uint16_t lo = get16(0x30E);
@@ -244,15 +392,13 @@ bool palmHwIsAsleep() {
   return (get16(0x200) & PLL_CONTROL_DISABLE) != 0;
 }
 
-static double systemClockFrequency() {
-  return PALM_SYSTEM_CLOCK_HZ;
+static uint32_t systemClockFrequency() {
+  return SYSTEM_CLOCK_HZ;
 }
 
 static void updateDisplayBrightnessLevel() {
 #if PALM_HAS_SED1375
-  // Palm IIIc brightness is not wired to the DragonBall contrast register.
-  // Keep it fixed until the real ROM preference/hardware path is mapped.
-  displayBrightnessLevel = 255;
+  updateIiicBrightnessLevel();
 #else
   uint16_t contrast = get16(0xA36);
   uint8_t lowByte = contrast & 0xff;
@@ -283,8 +429,17 @@ static void updateDisplayBrightnessLevel() {
 #endif
 }
 
+static uint64_t scaleU64(uint64_t value, uint64_t numerator, uint64_t denominator) {
+  if (value == 0 || numerator == 0 || denominator == 0) return 0;
+#if defined(__SIZEOF_INT128__)
+  return static_cast<uint64_t>((static_cast<__uint128_t>(value) * numerator) / denominator);
+#else
+  return (value / denominator) * numerator + ((value % denominator) * numerator) / denominator;
+#endif
+}
+
 static uint64_t hostMicrosToSystemCycles(uint64_t elapsedMicros) {
-  return static_cast<uint64_t>((static_cast<double>(elapsedMicros) * systemClockFrequency()) / 1000000.0);
+  return scaleU64(elapsedMicros, systemClockFrequency(), MICROS_PER_SECOND);
 }
 
 static void resetCyclePacer(uint64_t nowMicros) {
@@ -292,18 +447,45 @@ static void resetCyclePacer(uint64_t nowMicros) {
   cyclePaceBaseCycles = systemCycles;
 }
 
-static double timerTicksPerSecond() {
-  uint16_t control = get16(0x600);
+static bool activeTimerScale(uint16_t control, uint64_t &numerator, uint64_t &denominator) {
   uint8_t clockSource = static_cast<uint8_t>((control >> 1) & 0x7);
-  double prescaler = static_cast<double>((get16(0x602) & 0x00ff) + 1);
+  uint64_t prescaler = static_cast<uint64_t>((get16(0x602) & 0x00ff) + 1);
 
   switch (clockSource) {
     case 0x1:
-      return systemClockFrequency() / prescaler;
+      numerator = 1;
+      denominator = prescaler;
+      return true;
     case 0x2:
-      return systemClockFrequency() / prescaler / 16.0;
+      numerator = 1;
+      denominator = prescaler * 16ULL;
+      return true;
     default:
-      return (clockSource & 0x4) ? 32768.0 / prescaler : 0.0;
+      if ((clockSource & 0x4) == 0) return false;
+      numerator = 32768ULL;
+      denominator = static_cast<uint64_t>(systemClockFrequency()) * prescaler;
+      return true;
+  }
+}
+
+static bool sleepingTimerScale(uint16_t control, uint64_t &numerator, uint64_t &denominator) {
+  uint8_t clockSource = static_cast<uint8_t>((control >> 1) & 0x7);
+  uint64_t prescaler = static_cast<uint64_t>((get16(0x602) & 0x00ff) + 1);
+
+  switch (clockSource) {
+    case 0x1:
+      numerator = systemClockFrequency();
+      denominator = MICROS_PER_SECOND * prescaler;
+      return true;
+    case 0x2:
+      numerator = systemClockFrequency();
+      denominator = MICROS_PER_SECOND * prescaler * 16ULL;
+      return true;
+    default:
+      if ((clockSource & 0x4) == 0) return false;
+      numerator = 32768ULL;
+      denominator = MICROS_PER_SECOND * prescaler;
+      return true;
   }
 }
 
@@ -325,7 +507,7 @@ static void applyTimerTicks(uint16_t control, uint32_t ticks) {
 }
 
 static void resetTimerBaselines(uint64_t nowMicros) {
-  timerLastCycles = static_cast<double>(systemCycles);
+  timerLastCycles = systemCycles;
   timerLastHostMicros = nowMicros;
 }
 
@@ -337,41 +519,53 @@ static void updateTimer() {
     return;
   }
 
-  double timerHz = timerTicksPerSecond();
-  if (timerHz <= 0.0) {
-    resetTimerBaselines(nowMicros);
-    return;
-  }
-
   if (palmHwIsAsleep()) {
     if (timerLastHostMicros == 0) {
       resetTimerBaselines(nowMicros);
       return;
     }
 
+    uint64_t numerator;
+    uint64_t denominator;
+    if (!sleepingTimerScale(control, numerator, denominator)) {
+      resetTimerBaselines(nowMicros);
+      return;
+    }
+
     uint64_t elapsedMicros = nowMicros - timerLastHostMicros;
-    uint32_t ticks = static_cast<uint32_t>((static_cast<double>(elapsedMicros) * timerHz) / 1000000.0);
+    uint32_t ticks = static_cast<uint32_t>(scaleU64(elapsedMicros, numerator, denominator));
     if (ticks == 0) return;
 
-    timerLastHostMicros += static_cast<uint64_t>((static_cast<double>(ticks) * 1000000.0) / timerHz);
-    timerLastCycles = static_cast<double>(systemCycles);
+    uint64_t consumedMicros = scaleU64(ticks, denominator, numerator);
+    if (consumedMicros == 0) consumedMicros = elapsedMicros;
+    timerLastHostMicros += consumedMicros;
+    timerLastCycles = systemCycles;
     applyTimerTicks(control, ticks);
     return;
   }
 
-  double elapsedCycles = static_cast<double>(systemCycles) - timerLastCycles;
-  if (elapsedCycles <= 0.0) {
+  uint64_t numerator;
+  uint64_t denominator;
+  if (!activeTimerScale(control, numerator, denominator)) {
+    resetTimerBaselines(nowMicros);
+    return;
+  }
+
+  if (systemCycles <= timerLastCycles) {
     timerLastHostMicros = nowMicros;
     return;
   }
 
-  uint32_t ticks = static_cast<uint32_t>((elapsedCycles / systemClockFrequency()) * timerHz);
+  uint64_t elapsedCycles = systemCycles - timerLastCycles;
+  uint32_t ticks = static_cast<uint32_t>(scaleU64(elapsedCycles, numerator, denominator));
   if (ticks == 0) {
     timerLastHostMicros = nowMicros;
     return;
   }
 
-  timerLastCycles += (static_cast<double>(ticks) / timerHz) * systemClockFrequency();
+  uint64_t consumedCycles = scaleU64(ticks, denominator, numerator);
+  if (consumedCycles == 0) consumedCycles = elapsedCycles;
+  timerLastCycles += consumedCycles;
   timerLastHostMicros = nowMicros;
   applyTimerTicks(control, ticks);
 }
@@ -454,7 +648,7 @@ static bool idDetectAsserted() {
 static uint8_t portInputValue(char port) {
 #if PALM_HARDWARE_PROFILE == PALM_PROFILE_IIIC_EXPERIMENTAL
   if (port == 'C') return 0x08;  // Not charging, active-low cradle input.
-  if (port == 'F') return 0x82;  // FIXTRNL2 plus LCD-powered input.
+  if (port == 'F') return PORT_F_IXTRNL2 | PORT_F_PEN_IO;
 #endif
   if (port == 'D') return idDetectAsserted() ? HARDWARE_ID_KEY_STATE : portDKeyBits();
   if (port == 'F') return penDown ? 0x00 : 0x02;  // Sumo/Brad PenIO is active low.
@@ -501,9 +695,9 @@ static uint8_t readPortData(uint16_t offset) {
   uint8_t value = output | input | internal;
 #if PALM_HARDWARE_PROFILE == PALM_PROFILE_IIIC_EXPERIMENTAL
   if (port == 'F') {
-    // Austin waits for the SED1375 LCD-powered input during display wake.
-    // Force it visible even if GPIO select/dir would otherwise hide it.
-    value |= 0x81;
+    // Austin waits for LCDPowered during display wake. Keep it visible here;
+    // the ROM can sequence Port C later without getting stuck in the poll.
+    value |= PORT_F_IXTRNL2 | PORT_F_LCD_POWERED;
   }
 #endif
   return value;
@@ -620,6 +814,7 @@ static void completeSpiExchange() {
   if ((control & (SPIM_ENABLE | SPIM_EXCHANGE)) != (SPIM_ENABLE | SPIM_EXCHANGE)) return;
   uint16_t spiData = get16(0x800);
   uint16_t numBits = (control & 0x000f) + 1;
+  traceIiicBrightnessSpiTransfer(spiData, static_cast<uint8_t>(numBits));
 
   if ((dbRegs[0x431] & 0x20) == 0) {
     uint32_t oldBitsMask = 0xffffffffUL << numBits;
@@ -869,15 +1064,11 @@ void palmHwInit() {
   put16(0x906, UART_TX_FIFO_EMPTY | UART_TX_FIFO_HALF | UART_TX_AVAILABLE | UART_TX_IGNORE_CTS);
   displayBrightnessLevel = 255;
   updateDisplayBrightnessLevel();
+  resetIiicBrightnessTrace();
 
-  updateLcdWriteRange();
-  lcdDirty = true;
-  lcdFrameReady = true;
-  lcdDirtyGeneration = 1;
-  lcdLastDirtyMillis = millis();
   lastTimerStatus = 0;
   systemCycles = 0;
-  timerLastCycles = 0.0;
+  timerLastCycles = 0;
   timerLastHostMicros = hostMonotonicMicros();
   resetCyclePacer(timerLastHostMicros);
   seedRtcFromTimeRegister();
@@ -890,7 +1081,7 @@ bool palmHwLoadState(const uint8_t *regs, size_t regSize, const PalmHwSavedState
   memcpy(dbRegs, regs, PALM_DB_REG_SIZE);
   lastTimerStatus = state.lastTimerStatus;
   systemCycles = state.systemCycles;
-  timerLastCycles = state.timerLastCycles;
+  timerLastCycles = state.timerLastCycles > 0.0 ? static_cast<uint64_t>(state.timerLastCycles) : systemCycles;
   timerLastHostMicros = hostMonotonicMicros();
   resetCyclePacer(timerLastHostMicros);
   seedRtcFromTimeRegister();
@@ -899,6 +1090,7 @@ bool palmHwLoadState(const uint8_t *regs, size_t regSize, const PalmHwSavedState
   uartIrdaProbeEchoUntilMs = 0;
   displayBrightnessLevel = 255;
   updateDisplayBrightnessLevel();
+  resetIiicBrightnessTrace();
 
   adsBitBufferIn = state.adsBitBufferIn;
   adsBitBufferOut = state.adsBitBufferOut;
@@ -914,11 +1106,6 @@ bool palmHwLoadState(const uint8_t *regs, size_t regSize, const PalmHwSavedState
   cradleButtonLineLow = false;
   portDEdge = state.portDEdge;
 
-  updateLcdWriteRange();
-  lcdDirty = true;
-  lcdFrameReady = true;
-  lcdLastDirtyMillis = millis();
-  ++lcdDirtyGeneration;
   memset(&hwDebug, 0, sizeof(hwDebug));
   updatePortDInterrupts();
   updateRtcInterrupts();
@@ -945,10 +1132,10 @@ bool palmHwSaveState(uint8_t *regs, size_t regSize, PalmHwSavedState &state) {
   state.buttonBitsDown = buttonBitsDown;
   state.portDEdge = portDEdge;
   state.systemCycles = systemCycles;
-  state.timerLastCycles = timerLastCycles;
+  state.timerLastCycles = static_cast<double>(timerLastCycles);
   state.lastRtcSecond = lastRtcSecond;
-  state.lcdDirty = lcdDirty ? 1 : 0;
-  state.lcdFrameReady = lcdFrameReady ? 1 : 0;
+  state.lcdDirty = 0;
+  state.lcdFrameReady = 0;
   return true;
 }
 
@@ -1063,9 +1250,7 @@ void palmHwAdvanceCycles(uint32_t cycles) {
 void palmHwCycle() {
   updateTimer();
   updateRtcTime();
-  if (lcdDirty && !lcdFrameReady && millis() - lcdLastDirtyMillis >= 20) {
-    lcdFrameReady = true;
-  }
+  printIiicBrightnessTrace(false);
   updateInterruptStatus();
 }
 
@@ -1154,7 +1339,7 @@ void palmHwWrite8(uint32_t address, uint8_t value) {
   dbRegs[offset] = value;
   if (offset >= 0x600 && offset <= 0x609) {
     timerLastHostMicros = hostMonotonicMicros();
-    timerLastCycles = static_cast<double>(systemCycles);
+    timerLastCycles = systemCycles;
   }
   if (offset >= 0xB00 && offset <= 0xB03) {
     seedRtcFromTimeRegister();
@@ -1182,6 +1367,7 @@ void palmHwWrite8(uint32_t address, uint8_t value) {
       offset == 0xA36 || offset == 0xA37) {
     updateDisplayBrightnessLevel();
   }
+  traceIiicBrightnessPortWrite(offset);
   if (offset == 0x60A || offset == 0x60B) {
     uint16_t status = get16(0x60A);
     status &= value | ~lastTimerStatus;
@@ -1207,17 +1393,9 @@ void palmHwWrite8(uint32_t address, uint8_t value) {
     uint32_t start = get32(0xA00);
     start &= 0x1ffffffeUL;
     put32(0xA00, start);
-    updateLcdWriteRange();
-    markLcdDirty();
     ++hwDebug.lcdWriteCount;
     hwDebug.lastLcdWriteOffset = offset;
     hwDebug.lastLcdWriteValue = value;
-  }
-}
-
-void palmHwNotifyMemoryWrite(uint32_t address) {
-  if (lcdWriteRangeValid && address >= lcdWriteRangeStart && address < lcdWriteRangeEnd) {
-    markLcdDirty();
   }
 }
 
@@ -1228,15 +1406,12 @@ PalmLcdState palmHwGetLcdState() {
   lcd.height = get16(0xA0A) + 1;
   lcd.bytesPerLine = static_cast<uint16_t>(dbRegs[0xA05]) * 2;
   lcd.panelControl = dbRegs[0xA20];
-  lcd.dirtyGeneration = lcdDirtyGeneration;
 #if PALM_FORCE_1BPP_LCD
   lcd.bpp = 1;
 #else
   lcd.bpp = 1 << (lcd.panelControl & 0x03);
 #endif
   lcd.margin = dbRegs[0xA2D];
-  lcd.dirty = lcdDirty;
-  lcd.frameReady = lcdFrameReady;
 
   lcd.valid = lcd.startAddr != 0 && lcd.width > 0 && lcd.width <= 320 && lcd.height > 0 &&
               lcd.height <= 320 && lcd.bytesPerLine > 0 && lcd.bpp <= 4;
@@ -1251,6 +1426,9 @@ uint8_t palmHwDisplayBrightnessLevel() { return displayBrightnessLevel; }
 bool palmHwLcdBacklightOn() {
 #if PALM_HARDWARE_PROFILE == PALM_PROFILE_M100_EXPERIMENTAL
   return (dbRegs[0x429] & PORT_F_BACKLIGHT_ON) != 0;
+#elif PALM_HARDWARE_PROFILE == PALM_PROFILE_IIIC_EXPERIMENTAL
+  return iiicGpioOutputHigh(0x410, 0x411, 0x413, PORT_C_BACKLIGHT_ENABLE) &&
+         iiicGpioOutputHigh(0x410, 0x411, 0x413, PORT_C_ENABLE_5V);
 #else
   return false;
 #endif
@@ -1362,9 +1540,4 @@ uint16_t palmHwPeekReg16(uint16_t offset) {
 uint32_t palmHwPeekReg32(uint16_t offset) {
   if (offset > PALM_DB_REG_SIZE - 4) return 0xffffffffUL;
   return (static_cast<uint32_t>(palmHwPeekReg16(offset)) << 16) | palmHwPeekReg16(offset + 2);
-}
-
-void palmHwMarkLcdClean() {
-  lcdDirty = false;
-  lcdFrameReady = false;
 }

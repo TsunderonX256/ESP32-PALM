@@ -9,11 +9,15 @@ LCD geometry, digitizer geometry, and device identity.
 - `IIIX`: current working Palm IIIx profile.
 - `M100_EXPERIMENTAL`: current working Palm m100 profile for
   `Palm-m100-3.51-en.rom`.
-- `IIIC_EXPERIMENTAL`: current working Palm IIIc/Austin desktop profile for
-  `Palm-IIIc-4.1-en.rom`.
+- `IIIC_EXPERIMENTAL`: current working Palm IIIc/Austin profile for
+  `Palm-IIIc-4.1-en.rom`, including the experimental ESP32 SED1375 path.
 
 ## Profile Notes
 
+- `IIIX`: uses the IIIx/Brad 160x160 DragonBall EZ LCD path, 4 MB RAM map,
+  Brad hardware ID bits, and the shared III-series key/serial/IR register
+  behavior. This profile does not expose a normal Palm OS brightness slider in
+  the tested ROM, so display contrast stays fixed at maximum.
 - `M100_EXPERIMENTAL`: uses the m100-class 160x160 LCD plus 60-pixel
   silkscreen geometry, Calvin/m100 hardware ID bits, the m100 key matrix, and
   DragonBall EZ LCD contrast PWM register `$A36`.
@@ -30,11 +34,77 @@ LCD geometry, digitizer geometry, and device identity.
   switch the DragonBall LCD palette: normal mode maps low pixels bright and high
   pixels dark, while backlit mode inverts the grayscale palette for all supported
   LCD bpp values.
-- The IIIx profile keeps desktop contrast fixed at maximum because this ROM
-  does not expose a software brightness/contrast control in normal use.
-- The IIIc profile uses a 4 MB RAM map and the external Epson SED1375 color
-  LCD controller at `$1F000000`. This is intentionally separate from the
-  DragonBall EZ LCD path used by IIIx and m100.
+- `IIIC_EXPERIMENTAL`: uses the Palm IIIc/Austin profile with a 4 MB RAM map,
+  20 MHz DragonBall EZ timing, Austin hardware ID bits, and the external Epson
+  SED1375 color LCD controller at `$1F000000`. The SED1375 register aperture is
+  `$1F01FFE0..$1F01FFFF`, and the emulated SED1375 VRAM window is 80 KB.
+- IIIc rendering is intentionally separate from the DragonBall EZ LCD path used
+  by IIIx and m100. IIIc uses the SED1375 indexed-color VRAM and CLUT path;
+  DragonBall LCD registers such as `$A00..$A3F` are not the active panel
+  interface for IIIc.
+
+## Compile-Time Profile Boundaries
+
+Profiles are selected at compile time with `PALM_HARDWARE_PROFILE`, never by a
+runtime switch. `palm_config.h` defines the selected ESP32 profile before
+including `palm_profile.h`; desktop native builds pass the equivalent profile
+through CMake's `-DPALM_PROFILE=...` option.
+
+The profile boundary is intentionally hard:
+
+- `palm_profile.h` owns RAM size, CPU clock, device name, and whether SED1375 is
+  present. Unsupported profile values fail compilation.
+- `PALM_PROFILE_IIIX` and `PALM_PROFILE_M100_EXPERIMENTAL` set
+  `PALM_HAS_SED1375=0` and use the DragonBall EZ LCD path.
+- `PALM_PROFILE_IIIC_EXPERIMENTAL` sets `PALM_HAS_SED1375=1` and enables the
+  SED1375 color LCD path.
+- `palm_hw.cpp` gates hardware ID, key matrix, GPIO inputs/outputs, LCD
+  backlight behavior, and IIIc brightness-controller handling with
+  `#if PALM_HARDWARE_PROFILE == ...`.
+- `palm_memory.cpp` gates the SED1375 register/VRAM/CLUT implementation with
+  `#if PALM_HAS_SED1375`.
+- ESP32 panel buffering is also profile-owned:
+  `PALM_PANEL_INDEXED_FRAMEBUFFER` is enabled for IIIx/m100 to save PSRAM, and
+  disabled for IIIc so the scaled 256-color SED1375 output is kept in RGB565.
+
+When adding a new hardware behavior, keep it inside the matching profile block
+unless the real IIIx, m100, and IIIc hardware all share that behavior.
+
+## IIIc/Austin Hardware Controls
+
+The IIIc profile models Austin-specific LCD and brightness control separately
+from the m100 backlight/contrast path.
+
+Known Austin display control lines:
+
+| Function | Register/bit | Direction | Notes |
+| --- | --- | --- | --- |
+| SED1375 VRAM | `$1F000000` | memory | 80 KB indexed-color VRAM window |
+| SED1375 registers | `$1F01FFE0..$1F01FFFF` | memory | Epson SED1375 control/CLUT aperture |
+| LCD brightness controller sync | Port B data `$409`, bit `0x08` | active-low output | `hwrEZPortBLCDBright`; brackets brightness SPI transfers |
+| SED1375 backlight enable | Port C data `$411`, bit `0x10` | active-high output | `hwrEZPortCBacklightEnable`; gates ESP32 backlight duty |
+| Screen 5V enable | Port C data `$411`, bit `0x40` | active-high output | `hwrEZPortCEnable5V`; also gates ESP32 backlight duty |
+| LCD powered input | Port F data `$429`, bit `0x01` | active-high input | held visible so Austin display wake polling completes |
+| Pen IO input | Port F data `$429`, bit `0x02` | input | active-high Austin pen line |
+| Video clock enable | Port F data `$429`, bit `0x20` | active-high output | Austin video-clock control line |
+| SED1375 power save | SED1375 register `0x03`, bit `0x04` | register bit | observed as a power-save/dim state, not the normal brightness slider |
+
+The Palm IIIc brightness slider does not write the m100 `$A36` contrast PWM
+register. It asserts the Port B brightness-controller sync line and sends
+16-bit DragonBall SPIM transfers through `$800..$803`. On the tested ROM, the
+useful raw brightness value is `spiData >> 4`; observed slider endpoints are
+approximately `0x020..0x0a0`, and the value is inverted. The ESP32 target maps:
+
+```text
+raw 0x020 -> brightness level 255 -> configured 50% physical backlight
+raw 0x0a0 -> brightness level   0 -> configured 10% physical backlight
+```
+
+Port C backlight-enable and 5V-enable must both be high; otherwise ESP32
+backlight duty is forced to zero. The temporary serial probe
+`PALM_IIIC_BRIGHTNESS_SERIAL_STATS` can be enabled in `palm_config.h` to print
+`IIIC BRI ...` lines while investigating this path, but it should stay disabled
+in normal UART/HotSync builds.
 
 ## Switching Profiles
 
@@ -188,9 +258,8 @@ compatibility alias.
 
 ## ESP32 Build
 
-The Arduino build defaults to `IIIX` through `palm_profile.h`. To compile a
-different profile, define `PALM_HARDWARE_PROFILE` before `palm_config.h` is
-included or add a compiler define:
+The Arduino/ESP32 build is also compile-time selected. `palm_config.h` currently
+defines the active profile before including `palm_profile.h`:
 
 ```c
 #define PALM_HARDWARE_PROFILE PALM_PROFILE_IIIX
@@ -202,11 +271,20 @@ or:
 #define PALM_HARDWARE_PROFILE PALM_PROFILE_M100_EXPERIMENTAL
 ```
 
-or, for desktop/header parity only:
+or:
 
 ```c
 #define PALM_HARDWARE_PROFILE PALM_PROFILE_IIIC_EXPERIMENTAL
 ```
 
-The ESP32/CYD path does not currently implement the IIIc SED1375 color LCD
-controller, so IIIc remains a desktop-oriented profile for now.
+`Tools/CompileEsp32Palm.ps1` reads this setting and embeds the matching ROM by
+default:
+
+- IIIx: `Palm-IIIx-3.1.rom`
+- m100: `Palm-m100-3.51-en.rom`
+- IIIc: `Palm-IIIc-4.1-en.rom`
+
+On ESP32, IIIx/m100 builds use the DragonBall LCD decoder and the indexed panel
+framebuffer option. IIIc builds use the SED1375 color decoder, core-0 SED1375
+VRAM snapshot/render assist, RGB565 panel frames, Austin GPIO handling, and the
+IIIc brightness-controller SPI mapping described above.

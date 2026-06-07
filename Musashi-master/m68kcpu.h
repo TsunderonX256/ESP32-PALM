@@ -413,6 +413,22 @@ typedef uint32 uint64;
 /* These defines are dependant on the configuration defines in m68kconf.h */
 
 /* Disable certain comparisons if we're not using all CPU types */
+#if defined(M68K_STRICT_68000_FASTPATH) && M68K_STRICT_68000_FASTPATH && \
+	defined(M68K_FIXED_CPU_TYPE) && M68K_FIXED_CPU_TYPE == CPU_TYPE_000
+	#define CPU_TYPE_IS_040_PLUS(A)    0
+	#define CPU_TYPE_IS_040_LESS(A)    1
+	#define CPU_TYPE_IS_030_PLUS(A)    0
+	#define CPU_TYPE_IS_030_LESS(A)    1
+	#define CPU_TYPE_IS_020_PLUS(A)    0
+	#define CPU_TYPE_IS_020_LESS(A)    1
+	#define CPU_TYPE_IS_EC020_PLUS(A)  0
+	#define CPU_TYPE_IS_EC020_LESS(A)  1
+	#define CPU_TYPE_IS_010(A)         0
+	#define CPU_TYPE_IS_010_PLUS(A)    0
+	#define CPU_TYPE_IS_010_LESS(A)    1
+	#define CPU_TYPE_IS_020_VARIANT(A) 0
+	#define CPU_TYPE_IS_000(A)         1
+#else
 #if M68K_EMULATE_040
 #define CPU_TYPE_IS_040_PLUS(A)    ((A) & (CPU_TYPE_040 | CPU_TYPE_EC040))
 	#define CPU_TYPE_IS_040_LESS(A)    1
@@ -465,6 +481,7 @@ typedef uint32 uint64;
 	#define CPU_TYPE_IS_000(A)         ((A) == CPU_TYPE_000)
 #else
 	#define CPU_TYPE_IS_000(A)         1
+#endif
 #endif
 
 

@@ -15,10 +15,7 @@ struct PalmLcdState {
   uint8_t bpp;
   uint8_t margin;
   uint8_t panelControl;
-  uint32_t dirtyGeneration;
   bool valid;
-  bool dirty;
-  bool frameReady;
 };
 
 struct PalmHwDebug {
@@ -48,6 +45,8 @@ struct PalmHwSavedState {
   uint64_t systemCycles;
   double timerLastCycles;
   int64_t lastRtcSecond;
+  // Compatibility fields kept for older snapshots. Fixed-interval rendering no
+  // longer uses LCD dirty/frame-ready state.
   int32_t lcdDirty;
   int32_t lcdFrameReady;
 };
@@ -60,6 +59,7 @@ bool palmHwSleepSnapshotInputsQuiet();
 bool palmHwInRegisterSpace(uint32_t address);
 uint8_t palmHwRead8(uint32_t address);
 void palmHwWrite8(uint32_t address, uint8_t value);
+void palmHwNotifySed1375RegWrite(uint8_t offset, uint8_t value);
 void palmHwSetPen(bool down, uint16_t x, uint16_t y);
 void palmHwSetPenRaw(bool down, uint16_t rawX, uint16_t rawY);
 void palmHwSetButtonBits(uint16_t bits, bool down);
@@ -72,7 +72,6 @@ bool palmHwIsAsleep();
 bool palmHwHasWakeSource();
 uint8_t palmHwDisplayBrightnessLevel();
 bool palmHwLcdBacklightOn();
-void palmHwNotifyMemoryWrite(uint32_t address);
 PalmLcdState palmHwGetLcdState();
 PalmHwDebug palmHwGetDebug();
 uint32_t palmHwUartWriteRx(const uint8_t *buffer, uint32_t count);
@@ -96,4 +95,3 @@ void palmHwSaveUartState(uint8_t *rxFifo, uint8_t *txFifo,
 uint8_t palmHwPeekReg8(uint16_t offset);
 uint16_t palmHwPeekReg16(uint16_t offset);
 uint32_t palmHwPeekReg32(uint16_t offset);
-void palmHwMarkLcdClean();

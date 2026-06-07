@@ -177,8 +177,18 @@ shortcut list; observed `$A36` values run from `0x0180` to `0x01aa` and the
 ESP32 target maps that range onto a 10-50% physical backlight PWM span. Port F
 data bit `0x20` switches the emulated LCD palette between normal grayscale and
 inverted backlit grayscale. The IIIc profile adds the SED1375 color LCD path and
-a 4 MB RAM map. The IIIx profile keeps desktop LCD contrast fixed at maximum
-because its ROM does not normally expose that software control.
+a 4 MB RAM map. On ESP32, IIIc brightness is Austin-specific: the ROM asserts
+Port B bit `0x08` as the LCD brightness-controller sync line, sends a 16-bit
+SPIM value through `$800..$803`, and the emulator maps the inverted
+`spiData >> 4` range `0x020..0x0a0` onto the configured 10-50% physical
+backlight span. Port C bits `0x10` and `0x40` gate the IIIc backlight/panel
+power. The IIIx profile keeps desktop LCD contrast fixed at maximum because its
+ROM does not normally expose that software control.
+
+The IIIx, m100, and IIIc hardware interfaces are selected at compile time with
+`PALM_HARDWARE_PROFILE`; runtime profile switching is intentionally avoided.
+IIIx/m100 builds use the DragonBall LCD path, while IIIc builds enable the
+SED1375 register/VRAM/CLUT path and Austin GPIO handling.
 
 The desktop LCD palette is also profile-owned in
 `PalmDesktopHarness/PalmConfig.vb`; see
@@ -202,13 +212,23 @@ an SD card for snapshots, and PSRAM for most Palm RAM.
 
 The ESP32 path keeps:
 
-- the first 128 KB of Palm RAM in internal DRAM when possible, with the rest in
-  PSRAM
+- a configurable low Palm RAM segment in internal DRAM via
+  `PALM_RAM_INTERNAL_LOW_SIZE`, allocated before render buffers so the hot low
+  RAM segment gets priority, with the rest in PSRAM
 - CPU/register/timer hot state in internal DRAM
 - ROM in flash
 - 16 MB flash layout with two 4 MB app slots and a FATFS partition
 - 10 FPS interval LCD updates, with only the 160x160 Palm LCD area refreshed
   dynamically
+- optional indexed 8-bit RGB panel frame buffers with
+  `PALM_PANEL_INDEXED_FRAMEBUFFER`. When enabled, the active and pending
+  full-screen panel frames take about 261 KB instead of 522 KB; a small RGB565
+  palette/cache stays in internal DRAM and the RGB bounce callback expands
+  pixels back to RGB565 for the panel
+- Musashi separate immediate/PC-relative read callbacks enabled so opcode
+  extension reads can use the faster Palm instruction-read path where possible
+- strict 68000 Musashi fast path enabled, including a generated static-table
+  alias list for non-68000 opcode handlers
 - a static PNG-derived 4bpp m100 silkscreen strip compiled into flash
 - GT911 touch mapped into the ADS/digitizer emulation
 - virtual app/up/down buttons on the left side of the panel
@@ -218,6 +238,10 @@ The ESP32 path keeps:
   to a 10-50% ESP32 backlight PWM range
 - m100 Port F bit `0x20` backlight state mapped to the LCD render palette, so
   backlit mode inverts all DragonBall LCD bpp modes through a per-frame palette
+- Palm IIIc/Austin brightness mapped from Port B bit `0x08` brightness-controller
+  sync plus 16-bit SPIM transfers; the inverted `spiData >> 4` range
+  `0x020..0x0a0` controls ESP32 backlight duty while Port C bits `0x10` and
+  `0x40` gate backlight/panel power
 - automatic restore from `/palm_m100_state.bin` on the SD card, with wake from
   saved sleep state
 - low-power Palm sleep mode that turns off the display/backlight, lowers CPU

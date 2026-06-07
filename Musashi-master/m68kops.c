@@ -36826,6 +36826,8 @@ void m68ki_build_opcode_table(void)
 /* ======================================================================== */
 
 
+#include "m68k_68000_strict_aliases.h"
+
 #if !M68K_DYNAMIC_INSTR_TABLES
 void (*const m68ki_static_instruction_jump_table[0x10000])(void) = {
 	m68k_op_ori_8_d,

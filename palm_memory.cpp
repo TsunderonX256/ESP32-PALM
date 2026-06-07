@@ -74,10 +74,10 @@ static uint8_t sed1375Regs[PALM_SED1375_REG_SIZE];
 static uint8_t *sed1375Vram = nullptr;
 static uint32_t sed1375Clut[256];
 static uint16_t sed1375Clut565[256];
+static uint32_t sed1375PaletteGeneration = 1;
+static uint32_t sed1375VramGeneration = 1;
 static uint8_t sed1375LutEntry = 0;
 static uint8_t sed1375LutColor = 0;
-static bool sed1375Dirty = true;
-static uint32_t sed1375DirtyGeneration = 1;
 static constexpr uint32_t SED1375_STATE_REGS_OFFSET = 0;
 static constexpr uint32_t SED1375_STATE_LUT_OFFSET = SED1375_STATE_REGS_OFFSET + PALM_SED1375_REG_SIZE;
 static constexpr uint32_t SED1375_STATE_CLUT_OFFSET = SED1375_STATE_LUT_OFFSET + 4;
@@ -283,6 +283,10 @@ static inline bool PALM_MEM_FAST pageContainsSpan(uint32_t address, uint32_t siz
          (address & PALM_MEM_PAGE_MASK) <= PALM_MEM_PAGE_SIZE - size;
 }
 
+static inline size_t PALM_MEM_FAST pageCacheIndex(uint32_t tag) {
+  return (tag ^ (tag >> 8) ^ (tag >> 16)) & (PALM_MEM_PAGE_CACHE_ENTRIES - 1);
+}
+
 static inline const uint8_t *PALM_MEM_FAST fillReadPage(uint32_t tag) {
   uint32_t pageBase = tag << PALM_MEM_PAGE_SHIFT;
   const uint8_t *base = romPointerForAddress(pageBase, PALM_MEM_PAGE_SIZE);
@@ -290,7 +294,7 @@ static inline const uint8_t *PALM_MEM_FAST fillReadPage(uint32_t tag) {
     base = ramPointerForAddress(pageBase, PALM_MEM_PAGE_SIZE);
   }
 
-  DirectReadPage &entry = readPageCache[tag & (PALM_MEM_PAGE_CACHE_ENTRIES - 1)];
+  DirectReadPage &entry = readPageCache[pageCacheIndex(tag)];
   entry.tag = tag;
   entry.base = base;
   return base;
@@ -303,7 +307,7 @@ static inline uint8_t *PALM_MEM_FAST fillWritePage(uint32_t tag) {
     base = ramPointerForAddress(pageBase, PALM_MEM_PAGE_SIZE);
   }
 
-  DirectWritePage &entry = writePageCache[tag & (PALM_MEM_PAGE_CACHE_ENTRIES - 1)];
+  DirectWritePage &entry = writePageCache[pageCacheIndex(tag)];
   entry.tag = tag;
   entry.base = base;
   return base;
@@ -313,7 +317,7 @@ static inline const uint8_t *PALM_MEM_FAST cachedReadPointer(uint32_t address, u
   if (!pageContainsSpan(address, size)) return nullptr;
 
   uint32_t tag = address >> PALM_MEM_PAGE_SHIFT;
-  DirectReadPage &entry = readPageCache[tag & (PALM_MEM_PAGE_CACHE_ENTRIES - 1)];
+  DirectReadPage &entry = readPageCache[pageCacheIndex(tag)];
   const uint8_t *base = entry.tag == tag ? entry.base : fillReadPage(tag);
   return base != nullptr ? base + (address & PALM_MEM_PAGE_MASK) : nullptr;
 }
@@ -322,7 +326,7 @@ static inline uint8_t *PALM_MEM_FAST cachedWritePointer(uint32_t address, uint32
   if (!pageContainsSpan(address, size)) return nullptr;
 
   uint32_t tag = address >> PALM_MEM_PAGE_SHIFT;
-  DirectWritePage &entry = writePageCache[tag & (PALM_MEM_PAGE_CACHE_ENTRIES - 1)];
+  DirectWritePage &entry = writePageCache[pageCacheIndex(tag)];
   uint8_t *base = entry.tag == tag ? entry.base : fillWritePage(tag);
   return base != nullptr ? base + (address & PALM_MEM_PAGE_MASK) : nullptr;
 }
@@ -384,12 +388,6 @@ static void updateSed1375Clut565(uint8_t index) {
   sed1375Clut565[index] = argbTo565(sed1375Clut[index]);
 }
 
-static void markSed1375Dirty() {
-  sed1375Dirty = true;
-  ++sed1375DirtyGeneration;
-  if (sed1375DirtyGeneration == 0) sed1375DirtyGeneration = 1;
-}
-
 static bool ensureSed1375Allocated() {
   if (sed1375Vram != nullptr) return true;
 #if defined(ESP32) && defined(MALLOC_CAP_SPIRAM)
@@ -415,12 +413,12 @@ static bool initSed1375() {
   sed1375Regs[0x12] = 20;
   sed1375LutEntry = 0;
   sed1375LutColor = 0;
+  sed1375PaletteGeneration = 1;
+  sed1375VramGeneration = 1;
   for (uint32_t i = 0; i < 256; ++i) {
     sed1375Clut[i] = 0xff000000UL | (i << 16) | (i << 8) | i;
     updateSed1375Clut565(static_cast<uint8_t>(i));
   }
-  sed1375Dirty = true;
-  sed1375DirtyGeneration = 1;
   return true;
 }
 
@@ -442,6 +440,7 @@ static uint8_t sed1375ReadReg(uint32_t offset) {
 static void sed1375WriteReg(uint32_t offset, uint8_t value) {
   if (offset == 0x00 || offset >= PALM_SED1375_REG_SIZE) return;
   sed1375Regs[offset] = value;
+  palmHwNotifySed1375RegWrite(static_cast<uint8_t>(offset), value);
 
   if (offset == 0x15) {
     sed1375LutEntry = value;
@@ -460,11 +459,11 @@ static void sed1375WriteReg(uint32_t offset, uint8_t value) {
       entry = (entry & 0xffffff00UL) | expanded;
     }
     updateSed1375Clut565(sed1375LutEntry);
+    ++sed1375PaletteGeneration;
     sed1375LutColor = (sed1375LutColor + 1) % 3;
     if (sed1375LutColor == 0) ++sed1375LutEntry;
   }
 
-  if (offset >= 0x01 && offset <= 0x1c) markSed1375Dirty();
 }
 #endif
 
@@ -526,7 +525,7 @@ bool palmMemoryInit() {
        lowRequest >= 16384 &&
        palmRamSizeBytes < PALM_RAM_ALLOC_TARGET_SIZE &&
        palmRamSegmentCount < RAM_MAX_SEGMENTS;
-       lowRequest >>= 1) {
+       lowRequest -= (16UL * 1024UL)) {
     size_t remaining = PALM_RAM_ALLOC_TARGET_SIZE - palmRamSizeBytes;
     size_t request = lowRequest < remaining ? lowRequest : remaining;
     uint8_t *segment = static_cast<uint8_t *>(palmAllocInternal(request));
@@ -618,6 +617,13 @@ size_t palmRomSize() {
 size_t palmRamSize() { return palmRamSizeBytes; }
 size_t palmRamLastAllocAttemptSize() { return palmRamLastAttemptBytes; }
 size_t palmRamLastAllocAttemptSegments() { return palmRamLastAttemptSegments; }
+size_t palmRamSegmentSize(size_t index) {
+#if PALM_RAM_STATIC_BACKING
+  return index == 0 ? palmRamSizeBytes : 0;
+#else
+  return index < palmRamSegmentCount ? palmRamSegments[index].size : 0;
+#endif
+}
 
 bool palmRamWriteBytes(uint32_t offset, const uint8_t *data, uint32_t count) {
   if (count == 0) return true;
@@ -733,7 +739,9 @@ uint8_t PALM_MEM_FAST palmRead8(uint32_t address) {
   if (palmHwInRegisterSpace(address)) return palmHwRead8(address);
 #if PALM_HAS_SED1375
   if (sed1375RegOffset(address, offset)) return sed1375ReadReg(offset);
-  if (sed1375VramOffset(address, offset) && sed1375Vram != nullptr) return sed1375Vram[offset];
+  if (sed1375VramOffset(address, offset) && sed1375Vram != nullptr) {
+    return sed1375Vram[offset];
+  }
 #endif
   if (ramSizeProbeAddress(address)) return 0x00;
 #if PALM_MIRROR_LOGICAL_RAM
@@ -854,7 +862,6 @@ void PALM_MEM_FAST palmWrite8(uint32_t address, uint8_t value) {
   uint8_t *direct = cachedWritePointer(address, 1);
   if (direct != nullptr) {
     direct[0] = value;
-    palmHwNotifyMemoryWrite(address);
     return;
   }
 #endif
@@ -871,7 +878,7 @@ void PALM_MEM_FAST palmWrite8(uint32_t address, uint8_t value) {
 
   if (sed1375VramOffset(address, offset) && sed1375Vram != nullptr) {
     sed1375Vram[offset] = value;
-    markSed1375Dirty();
+    ++sed1375VramGeneration;
     return;
   }
 #endif
@@ -883,7 +890,6 @@ void PALM_MEM_FAST palmWrite8(uint32_t address, uint8_t value) {
   uint8_t *ram = ramPointerForAddress(address, 1);
   if (ram != nullptr) {
     ram[0] = value;
-    palmHwNotifyMemoryWrite(address);
     return;
   }
 
@@ -898,7 +904,6 @@ void PALM_MEM_FAST palmWrite8(uint32_t address, uint8_t value) {
     memoryDebug.lastMirrorWrite = address;
 #endif
     *ramPointer(mirroredRamOffset(offset)) = value;
-    palmHwNotifyMemoryWrite(address);
     return;
   }
 #else
@@ -929,7 +934,6 @@ void PALM_MEM_FAST palmWrite16(uint32_t address, uint16_t value) {
   uint8_t *direct = cachedWritePointer(address, 2);
   if (direct != nullptr) {
     writeBe16(direct, value);
-    palmHwNotifyMemoryWrite(address);
     return;
   }
   if (palmHwInRegisterSpace(address)) {
@@ -943,7 +947,6 @@ void PALM_MEM_FAST palmWrite16(uint32_t address, uint16_t value) {
   uint8_t *ram = ramPointerForAddress(address, 2);
   if (ram != nullptr) {
     writeBe16(ram, value);
-    palmHwNotifyMemoryWrite(address);
     return;
   }
   if (ramOffset(address, offset) && ramOffset(address + 1, nextOffset)) {
@@ -954,7 +957,6 @@ void PALM_MEM_FAST palmWrite16(uint32_t address, uint16_t value) {
       *ramPointer(offset) = value >> 8;
       *ramPointer(nextOffset) = value & 0xff;
     }
-    palmHwNotifyMemoryWrite(address);
     return;
   }
 #if PALM_MIRROR_LOGICAL_RAM
@@ -972,7 +974,6 @@ void PALM_MEM_FAST palmWrite16(uint32_t address, uint16_t value) {
       *ramPointer(offset) = value >> 8;
       *ramPointer(nextOffset) = value & 0xff;
     }
-    palmHwNotifyMemoryWrite(address);
     return;
   }
 #endif
@@ -991,7 +992,6 @@ void PALM_MEM_FAST palmWrite32(uint32_t address, uint32_t value) {
   uint8_t *direct = cachedWritePointer(address, 4);
   if (direct != nullptr) {
     writeBe32(direct, value);
-    palmHwNotifyMemoryWrite(address);
     return;
   }
   if (palmHwInRegisterSpace(address)) {
@@ -1007,14 +1007,12 @@ void PALM_MEM_FAST palmWrite32(uint32_t address, uint32_t value) {
   uint8_t *ram = ramPointerForAddress(address, 4);
   if (ram != nullptr) {
     writeBe32(ram, value);
-    palmHwNotifyMemoryWrite(address);
     return;
   }
   if (ramOffset(address, offset) && ramOffset(address + 3, lastOffset) && lastOffset == offset + 3) {
     uint8_t *ptr = ramPointerSpan(offset, 4);
     if (ptr != nullptr) {
       writeBe32(ptr, value);
-      palmHwNotifyMemoryWrite(address);
       return;
     }
   }
@@ -1026,7 +1024,6 @@ void PALM_MEM_FAST palmWrite32(uint32_t address, uint32_t value) {
       uint8_t *ptr = ramPointerSpan(offset, 4);
       if (ptr != nullptr) {
         writeBe32(ptr, value);
-        palmHwNotifyMemoryWrite(address);
         return;
       }
     }
@@ -1083,6 +1080,26 @@ extern "C" unsigned int PALM_MEM_FAST palm_read_instr_16(unsigned int address) {
   return 0xffff;
 }
 
+extern "C" unsigned int PALM_MEM_FAST m68k_read_immediate_16(unsigned int address) {
+  return palm_read_instr_16(address);
+}
+
+extern "C" unsigned int PALM_MEM_FAST m68k_read_immediate_32(unsigned int address) {
+  return (palm_read_instr_16(address) << 16) | palm_read_instr_16(address + 2);
+}
+
+extern "C" unsigned int PALM_MEM_FAST m68k_read_pcrelative_8(unsigned int address) {
+  return palmRead8(address);
+}
+
+extern "C" unsigned int PALM_MEM_FAST m68k_read_pcrelative_16(unsigned int address) {
+  return palmRead16(address);
+}
+
+extern "C" unsigned int PALM_MEM_FAST m68k_read_pcrelative_32(unsigned int address) {
+  return palmRead32(address);
+}
+
 extern "C" void PALM_MEM_FAST m68k_write_memory_8(unsigned int address, unsigned int value) {
   palmWrite8(address, value & 0xff);
 }
@@ -1115,9 +1132,6 @@ bool palmSed1375GetLcdState(PalmLcdState &lcd) {
   lcd.bpp = bpp;
   lcd.margin = 0;
   lcd.panelControl = sed1375Regs[0x02];
-  lcd.dirtyGeneration = sed1375DirtyGeneration;
-  lcd.dirty = sed1375Dirty;
-  lcd.frameReady = sed1375Dirty;
   lcd.valid = sed1375Vram != nullptr && lcd.width > 0 && lcd.width <= 320 &&
               lcd.height > 0 && lcd.height <= 320 &&
               lcd.bytesPerLine > 0 && (bpp == 1 || bpp == 2 || bpp == 4 || bpp == 8);
@@ -1128,17 +1142,27 @@ bool palmSed1375GetLcdState(PalmLcdState &lcd) {
 #endif
 }
 
-void palmSed1375MarkClean() {
-#if PALM_HAS_SED1375
-  sed1375Dirty = false;
-#endif
-}
-
 uint16_t palmSed1375PaletteColor565(uint8_t index) {
 #if PALM_HAS_SED1375
   return sed1375Clut565[index];
 #else
   (void)index;
+  return 0;
+#endif
+}
+
+uint32_t palmSed1375PaletteGeneration() {
+#if PALM_HAS_SED1375
+  return sed1375PaletteGeneration;
+#else
+  return 0;
+#endif
+}
+
+uint32_t palmSed1375VramGeneration() {
+#if PALM_HAS_SED1375
+  return sed1375VramGeneration;
+#else
   return 0;
 #endif
 }
@@ -1204,10 +1228,12 @@ static void sed1375SetStateByte(uint32_t offset, uint8_t value) {
     uint8_t shift = static_cast<uint8_t>((3U - (clutOffset & 3U)) * 8U);
     entry = (entry & ~(0xffUL << shift)) | (static_cast<uint32_t>(value) << shift);
     updateSed1375Clut565(static_cast<uint8_t>(clutOffset / sizeof(uint32_t)));
+    ++sed1375PaletteGeneration;
     return;
   }
   if (offset < SED1375_STATE_SIZE && sed1375Vram != nullptr) {
     sed1375Vram[offset - SED1375_STATE_VRAM_OFFSET] = value;
+    ++sed1375VramGeneration;
   }
 }
 #endif
@@ -1240,7 +1266,6 @@ bool palmSed1375WriteStateBytes(uint32_t offset, const uint8_t *src, size_t coun
   for (size_t i = 0; i < count; ++i) {
     sed1375SetStateByte(offset + static_cast<uint32_t>(i), src[i]);
   }
-  markSed1375Dirty();
   return true;
 #else
   (void)offset;

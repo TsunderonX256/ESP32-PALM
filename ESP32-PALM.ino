@@ -1,4 +1,6 @@
 #include <Arduino.h>
+#include "palm_config.h"
+
 #if defined(ESP32)
 #include <esp_heap_caps.h>
 #include <freertos/FreeRTOS.h>
@@ -13,7 +15,6 @@
 #endif
 #endif
 
-#include "palm_config.h"
 #include "palm_hw.h"
 #include "palm_memory.h"
 #include "silkscreen_asset.h"
@@ -79,7 +80,6 @@ static constexpr int RGB_PANEL_VSYNC_FRONT_PORCH = 8;
 static constexpr int RGB_PANEL_VSYNC_PULSE_WIDTH = 4;
 static constexpr int RGB_PANEL_VSYNC_BACK_PORCH = 12;
 static constexpr bool RGB_PANEL_PCLK_IDLE_HIGH = true;
-static constexpr bool PALM_DISABLE_DYNAMIC_LCD_RENDER_TEST = false;
 static constexpr bool PALM_RENDER_SYNCHRONOUS_TEST = false;
 static constexpr size_t RGB_PANEL_BOUNCE_BUFFER_PX = 480;
 static constexpr uint32_t PALM_RENDER_TASK_STACK_BYTES = 8192;
@@ -187,8 +187,6 @@ static constexpr int TOUCH_STABLE_PALM_TOLERANCE = 12;
 static TaskHandle_t renderTaskHandle = nullptr;
 static SemaphoreHandle_t renderSurfaceMutex = nullptr;
 static volatile uint32_t renderFrames = 0;
-static uint32_t palmViewToSurfaceX[PALM_VIEW_H];
-static uint32_t palmViewToSurfaceY[PALM_VIEW_W];
 static uint32_t palmLcdViewToSourceX[PALM_LCD_VIEW_H];
 static uint32_t palmLcdViewToSourceY[PALM_LCD_VIEW_W];
 struct LcdBilinearAxis {
@@ -605,71 +603,131 @@ static_assert(PALM_UART_FIFO_SIZE <= sizeof(PalmNativeStateHeader::uartRxFifo),
 static PalmNativeStateHeader stateHeaderBuffer;
 static uint8_t stateIoBuffer[PALM_DB_REG_SIZE];
 
-static uint16_t to565(uint16_t color) {
-  return color;
-}
-
 static inline uint16_t rgb565SwapBytes(uint16_t color) {
   return static_cast<uint16_t>((color << 8) | (color >> 8));
 }
 
-static void lcdFillRect(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t color) {
-  (void)x;
-  (void)y;
-  (void)w;
-  (void)h;
-  (void)color;
+#if defined(ESP32)
+#define PALM_PANEL_FAST_DATA DRAM_ATTR
+#else
+#define PALM_PANEL_FAST_DATA
+#endif
+
+#if PALM_PANEL_INDEXED_FRAMEBUFFER
+struct PanelColorCacheEntry {
+  uint16_t color;
+  uint8_t index;
+  uint8_t valid;
+};
+
+static PALM_PANEL_FAST_DATA uint16_t panelPalette565[256];
+static PALM_PANEL_FAST_DATA uint16_t panelPaletteColors[256];
+static PALM_PANEL_FAST_DATA uint16_t panelPaletteCount = 0;
+static PALM_PANEL_FAST_DATA PanelColorCacheEntry panelColorCache[512];
+
+static inline uint16_t panelColorCacheSlot(uint16_t color) {
+  return static_cast<uint16_t>((color ^ (color >> 7) ^ (color >> 13)) & 0x01ff);
 }
 
-static void lcdDrawFastHLine(int16_t x, int16_t y, int16_t w, uint16_t color) {
-  (void)x;
-  (void)y;
-  (void)w;
-  (void)color;
+static uint32_t panelColorDistance(uint16_t a, uint16_t b) {
+  int ar = (a >> 11) & 0x1f;
+  int ag = (a >> 5) & 0x3f;
+  int ab = a & 0x1f;
+  int br = (b >> 11) & 0x1f;
+  int bg = (b >> 5) & 0x3f;
+  int bb = b & 0x1f;
+  int dr = ar - br;
+  int dg = ag - bg;
+  int db = ab - bb;
+  return static_cast<uint32_t>(dr * dr * 2 + dg * dg + db * db * 2);
 }
 
-static void lcdDrawFastVLine(int16_t x, int16_t y, int16_t h, uint16_t color) {
-  (void)x;
-  (void)y;
-  (void)h;
-  (void)color;
+static uint8_t panelNearestColorIndex(uint16_t color) {
+  uint8_t bestIndex = 0;
+  uint32_t bestDistance = 0xffffffffUL;
+  for (uint16_t i = 0; i < panelPaletteCount; ++i) {
+    uint32_t distance = panelColorDistance(color, panelPaletteColors[i]);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      bestIndex = static_cast<uint8_t>(i);
+      if (distance == 0) break;
+    }
+  }
+  return bestIndex;
 }
 
-static void lcdDrawRect(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t color) {
-  (void)x;
-  (void)y;
-  (void)w;
-  (void)h;
-  (void)color;
+static uint8_t panelRegisterColor(uint16_t color) {
+  uint16_t slot = panelColorCacheSlot(color);
+  PanelColorCacheEntry &entry = panelColorCache[slot];
+  if (entry.valid && entry.color == color) return entry.index;
+
+  for (uint16_t i = 0; i < panelPaletteCount; ++i) {
+    if (panelPaletteColors[i] == color) {
+      entry = {color, static_cast<uint8_t>(i), 1};
+      return static_cast<uint8_t>(i);
+    }
+  }
+
+  uint8_t index;
+  if (panelPaletteCount < 256) {
+    index = static_cast<uint8_t>(panelPaletteCount++);
+    panelPaletteColors[index] = color;
+    panelPalette565[index] = color;
+  } else {
+    index = panelNearestColorIndex(color);
+  }
+  entry = {color, index, 1};
+  return index;
 }
 
-static void lcdDrawLine(int16_t x0, int16_t y0, int16_t x1, int16_t y1, uint16_t color) {
-  (void)x0;
-  (void)y0;
-  (void)x1;
-  (void)y1;
-  (void)color;
+static void panelPaletteReset() {
+  panelPaletteCount = 0;
+  memset(panelColorCache, 0, sizeof(panelColorCache));
 }
 
-static void lcdPushImage(int16_t x, int16_t y, int16_t w, int16_t h, const uint16_t *pixels) {
-  (void)x;
-  (void)y;
-  (void)w;
-  (void)h;
-  (void)pixels;
+static inline PanelPixel panelEncodeColor(uint16_t color) {
+  return panelRegisterColor(color);
 }
+
+static inline uint16_t panelDecodePixel(PanelPixel pixel) {
+  return panelPalette565[pixel];
+}
+#else
+static void panelPaletteReset() {}
+static inline PanelPixel panelEncodeColor(uint16_t color) { return color; }
+static inline uint16_t panelDecodePixel(PanelPixel pixel) { return pixel; }
+#endif
 
 static uint16_t *palmSurface = nullptr;
-static uint16_t *palmPanelLcd = nullptr;
-static uint16_t *panelFrames[2] = {nullptr, nullptr};
+static PanelPixel *panelFrames[2] = {nullptr, nullptr};
+static bool palmSurfaceInInternalRam = false;
 static bool panelFramesInInternalRam = false;
-static uint16_t * volatile activePanelFrame = nullptr;
-static uint16_t *pendingPanelFrame = nullptr;
+static PanelPixel * volatile activePanelFrame = nullptr;
+static PanelPixel *pendingPanelFrame = nullptr;
 static volatile bool panelFrameBoundary = true;
 static bool panelStaticFramesReady = false;
 static uint8_t drawPanelFrameIndex = 0;
+#if PALM_HAS_SED1375 && PALM_SED1375_DECODE_ON_RENDER_CORE
+static constexpr uint32_t SED1375_RENDER_MAX_LINE_BYTES = 320;
+static constexpr uint32_t SED1375_RENDER_MAX_BYTES = SED1375_RENDER_MAX_LINE_BYTES * PALM_LCD_H;
+struct Sed1375RenderSnapshot {
+  PalmLcdState lcd;
+  uint16_t palette565[256];
+  uint32_t paletteGeneration;
+  uint32_t vramGeneration;
+  uint16_t drawW;
+  uint16_t drawH;
+  bool valid;
+};
+static uint8_t *sed1375RenderVram = nullptr;
+static bool sed1375RenderVramInInternalRam = false;
+static Sed1375RenderSnapshot sed1375RenderSnapshot = {};
+#endif
 static uint16_t virtualButtonBitsDown = 0;
 static int virtualButtonIndexDown = -1;
+static bool virtualTouchActive = false;
+static uint16_t virtualTouchBits = 0;
+static int virtualTouchIndex = -1;
 static bool palmStateSaveRequested = false;
 static bool palmStateSaveInProgress = false;
 static bool touchInputDisabled = false;
@@ -699,21 +757,45 @@ static void lockRenderSurface() {
   if (renderSurfaceMutex != nullptr) xSemaphoreTake(renderSurfaceMutex, portMAX_DELAY);
 }
 
+static bool tryLockRenderSurface() {
+  return renderSurfaceMutex == nullptr || xSemaphoreTake(renderSurfaceMutex, 0) == pdTRUE;
+}
+
 static void unlockRenderSurface() {
   if (renderSurfaceMutex != nullptr) xSemaphoreGive(renderSurfaceMutex);
 }
 
-static bool initRenderBuffers() {
-  if (palmSurface != nullptr && palmPanelLcd != nullptr &&
-      panelFrames[0] != nullptr && panelFrames[1] != nullptr) return true;
+static void *allocRenderBuffer(size_t bytes, bool &internalRam) {
 #if defined(ESP32)
-  palmSurface = static_cast<uint16_t *>(heap_caps_malloc(PALM_SURFACE_W * PALM_SURFACE_H * sizeof(uint16_t),
-                                                        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-  palmPanelLcd = static_cast<uint16_t *>(heap_caps_malloc(PALM_LCD_W * PALM_LCD_H * sizeof(uint16_t),
-                                                         MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-  panelFrames[0] = static_cast<uint16_t *>(heap_caps_malloc(SCREEN_W * SCREEN_H * sizeof(uint16_t),
+  internalRam = true;
+  void *ptr = heap_caps_malloc(bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (ptr != nullptr) return ptr;
+  internalRam = false;
+#if defined(MALLOC_CAP_SPIRAM)
+  return heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+#else
+  return nullptr;
+#endif
+#else
+  internalRam = true;
+  return malloc(bytes);
+#endif
+}
+
+static bool initRenderBuffers() {
+#if PALM_HAS_SED1375 && PALM_SED1375_DECODE_ON_RENDER_CORE
+  if (palmSurface != nullptr && panelFrames[0] != nullptr && panelFrames[1] != nullptr &&
+      sed1375RenderVram != nullptr) return true;
+#else
+  if (palmSurface != nullptr && panelFrames[0] != nullptr && panelFrames[1] != nullptr) return true;
+#endif
+#if defined(ESP32)
+  panelPaletteReset();
+  palmSurface = static_cast<uint16_t *>(allocRenderBuffer(PALM_SURFACE_W * PALM_SURFACE_H * sizeof(uint16_t),
+                                                          palmSurfaceInInternalRam));
+  panelFrames[0] = static_cast<PanelPixel *>(heap_caps_malloc(SCREEN_W * SCREEN_H * sizeof(PanelPixel),
                                                            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-  panelFrames[1] = static_cast<uint16_t *>(heap_caps_malloc(SCREEN_W * SCREEN_H * sizeof(uint16_t),
+  panelFrames[1] = static_cast<PanelPixel *>(heap_caps_malloc(SCREEN_W * SCREEN_H * sizeof(PanelPixel),
                                                            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
   panelFramesInInternalRam = panelFrames[0] != nullptr && panelFrames[1] != nullptr;
   if (!panelFramesInInternalRam) {
@@ -725,28 +807,43 @@ static bool initRenderBuffers() {
       heap_caps_free(panelFrames[1]);
       panelFrames[1] = nullptr;
     }
-    panelFrames[0] = static_cast<uint16_t *>(heap_caps_malloc(SCREEN_W * SCREEN_H * sizeof(uint16_t),
+    panelFrames[0] = static_cast<PanelPixel *>(heap_caps_malloc(SCREEN_W * SCREEN_H * sizeof(PanelPixel),
                                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    panelFrames[1] = static_cast<uint16_t *>(heap_caps_malloc(SCREEN_W * SCREEN_H * sizeof(uint16_t),
+    panelFrames[1] = static_cast<PanelPixel *>(heap_caps_malloc(SCREEN_W * SCREEN_H * sizeof(PanelPixel),
                                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
   }
-#else
-  palmSurface = static_cast<uint16_t *>(malloc(PALM_SURFACE_W * PALM_SURFACE_H * sizeof(uint16_t)));
-  palmPanelLcd = static_cast<uint16_t *>(malloc(PALM_LCD_W * PALM_LCD_H * sizeof(uint16_t)));
-  panelFrames[0] = static_cast<uint16_t *>(malloc(SCREEN_W * SCREEN_H * sizeof(uint16_t)));
-  panelFrames[1] = static_cast<uint16_t *>(malloc(SCREEN_W * SCREEN_H * sizeof(uint16_t)));
+#if PALM_HAS_SED1375 && PALM_SED1375_DECODE_ON_RENDER_CORE
+  sed1375RenderVramInInternalRam = false;
+#if defined(MALLOC_CAP_SPIRAM)
+  sed1375RenderVram = static_cast<uint8_t *>(heap_caps_malloc(SED1375_RENDER_MAX_BYTES,
+                                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
 #endif
-  if (palmSurface == nullptr || palmPanelLcd == nullptr ||
-      panelFrames[0] == nullptr || panelFrames[1] == nullptr) return false;
+  if (sed1375RenderVram == nullptr) {
+    sed1375RenderVramInInternalRam = true;
+    sed1375RenderVram = static_cast<uint8_t *>(heap_caps_malloc(SED1375_RENDER_MAX_BYTES,
+                                                                MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  }
+#endif
+#else
+  panelPaletteReset();
+  palmSurface = static_cast<uint16_t *>(malloc(PALM_SURFACE_W * PALM_SURFACE_H * sizeof(uint16_t)));
+  panelFrames[0] = static_cast<PanelPixel *>(malloc(SCREEN_W * SCREEN_H * sizeof(PanelPixel)));
+  panelFrames[1] = static_cast<PanelPixel *>(malloc(SCREEN_W * SCREEN_H * sizeof(PanelPixel)));
+#if PALM_HAS_SED1375 && PALM_SED1375_DECODE_ON_RENDER_CORE
+  sed1375RenderVramInInternalRam = true;
+  sed1375RenderVram = static_cast<uint8_t *>(malloc(SED1375_RENDER_MAX_BYTES));
+#endif
+#endif
+  if (palmSurface == nullptr || panelFrames[0] == nullptr || panelFrames[1] == nullptr) return false;
+#if PALM_HAS_SED1375 && PALM_SED1375_DECODE_ON_RENDER_CORE
+  if (sed1375RenderVram == nullptr) return false;
+#endif
   for (uint32_t i = 0; i < static_cast<uint32_t>(PALM_SURFACE_W) * PALM_SURFACE_H; ++i) {
     palmSurface[i] = TFT_WHITE;
   }
-  for (uint32_t i = 0; i < static_cast<uint32_t>(PALM_LCD_W) * PALM_LCD_H; ++i) {
-    palmPanelLcd[i] = TFT_WHITE;
-  }
   for (uint32_t frame = 0; frame < 2; ++frame) {
     for (uint32_t i = 0; i < static_cast<uint32_t>(SCREEN_W) * SCREEN_H; ++i) {
-      panelFrames[frame][i] = TFT_MIDGREY;
+      panelFrames[frame][i] = panelEncodeColor(TFT_MIDGREY);
     }
   }
   activePanelFrame = panelFrames[0];
@@ -779,12 +876,35 @@ static void buildLcdPalette(uint16_t *palette, uint8_t bpp, bool backlightOn) {
   }
 }
 
-static uint8_t readPackedLcdPixel(uint32_t rowAddress, uint16_t x, uint8_t bpp, uint8_t pan) {
-  if (bpp != 1 && bpp != 2 && bpp != 4 && bpp != 8) return 0;
-  uint32_t bitIndex = static_cast<uint32_t>(x + pan) * bpp;
-  uint8_t byteValue = palmRead8(rowAddress + (bitIndex >> 3));
-  uint8_t shift = 8 - bpp - (bitIndex & 7);
-  return (byteValue >> shift) & ((1 << bpp) - 1);
+static void drawLcd1BppNoMargin(const PalmLcdState &lcd, uint16_t drawW, uint16_t drawH,
+                                const uint16_t *palette) {
+  uint16_t offColor = palette[0];
+  uint16_t onColor = palette[1];
+  uint16_t fullBytes = drawW >> 3;
+  uint16_t tailPixels = drawW & 7;
+
+  for (uint16_t y = 0; y < drawH; ++y) {
+    uint32_t srcLine = lcd.startAddr + static_cast<uint32_t>(y) * lcd.bytesPerLine;
+    uint16_t *row = palmSurface + static_cast<uint32_t>(y) * PALM_SURFACE_W;
+    uint16_t x = 0;
+    for (uint16_t bx = 0; bx < fullBytes; ++bx) {
+      uint8_t bits = palmRead8(srcLine + bx);
+      row[x++] = (bits & 0x80) ? onColor : offColor;
+      row[x++] = (bits & 0x40) ? onColor : offColor;
+      row[x++] = (bits & 0x20) ? onColor : offColor;
+      row[x++] = (bits & 0x10) ? onColor : offColor;
+      row[x++] = (bits & 0x08) ? onColor : offColor;
+      row[x++] = (bits & 0x04) ? onColor : offColor;
+      row[x++] = (bits & 0x02) ? onColor : offColor;
+      row[x++] = (bits & 0x01) ? onColor : offColor;
+    }
+    if (tailPixels != 0) {
+      uint8_t bits = palmRead8(srcLine + fullBytes);
+      for (uint16_t bit = 0; bit < tailPixels; ++bit) {
+        row[x++] = (bits & (0x80 >> bit)) ? onColor : offColor;
+      }
+    }
+  }
 }
 
 static void surfaceFillRect(int x, int y, int w, int h, uint16_t color) {
@@ -823,13 +943,6 @@ static void surfaceDrawRect(int x, int y, int w, int h, uint16_t color) {
 }
 
 static void initScaleMaps() {
-  for (int y = 0; y < PALM_VIEW_H; ++y) {
-    palmViewToSurfaceX[y] = (static_cast<uint32_t>(y) * ((PALM_SURFACE_W - 1) << 16)) / (PALM_VIEW_H - 1);
-  }
-  for (int x = 0; x < PALM_VIEW_W; ++x) {
-    uint32_t forwardY16 = (static_cast<uint32_t>(x) * ((PALM_SURFACE_H - 1) << 16)) / (PALM_VIEW_W - 1);
-    palmViewToSurfaceY[x] = ((PALM_SURFACE_H - 1) << 16) - forwardY16;
-  }
   for (int y = 0; y < PALM_LCD_VIEW_H; ++y) {
     uint32_t x16 = (static_cast<uint32_t>(y) * ((PALM_LCD_W - 1) << 16)) / (PALM_LCD_VIEW_H - 1);
     uint32_t x0 = x16 >> 16;
@@ -858,6 +971,97 @@ static void initScaleMaps() {
     };
   }
 }
+
+#if PALM_HAS_SED1375 && PALM_SED1375_DECODE_ON_RENDER_CORE
+static bool captureSed1375RenderSnapshot(const PalmLcdState &lcd) {
+  sed1375RenderSnapshot.valid = false;
+  if (sed1375RenderVram == nullptr || !lcd.valid ||
+      lcd.bytesPerLine == 0 || lcd.bytesPerLine > SED1375_RENDER_MAX_LINE_BYTES) {
+    return false;
+  }
+
+  uint16_t drawW = min<uint16_t>(PALM_LCD_W, lcd.width);
+  uint16_t drawH = min<uint16_t>(PALM_LCD_H, lcd.height);
+  if (drawW == 0 || drawH == 0 ||
+      static_cast<uint32_t>(lcd.bytesPerLine) * drawH > SED1375_RENDER_MAX_BYTES) {
+    return false;
+  }
+
+  uint32_t paletteGeneration = palmSed1375PaletteGeneration();
+  uint32_t vramGeneration = palmSed1375VramGeneration();
+
+  if (sed1375RenderSnapshot.paletteGeneration != paletteGeneration) {
+    for (uint16_t i = 0; i < 256; ++i) {
+      sed1375RenderSnapshot.palette565[i] = palmSed1375PaletteColor565(static_cast<uint8_t>(i));
+    }
+    sed1375RenderSnapshot.paletteGeneration = paletteGeneration;
+  }
+
+  for (uint16_t y = 0; y < drawH; ++y) {
+    uint32_t srcLine = lcd.startAddr + static_cast<uint32_t>(y) * lcd.bytesPerLine;
+    const uint8_t *src = palmSed1375VramPointer(srcLine, lcd.bytesPerLine);
+    if (src == nullptr) {
+      sed1375RenderSnapshot.valid = false;
+      return false;
+    }
+    memcpy(sed1375RenderVram + static_cast<uint32_t>(y) * lcd.bytesPerLine,
+           src,
+           lcd.bytesPerLine);
+  }
+
+  sed1375RenderSnapshot.lcd = lcd;
+  sed1375RenderSnapshot.drawW = drawW;
+  sed1375RenderSnapshot.drawH = drawH;
+  sed1375RenderSnapshot.vramGeneration = vramGeneration;
+  sed1375RenderSnapshot.valid = true;
+  return true;
+}
+
+static bool sed1375RenderSnapshotReusable(const PalmLcdState &lcd) {
+  return sed1375RenderSnapshot.vramGeneration == palmSed1375VramGeneration() &&
+         sed1375RenderSnapshot.paletteGeneration == palmSed1375PaletteGeneration() &&
+         sed1375RenderSnapshot.drawW == min<uint16_t>(PALM_LCD_W, lcd.width) &&
+         sed1375RenderSnapshot.drawH == min<uint16_t>(PALM_LCD_H, lcd.height) &&
+         sed1375RenderSnapshot.lcd.startAddr == lcd.startAddr &&
+         sed1375RenderSnapshot.lcd.bytesPerLine == lcd.bytesPerLine &&
+         sed1375RenderSnapshot.lcd.bpp == lcd.bpp &&
+         sed1375RenderSnapshot.lcd.margin == lcd.margin;
+}
+
+static void decodeSed1375RenderSnapshotToSurface() {
+  if (!sed1375RenderSnapshot.valid || sed1375RenderVram == nullptr || palmSurface == nullptr) return;
+
+  PalmLcdState lcd = sed1375RenderSnapshot.lcd;
+  uint16_t drawW = sed1375RenderSnapshot.drawW;
+  uint16_t drawH = sed1375RenderSnapshot.drawH;
+  if (drawW < PALM_LCD_W || drawH < PALM_LCD_H) {
+    surfaceFillRect(0, 0, PALM_LCD_W, PALM_LCD_H, TFT_WHITE);
+  }
+
+  for (uint16_t y = 0; y < drawH; ++y) {
+    const uint8_t *srcBytes = sed1375RenderVram + static_cast<uint32_t>(y) * lcd.bytesPerLine;
+    uint16_t *dstRow = palmSurface + static_cast<uint32_t>(y) * PALM_SURFACE_W;
+    uint32_t cachedByteIndex = 0xffffffffUL;
+    uint8_t cachedByte = 0;
+    for (uint16_t x = 0; x < drawW; ++x) {
+      uint8_t value = 0;
+      if (lcd.bpp == 1 || lcd.bpp == 2 || lcd.bpp == 4 || lcd.bpp == 8) {
+        uint32_t bitIndex = static_cast<uint32_t>(x + lcd.margin) * lcd.bpp;
+        uint32_t byteIndex = bitIndex >> 3;
+        if (byteIndex != cachedByteIndex) {
+          cachedByteIndex = byteIndex;
+          cachedByte = byteIndex < lcd.bytesPerLine ? srcBytes[byteIndex] : 0;
+        }
+        uint8_t shift = 8 - lcd.bpp - (bitIndex & 7);
+        value = (cachedByte >> shift) & ((1 << lcd.bpp) - 1);
+      }
+      dstRow[x] = sed1375RenderSnapshot.palette565[value];
+    }
+  }
+
+  sed1375RenderSnapshot.valid = false;
+}
+#endif
 
 static inline uint16_t bilinear565Fast(const uint16_t *pixels,
                                        const LcdBilinearAxis &x,
@@ -890,41 +1094,27 @@ static inline uint16_t bilinear565Fast(const uint16_t *pixels,
   return rgb565SwapBytes(static_cast<uint16_t>((r << 11) | (g << 5) | b));
 }
 
-static inline uint16_t composePanelPixel(int screenX, int screenY) {
-  if (palmSurface == nullptr ||
-      screenX < PALM_VIEW_X ||
-      screenX >= PALM_VIEW_X + PALM_VIEW_W ||
-      screenY < PALM_VIEW_Y ||
-      screenY >= PALM_VIEW_Y + PALM_VIEW_H) {
-    return TFT_MIDGREY;
-  }
-
-  int dx = screenX - PALM_VIEW_X;
-  int dy = screenY - PALM_VIEW_Y;
-  uint32_t srcX = palmViewToSurfaceX[dy] >> 16;
-  uint32_t srcY = palmViewToSurfaceY[dx] >> 16;
-  return palmSurface[srcY * PALM_SURFACE_W + srcX];
-}
-
-static void renderPanelLcdFrameFromSurface(uint16_t *target) {
+static void renderPanelLcdFrameFromSurface(PanelPixel *target) {
   if (target == nullptr || palmSurface == nullptr) return;
 
   for (int dy = 0; dy < PALM_LCD_VIEW_H; ++dy) {
     uint32_t srcX16 = palmLcdViewToSourceX[dy];
     const LcdBilinearAxis &srcX = palmLcdBilinearX[dy];
-    uint16_t *lcdRow = target + static_cast<uint32_t>(PALM_LCD_VIEW_Y + dy) * SCREEN_W + PALM_LCD_VIEW_X;
+    PanelPixel *lcdRow = target + static_cast<uint32_t>(PALM_LCD_VIEW_Y + dy) * SCREEN_W + PALM_LCD_VIEW_X;
     for (int dx = 0; dx < PALM_LCD_VIEW_W; ++dx) {
       uint32_t srcY16 = palmLcdViewToSourceY[dx];
+      uint16_t color;
       if (PALM_LCD_BILINEAR_UPSCALE) {
-        lcdRow[dx] = bilinear565Fast(palmSurface, srcX, palmLcdBilinearY[dx]);
+        color = bilinear565Fast(palmSurface, srcX, palmLcdBilinearY[dx]);
       } else {
-        lcdRow[dx] = palmSurface[static_cast<uint32_t>(srcY16 >> 16) * PALM_SURFACE_W + (srcX16 >> 16)];
+        color = palmSurface[static_cast<uint32_t>(srcY16 >> 16) * PALM_SURFACE_W + (srcX16 >> 16)];
       }
+      lcdRow[dx] = panelEncodeColor(color);
     }
   }
 }
 
-static void panelFillRect(uint16_t *target, int x, int y, int w, int h, uint16_t color) {
+static void panelFillRect(PanelPixel *target, int x, int y, int w, int h, uint16_t color) {
   if (target == nullptr || w <= 0 || h <= 0) return;
   int x2 = x + w;
   int y2 = y + h;
@@ -934,20 +1124,21 @@ static void panelFillRect(uint16_t *target, int x, int y, int w, int h, uint16_t
   if (y2 > SCREEN_H) y2 = SCREEN_H;
   if (x >= x2 || y >= y2) return;
 
+  PanelPixel encoded = panelEncodeColor(color);
   for (int py = y; py < y2; ++py) {
-    uint16_t *row = target + static_cast<uint32_t>(py) * SCREEN_W;
-    for (int px = x; px < x2; ++px) row[px] = color;
+    PanelPixel *row = target + static_cast<uint32_t>(py) * SCREEN_W;
+    for (int px = x; px < x2; ++px) row[px] = encoded;
   }
 }
 
-static void panelDrawRect(uint16_t *target, int x, int y, int w, int h, uint16_t color) {
+static void panelDrawRect(PanelPixel *target, int x, int y, int w, int h, uint16_t color) {
   panelFillRect(target, x, y, w, 1, color);
   panelFillRect(target, x, y + h - 1, w, 1, color);
   panelFillRect(target, x, y, 1, h, color);
   panelFillRect(target, x + w - 1, y, 1, h, color);
 }
 
-static void panelDrawSystemBitmapIcon(uint16_t *target, int x, int y, int w, int h, const uint8_t *bits) {
+static void panelDrawSystemBitmapIcon(PanelPixel *target, int x, int y, int w, int h, const uint8_t *bits) {
   int ix = x + (w - SYSTEM_BUTTON_ICON_W) / 2;
   int iy = y + (h - SYSTEM_BUTTON_ICON_H) / 2;
 
@@ -967,7 +1158,7 @@ static inline uint8_t silkscreenPixelIndex(int x, int y) {
   return (x & 1) != 0 ? (packed & 0x0f) : (packed >> 4);
 }
 
-static void panelDrawSilkscreenBitmap(uint16_t *target, int x, int y, int w, int h) {
+static void panelDrawSilkscreenBitmap(PanelPixel *target, int x, int y, int w, int h) {
   if (target == nullptr || w <= 0 || h <= 0) return;
 
   int x0 = x < 0 ? 0 : x;
@@ -978,16 +1169,16 @@ static void panelDrawSilkscreenBitmap(uint16_t *target, int x, int y, int w, int
 
   for (int py = y0; py < y1; ++py) {
     int sy = ((py - y) * SILKSCREEN_IMAGE_H) / h;
-    uint16_t *row = target + static_cast<uint32_t>(py) * SCREEN_W;
+    PanelPixel *row = target + static_cast<uint32_t>(py) * SCREEN_W;
     for (int px = x0; px < x1; ++px) {
       int sx = ((px - x) * SILKSCREEN_IMAGE_W) / w;
       uint8_t index = silkscreenPixelIndex(sx, sy);
-      row[px] = pgm_read_word(kSilkscreenPalette565 + (index & 0x0f));
+      row[px] = panelEncodeColor(pgm_read_word(kSilkscreenPalette565 + (index & 0x0f)));
     }
   }
 }
 
-static void panelDrawAppIcon(uint16_t *target, int x, int y, int w, int h, int bars) {
+static void panelDrawAppIcon(PanelPixel *target, int x, int y, int w, int h, int bars) {
   int iconW = w / 2;
   int iconH = h / 2;
   int ix = x + (w - iconW) / 2;
@@ -1001,7 +1192,7 @@ static void panelDrawAppIcon(uint16_t *target, int x, int y, int w, int h, int b
   }
 }
 
-static void panelDrawArrowIcon(uint16_t *target, int x, int y, int w, int h, bool up) {
+static void panelDrawArrowIcon(PanelPixel *target, int x, int y, int w, int h, bool up) {
   int cx = x + w / 2;
   int cy = y + h / 2;
   int half = w / 5;
@@ -1017,7 +1208,7 @@ static void panelDrawArrowIcon(uint16_t *target, int x, int y, int w, int h, boo
   panelFillRect(target, cx - 3, up ? cy : cy - height / 2, 7, height / 2 + 5, TFT_WHITE);
 }
 
-static void panelDrawPowerIcon(uint16_t *target, int x, int y, int w, int h) {
+static void panelDrawPowerIcon(PanelPixel *target, int x, int y, int w, int h) {
   int cx = x + w / 2;
   int cy = y + h / 2;
   int radius = min(w, h) / 4;
@@ -1029,7 +1220,7 @@ static void panelDrawPowerIcon(uint16_t *target, int x, int y, int w, int h) {
   panelFillRect(target, cx - radius / 2, cy + radius - 2, radius + 1, 4, TFT_WHITE);
 }
 
-static void panelDrawSaveIcon(uint16_t *target, int x, int y, int w, int h) {
+static void panelDrawSaveIcon(PanelPixel *target, int x, int y, int w, int h) {
   int iconW = w / 2;
   int iconH = h / 2;
   int ix = x + (w - iconW) / 2;
@@ -1040,7 +1231,7 @@ static void panelDrawSaveIcon(uint16_t *target, int x, int y, int w, int h) {
   panelFillRect(target, ix + iconW - 8, iy + 3, 4, iconH / 3, TFT_WHITE);
 }
 
-static void panelDrawResetIcon(uint16_t *target, int x, int y, int w, int h) {
+static void panelDrawResetIcon(PanelPixel *target, int x, int y, int w, int h) {
   int cx = x + w / 2;
   int cy = y + h / 2;
   int r = min(w, h) / 4;
@@ -1057,7 +1248,7 @@ static void panelDrawResetIcon(uint16_t *target, int x, int y, int w, int h) {
   }
 }
 
-static void renderVirtualButtonStrip(uint16_t *target) {
+static void renderVirtualButtonStrip(PanelPixel *target) {
   int stripW = VIRTUAL_BUTTON_STRIP_X1 - VIRTUAL_BUTTON_STRIP_X0;
   if (stripW <= 12) return;
 
@@ -1083,7 +1274,7 @@ static void renderVirtualButtonStrip(uint16_t *target) {
   }
 }
 
-static void renderVirtualPowerStrip(uint16_t *target) {
+static void renderVirtualPowerStrip(PanelPixel *target) {
   int stripW = VIRTUAL_POWER_STRIP_X1 - VIRTUAL_POWER_STRIP_X0;
   if (stripW <= 12) return;
 
@@ -1115,13 +1306,14 @@ static void renderVirtualPowerStrip(uint16_t *target) {
   panelDrawSystemBitmapIcon(target, bx, resetBy, bw, resetBh, kBtnResetPngBits);
 }
 
-static void renderPanelStaticFrameFromSurface(uint16_t *target) {
+static void renderPanelStaticFrameFromSurface(PanelPixel *target) {
   if (target == nullptr || palmSurface == nullptr) return;
 
   for (int y = 0; y < SCREEN_H; ++y) {
-    uint16_t *row = target + static_cast<uint32_t>(y) * SCREEN_W;
+    PanelPixel *row = target + static_cast<uint32_t>(y) * SCREEN_W;
+    PanelPixel encoded = panelEncodeColor(TFT_MIDGREY);
     for (int x = 0; x < SCREEN_W; ++x) {
-      row[x] = TFT_MIDGREY;
+      row[x] = encoded;
     }
   }
   renderVirtualButtonStrip(target);
@@ -1133,9 +1325,12 @@ static void renderPanelStaticFrameFromSurface(uint16_t *target) {
 }
 
 static void publishPanelFrame() {
+#if PALM_HAS_SED1375 && PALM_SED1375_DECODE_ON_RENDER_CORE
+  decodeSed1375RenderSnapshotToSurface();
+#endif
   if (!panelStaticFramesReady) {
     renderPanelStaticFrameFromSurface(panelFrames[0]);
-    memcpy(panelFrames[1], panelFrames[0], SCREEN_W * SCREEN_H * sizeof(uint16_t));
+    memcpy(panelFrames[1], panelFrames[0], SCREEN_W * SCREEN_H * sizeof(PanelPixel));
     activePanelFrame = panelFrames[0];
     drawPanelFrameIndex = 0;
     panelStaticFramesReady = true;
@@ -1173,37 +1368,23 @@ static bool rgbBounceFillCallback(esp_lcd_panel_handle_t panel, void *bounceBuf,
     pendingPanelFrame = nullptr;
     panelFrameBoundary = false;
   }
-  uint16_t *source = activePanelFrame;
+  PanelPixel *source = activePanelFrame;
   if (source == nullptr) {
     uint16_t *out = static_cast<uint16_t *>(bounceBuf);
     int pixels = lenBytes / sizeof(uint16_t);
     for (int i = 0; i < pixels; ++i) out[i] = TFT_MIDGREY;
     return false;
   }
+#if PALM_PANEL_INDEXED_FRAMEBUFFER
+  uint16_t *out = static_cast<uint16_t *>(bounceBuf);
+  int pixels = lenBytes / sizeof(uint16_t);
+  for (int i = 0; i < pixels; ++i) {
+    out[i] = panelDecodePixel(source[posPx + i]);
+  }
+#else
   memcpy(bounceBuf, source + posPx, lenBytes);
+#endif
   return false;
-}
-
-static void renderPalmSurfaceToPanel() {
-  static uint16_t line[PALM_VIEW_W];
-  for (int dy = 0; dy < PALM_VIEW_H; ++dy) {
-    uint32_t srcX = palmViewToSurfaceX[dy] >> 16;
-    for (int dx = 0; dx < PALM_VIEW_W; ++dx) {
-      line[dx] = palmSurface[static_cast<uint32_t>(palmViewToSurfaceY[dx] >> 16) * PALM_SURFACE_W + srcX];
-    }
-    lcdPushImage(PALM_VIEW_X, PALM_VIEW_Y + dy, PALM_VIEW_W, 1, line);
-  }
-}
-
-static void renderPalmLcdToPanel() {
-  static uint16_t line[PALM_LCD_VIEW_W];
-  for (int dy = 0; dy < PALM_LCD_VIEW_H; ++dy) {
-    uint32_t srcX = palmLcdViewToSourceX[dy] >> 16;
-    for (int dx = 0; dx < PALM_LCD_VIEW_W; ++dx) {
-      line[dx] = palmPanelLcd[static_cast<uint32_t>(palmLcdViewToSourceY[dx] >> 16) * PALM_LCD_W + srcX];
-    }
-    lcdPushImage(PALM_LCD_VIEW_X, PALM_LCD_VIEW_Y + dy, PALM_LCD_VIEW_W, 1, line);
-  }
 }
 
 static void renderTaskMain(void *parameter) {
@@ -1217,16 +1398,10 @@ static void renderTaskMain(void *parameter) {
 }
 
 static void renderStaticSurfaceToPanel() {
-  for (int y = 0; y < PALM_LCD_H; ++y) {
-    memcpy(palmPanelLcd + static_cast<uint32_t>(y) * PALM_LCD_W,
-           palmSurface + static_cast<uint32_t>(y) * PALM_SURFACE_W,
-           PALM_LCD_W * sizeof(uint16_t));
-  }
   publishPanelFrame();
 }
 
 static void requestPanelRender() {
-  if (PALM_DISABLE_DYNAMIC_LCD_RENDER_TEST) return;
   if (!PALM_RENDER_SYNCHRONOUS_TEST && renderTaskHandle != nullptr) {
     xTaskNotifyGive(renderTaskHandle);
     return;
@@ -1311,6 +1486,19 @@ static uint16_t virtualButtonBitsForRaw(int rawX, int rawY, int &index) {
   if (index < 0) index = 0;
   if (index >= VIRTUAL_BUTTON_COUNT) index = VIRTUAL_BUTTON_COUNT - 1;
   return virtualButtonBitsForIndex(index);
+}
+
+static void resetVirtualTouchLatch() {
+  virtualTouchActive = false;
+  virtualTouchBits = 0;
+  virtualTouchIndex = -1;
+}
+
+static bool rawInLatchedVirtualButton(int rawX, int rawY) {
+  if (!virtualTouchActive || virtualTouchBits == 0) return false;
+  int index = -1;
+  uint16_t bits = virtualButtonBitsForRaw(rawX, rawY, index);
+  return bits == virtualTouchBits && index == virtualTouchIndex;
 }
 
 static bool rawInSystemStrip(int rawX, int rawY) {
@@ -1672,6 +1860,9 @@ static void setBacklightDuty(uint8_t duty) {
 }
 
 static uint8_t palmBacklightDutyFromOs() {
+#if PALM_HARDWARE_PROFILE == PALM_PROFILE_IIIC_EXPERIMENTAL
+  if (!palmHwLcdBacklightOn()) return 0;
+#endif
   uint8_t level = palmHwDisplayBrightnessLevel();
   uint16_t span = BACKLIGHT_PALM_MAX_DUTY - BACKLIGHT_PALM_MIN_DUTY;
   return BACKLIGHT_PALM_MIN_DUTY + ((static_cast<uint16_t>(level) * span + 127) / 255);
@@ -1801,6 +1992,7 @@ static bool getPalmScreenTouch(int &screenX, int &screenY) {
   unsigned long now = millis();
   if (touchInputDisabled) {
     setVirtualButtonBits(0, -1, lastTouchRawX, lastTouchRawY);
+    resetVirtualTouchLatch();
     resetSaveButtonHold(false);
     resetResetButtonHold(false);
     cachedTouchDown = false;
@@ -1820,6 +2012,7 @@ static bool getPalmScreenTouch(int &screenX, int &screenY) {
       lastTouchRawY = rawY;
       if (palmLowPowerModeActive && palmLowPowerRequireTouchRelease) {
         setVirtualButtonBits(0, -1, rawX, rawY);
+        resetVirtualTouchLatch();
         resetSaveButtonHold(false);
         resetResetButtonHold(false);
         cachedTouchDown = false;
@@ -1828,24 +2021,38 @@ static bool getPalmScreenTouch(int &screenX, int &screenY) {
         return false;
       }
 
-      int buttonIndex;
-      uint16_t buttonBits = virtualButtonBitsForRaw(rawX, rawY, buttonIndex);
-      buttonBits = applySystemHoldLatch(buttonBits, buttonIndex, rawX, rawY);
-      if (buttonBits != 0) {
-        if (palmHwIsAsleep()) {
-          setVirtualButtonBits(0, -1, rawX, rawY);
-          buttonBits = 0;
-        } else {
+      int buttonIndex = -1;
+      uint16_t buttonBits = 0;
+      bool palmAsleep = palmHwIsAsleep();
+      if (!palmAsleep) {
+        if (!virtualTouchActive && !cachedTouchDown && !touchCandidateActive) {
+          virtualTouchActive = true;
+          virtualTouchBits = virtualButtonBitsForRaw(rawX, rawY, virtualTouchIndex);
+        }
+        if (virtualTouchBits != 0 && rawInLatchedVirtualButton(rawX, rawY)) {
+          buttonIndex = virtualTouchIndex;
+          buttonBits = virtualTouchBits;
+          buttonBits = applySystemHoldLatch(buttonBits, buttonIndex, rawX, rawY);
+        }
+        if (buttonBits != 0) {
           setVirtualButtonBits(buttonBits, buttonIndex, rawX, rawY);
           if ((buttonBits & VIRTUAL_BUTTON_HOLD_MASK) != 0) holdButtonLastSeenMs = now;
           updateSaveButtonHold((buttonBits & VIRTUAL_BUTTON_SAVE_STATE) != 0, now);
           updateResetButtonHold((buttonBits & VIRTUAL_BUTTON_RESET_OS) != 0, now);
+        } else {
+          resetSaveButtonHold(false);
+          resetResetButtonHold(false);
         }
-      } else {
+      } else if (virtualButtonBitsDown != 0 || virtualTouchActive) {
+        setVirtualButtonBits(0, -1, rawX, rawY);
+        resetVirtualTouchLatch();
         resetSaveButtonHold(false);
         resetResetButtonHold(false);
       }
-      if (buttonBits != 0) {
+      if (virtualTouchActive && virtualTouchBits != 0) {
+        if (buttonBits == 0 && virtualButtonBitsDown != 0) {
+          setVirtualButtonBits(0, -1, rawX, rawY);
+        }
         cachedTouchDown = false;
         touchCandidateActive = false;
         lastTouchDown = false;
@@ -1855,7 +2062,7 @@ static bool getPalmScreenTouch(int &screenX, int &screenY) {
       int palmX;
       int palmY;
       rawTouchToPalm(rawX, rawY, palmX, palmY);
-      bool bypassStableTouch = palmHwIsAsleep();
+      bool bypassStableTouch = palmAsleep;
       if (!cachedTouchDown && !bypassStableTouch) {
         if (!touchCandidateActive ||
             abs(palmX - touchCandidatePalmX) > TOUCH_STABLE_PALM_TOLERANCE ||
@@ -1893,6 +2100,7 @@ static bool getPalmScreenTouch(int &screenX, int &screenY) {
       resetResetButtonHold();
       palmLowPowerRequireTouchRelease = false;
       setVirtualButtonBits(0, -1, lastTouchRawX, lastTouchRawY);
+      resetVirtualTouchLatch();
       cachedTouchDown = cachedTouchDown && ((now - lastControllerTouchMs) < PALM_TOUCH_RELEASE_DEBOUNCE_MS);
       if (!cachedTouchDown) touchCandidateActive = false;
     }
@@ -2170,48 +2378,73 @@ static bool drawPalmFrameFromEmulatedLcd() {
     return false;
   }
 
-  lockRenderSurface();
-  lcdWaitingDrawn = false;
-  drawPalmShellOnce();
+#if PALM_HAS_SED1375 && PALM_SED1375_DECODE_ON_RENDER_CORE
+  if (useSed1375) {
+    if (sed1375RenderSnapshotReusable(lcd)) return false;
+    if (!tryLockRenderSurface()) return false;
+    lcdWaitingDrawn = false;
+    drawPalmShellOnce();
+    bool captured = captureSed1375RenderSnapshot(lcd);
+    unlockRenderSurface();
+    if (!captured) {
+      drawWaitingFrame();
+      return false;
+    }
+
+    requestPanelRender();
+#if PALM_PERF_SERIAL_STATS
+    uint32_t renderMicros = micros() - renderStartMicros;
+    renderTotalMicros += renderMicros;
+    if (renderMicros > renderMaxMicros) renderMaxMicros = renderMicros;
+    ++renderMeasuredFrames;
+#endif
+    return true;
+  }
+#endif
 
   uint16_t drawW = min<uint16_t>(PALM_LCD_W, lcd.width);
   uint16_t drawH = min<uint16_t>(PALM_LCD_H, lcd.height);
   bool lcdBacklightOn = !useSed1375 && palmHwLcdBacklightOn();
+
+  if (!tryLockRenderSurface()) return false;
+  lcdWaitingDrawn = false;
+  drawPalmShellOnce();
+
   uint16_t lcdPalette[256];
   if (!useSed1375) buildLcdPalette(lcdPalette, lcd.bpp, lcdBacklightOn);
   uint16_t lcdBackground = useSed1375 ? TFT_WHITE : lcdPalette[0];
-  surfaceFillRect(0, 0, PALM_LCD_W, PALM_LCD_H, lcdBackground);
+  if (drawW < PALM_LCD_W || drawH < PALM_LCD_H) {
+    surfaceFillRect(0, 0, PALM_LCD_W, PALM_LCD_H, lcdBackground);
+  }
 
-  for (uint16_t y = 0; y < drawH; ++y) {
-    uint32_t srcLine = lcd.startAddr + static_cast<uint32_t>(y) * lcd.bytesPerLine;
-    const uint8_t *srcBytes = useSed1375 ? palmSed1375VramPointer(srcLine, lcd.bytesPerLine) : nullptr;
-    uint32_t cachedByteIndex = 0xffffffffUL;
-    uint8_t cachedByte = 0;
-    for (uint16_t x = 0; x < drawW; ++x) {
-      uint8_t value = 0;
-      if (lcd.bpp == 1 || lcd.bpp == 2 || lcd.bpp == 4 || lcd.bpp == 8) {
-        uint32_t bitIndex = static_cast<uint32_t>(x + lcd.margin) * lcd.bpp;
-        uint32_t byteIndex = bitIndex >> 3;
-        if (byteIndex != cachedByteIndex) {
-          cachedByteIndex = byteIndex;
-          cachedByte = srcBytes != nullptr ? srcBytes[byteIndex] : palmRead8(srcLine + byteIndex);
+  if (!useSed1375 && lcd.bpp == 1 && lcd.margin == 0) {
+    drawLcd1BppNoMargin(lcd, drawW, drawH, lcdPalette);
+  } else {
+    for (uint16_t y = 0; y < drawH; ++y) {
+      uint32_t srcLine = lcd.startAddr + static_cast<uint32_t>(y) * lcd.bytesPerLine;
+      const uint8_t *srcBytes = useSed1375 ? palmSed1375VramPointer(srcLine, lcd.bytesPerLine) : nullptr;
+      uint16_t *dstRow = palmSurface + static_cast<uint32_t>(y) * PALM_SURFACE_W;
+      uint32_t cachedByteIndex = 0xffffffffUL;
+      uint8_t cachedByte = 0;
+      for (uint16_t x = 0; x < drawW; ++x) {
+        uint8_t value = 0;
+        if (lcd.bpp == 1 || lcd.bpp == 2 || lcd.bpp == 4 || lcd.bpp == 8) {
+          uint32_t bitIndex = static_cast<uint32_t>(x + lcd.margin) * lcd.bpp;
+          uint32_t byteIndex = bitIndex >> 3;
+          if (byteIndex != cachedByteIndex) {
+            cachedByteIndex = byteIndex;
+            cachedByte = srcBytes != nullptr ? srcBytes[byteIndex] : palmRead8(srcLine + byteIndex);
+          }
+          uint8_t shift = 8 - lcd.bpp - (bitIndex & 7);
+          value = (cachedByte >> shift) & ((1 << lcd.bpp) - 1);
         }
-        uint8_t shift = 8 - lcd.bpp - (bitIndex & 7);
-        value = (cachedByte >> shift) & ((1 << lcd.bpp) - 1);
+        dstRow[x] = useSed1375 ? palmSed1375PaletteColor565(value) : lcdPalette[value];
       }
-      uint16_t color = useSed1375 ? palmSed1375PaletteColor565(value) :
-                                    lcdPalette[value];
-      surfaceSetPixel(x, y, color);
     }
   }
   unlockRenderSurface();
 
   requestPanelRender();
-  if (useSed1375) {
-    palmSed1375MarkClean();
-  } else {
-    palmHwMarkLcdClean();
-  }
 #if PALM_PERF_SERIAL_STATS
   uint32_t renderMicros = micros() - renderStartMicros;
   renderTotalMicros += renderMicros;
@@ -2222,13 +2455,9 @@ static bool drawPalmFrameFromEmulatedLcd() {
 }
 
 static void drawStatusText(const char *line1, const char *line2, const char *line3) {
-#if PALM_BOOT_STATUS_TEXT
-  lcdFillRect(0, 0, SCREEN_W, 16, TFT_DARKGREY);
-#else
   (void)line1;
   (void)line2;
   (void)line3;
-#endif
 }
 
 static void drawStaticDisplayTest() {
@@ -2279,7 +2508,8 @@ static void releaseSerialDebugForPalmUart() {
     !PALM_TOUCH_EDGE_SERIAL_STATS && \
     !PALM_BUTTON_HOLD_SERIAL_STATS && \
     !PALM_WAKE_SERIAL_STATS && \
-    !PALM_CONTRAST_SERIAL_STATS
+    !PALM_CONTRAST_SERIAL_STATS && \
+    !PALM_IIIC_BRIGHTNESS_SERIAL_STATS
   if (debugSerialActive) {
     PALM_DBG_PRINTLN("Debug serial released for Palm UART");
     Serial.flush();
@@ -2595,7 +2825,7 @@ static void printWakeDebugLine(const char *tag, uint16_t touchAdcX, uint16_t tou
   PALM_DBG_PRINTF("DBG %s t=%lu pc=%08lx sp=%08lx sr=%04lx sleep=%u wake=%u irq=%u slices=%lu(+%lu) "
                 "pll=%04x im=%04x/%04x st=%04x/%04x pend=%04x/%04x tmr=%04x/%04x/%04x/%04x/%04x "
                 "pd=%02x/%02x pol=%02x req=%02x kbd=%02x edge=%02x "
-                "lcd=%u/%u/%u start=%08lx bpp=%u touch=%u raw=%d,%d palm=%d,%d adc=%u,%u wakeTouch=%u power=%u\n",
+                "lcd=%u start=%08lx bpp=%u touch=%u raw=%d,%d palm=%d,%d adc=%u,%u wakeTouch=%u power=%u\n",
                 tag,
                 (unsigned long)millis(),
                 (unsigned long)debugCpuReg(M68K_REG_PC),
@@ -2625,8 +2855,6 @@ static void printWakeDebugLine(const char *tag, uint16_t touchAdcX, uint16_t tou
                 portDKbd,
                 portDEdge,
                 lcd.valid ? 1 : 0,
-                lcd.dirty ? 1 : 0,
-                lcd.frameReady ? 1 : 0,
                 (unsigned long)lcd.startAddr,
                 lcd.bpp,
                 lastTouchDown ? 1 : 0,
@@ -3280,31 +3508,11 @@ void setup() {
   initSerialDebug();
   disableUnusedRadios();
   powerDownOptionalXpt2046();
-  bool renderBuffersOk = initRenderBuffers();
 #if PALM_BOOT_SERIAL_STATS
   PALM_DBG_PRINTF("Heap before Palm RAM: free=%lu max=%lu\n",
                 (unsigned long)ESP.getFreeHeap(),
                 (unsigned long)ESP.getMaxAllocHeap());
 #if defined(ESP32)
-  PALM_DBG_PRINTF("Render buffers: surface=%p lcd=%p %s\n",
-                palmSurface,
-                palmPanelLcd,
-                renderBuffersOk ? "OK" : "FAILED");
-  PALM_DBG_PRINTF("Panel frames: a=%p b=%p %s\n",
-                panelFrames[0],
-                panelFrames[1],
-                panelFramesInInternalRam ? "INTERNAL" : "PSRAM");
-  PALM_DBG_PRINTF("RGB timing: pclk=%ld edge=%s idle=%s bounce=%u h=%d/%d/%d v=%d/%d/%d\n",
-                (long)RGB_PANEL_PIXEL_CLOCK_HZ,
-                RGB_PANEL_PCLK_ACTIVE_NEG ? "neg" : "pos",
-                RGB_PANEL_PCLK_IDLE_HIGH ? "high" : "low",
-                (unsigned)RGB_PANEL_BOUNCE_BUFFER_PX,
-                RGB_PANEL_HSYNC_FRONT_PORCH,
-                RGB_PANEL_HSYNC_PULSE_WIDTH,
-                RGB_PANEL_HSYNC_BACK_PORCH,
-                RGB_PANEL_VSYNC_FRONT_PORCH,
-                RGB_PANEL_VSYNC_PULSE_WIDTH,
-                RGB_PANEL_VSYNC_BACK_PORCH);
   PALM_DBG_PRINTF("8-bit heap before Palm RAM: free=%lu max=%lu\n",
                 (unsigned long)heap_caps_get_free_size(MALLOC_CAP_8BIT),
                 (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
@@ -3316,14 +3524,15 @@ void setup() {
 #endif
 #endif
 
+  bool renderBuffersOk = false;
+#if PALM_STATIC_DISPLAY_TEST
+  renderBuffersOk = initRenderBuffers();
   if (!renderBuffersOk) {
 #if PALM_BOOT_SERIAL_STATS
     PALM_DBG_PRINTLN("Render buffer allocation failed");
 #endif
     return;
   }
-
-#if PALM_STATIC_DISPLAY_TEST
   initDisplay();
   drawStaticDisplayTest();
 #if PALM_BOOT_SERIAL_STATS
@@ -3347,6 +3556,8 @@ void setup() {
                 memoryOk ? "OK" : "FAILED");
   PALM_DBG_PRINTF("Palm RAM segments: %lu\n",
                 (unsigned long)palmRamLastAllocAttemptSegments());
+  PALM_DBG_PRINTF("Palm RAM low segment: %lu KB\n",
+                (unsigned long)(palmRamSegmentSize(0) / 1024));
   PALM_DBG_PRINTF("Heap after Palm RAM: free=%lu max=%lu\n",
                 (unsigned long)ESP.getFreeHeap(),
                 (unsigned long)ESP.getMaxAllocHeap());
@@ -3356,6 +3567,49 @@ void setup() {
                 (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
 #endif
 #endif
+
+  renderBuffersOk = initRenderBuffers();
+#if PALM_BOOT_SERIAL_STATS && defined(ESP32)
+  PALM_DBG_PRINTF("Render buffers: surface=%p %s %s\n",
+                palmSurface,
+                palmSurfaceInInternalRam ? "INTERNAL" : "PSRAM",
+                renderBuffersOk ? "OK" : "FAILED");
+  PALM_DBG_PRINTF("Panel frames: a=%p b=%p %s\n",
+                panelFrames[0],
+                panelFrames[1],
+                panelFramesInInternalRam ? "INTERNAL" : "PSRAM");
+#if PALM_HAS_SED1375 && PALM_SED1375_DECODE_ON_RENDER_CORE
+  PALM_DBG_PRINTF("SED1375 render snapshot: vram=%p %s\n",
+                sed1375RenderVram,
+                sed1375RenderVramInInternalRam ? "INTERNAL" : "PSRAM");
+#endif
+  PALM_DBG_PRINTF("RGB timing: pclk=%ld edge=%s idle=%s bounce=%u h=%d/%d/%d v=%d/%d/%d\n",
+                (long)RGB_PANEL_PIXEL_CLOCK_HZ,
+                RGB_PANEL_PCLK_ACTIVE_NEG ? "neg" : "pos",
+                RGB_PANEL_PCLK_IDLE_HIGH ? "high" : "low",
+                (unsigned)RGB_PANEL_BOUNCE_BUFFER_PX,
+                RGB_PANEL_HSYNC_FRONT_PORCH,
+                RGB_PANEL_HSYNC_PULSE_WIDTH,
+                RGB_PANEL_HSYNC_BACK_PORCH,
+                RGB_PANEL_VSYNC_FRONT_PORCH,
+                RGB_PANEL_VSYNC_PULSE_WIDTH,
+                RGB_PANEL_VSYNC_BACK_PORCH);
+  PALM_DBG_PRINTF("Heap after render buffers: free=%lu max=%lu\n",
+                (unsigned long)ESP.getFreeHeap(),
+                (unsigned long)ESP.getMaxAllocHeap());
+#if defined(MALLOC_CAP_SPIRAM)
+  PALM_DBG_PRINTF("PSRAM after render buffers: free=%lu max=%lu\n",
+                (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
+                (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+#endif
+#endif
+
+  if (!renderBuffersOk) {
+#if PALM_BOOT_SERIAL_STATS
+    PALM_DBG_PRINTLN("Render buffer allocation failed");
+#endif
+    return;
+  }
 
   initTouch();
 #if PALM_BOOT_SERIAL_STATS
@@ -3575,7 +3829,7 @@ void loop() {
 
     PalmLcdState lcd = palmHwGetLcdState();
     uint8_t irq = palmHwGetInterruptLevel();
-    PALM_DBG_PRINTF("PC=%08x irq=%u slices=%lu render=%lu t=%04x/%04x/%04x im=%04x/%04x is=%04x/%04x lcd=%u/%u/%u bpp=%u panel=%02x pitch=%u touch=%u raw=%d,%d scr=%d,%d palm=%d,%d adc=%u,%u\n",
+    PALM_DBG_PRINTF("PC=%08x irq=%u slices=%lu render=%lu t=%04x/%04x/%04x im=%04x/%04x is=%04x/%04x lcd=%u bpp=%u panel=%02x pitch=%u touch=%u raw=%d,%d scr=%d,%d palm=%d,%d adc=%u,%u\n",
                   m68k_get_reg(nullptr, M68K_REG_PC),
                   irq,
                   (unsigned long)cpuSlices,
@@ -3588,8 +3842,6 @@ void loop() {
                   palmRead16(PALM_DB_REG_BASE + 0x30C),
                   palmRead16(PALM_DB_REG_BASE + 0x30E),
                   lcd.valid ? 1 : 0,
-                  lcd.dirty ? 1 : 0,
-                  lcd.frameReady ? 1 : 0,
                   lcd.bpp,
                   lcd.panelControl,
                   lcd.bytesPerLine,
