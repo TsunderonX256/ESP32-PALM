@@ -220,12 +220,16 @@ static constexpr int TOUCH_ADC_HIGH = 3800;
 static constexpr int TOUCH_ADC_LOW = 300;
 static constexpr int TOUCH_ADC_X_MAX_VALUE = PALM_LCD_W - 1;
 static constexpr int TOUCH_ADC_Y_MAX_VALUE = PALM_DIGITIZER_H - 1;
+#if PALM_TOUCH_USE_EVENT_QUEUE
 static constexpr uint16_t SYS_TRAP_EVT_ENQUEUE_PEN_POINT = 0xa126;
 static constexpr uint16_t SYS_TRAP_EVT_WAKEUP = 0xa12f;
+#endif
 #if PALM_COLD_BOOT_SEED_TIME_MANAGER
 static constexpr uint16_t SYS_TRAP_TIM_SET_SECONDS = 0xa0f6;
 #endif
+#if PALM_OS_TRAP_BRIDGE
 static constexpr uint32_t PALM_CALL_STUB_ADDRESS = PALM_RAM_BASE + PALM_RAM_LOGICAL_SIZE - 0x100;
+#endif
 #if PALM_HARDWARE_PROFILE == PALM_PROFILE_IIIC_EXPERIMENTAL
 static constexpr const char *PALM_STATE_SD_PATH = "/palm_iiic_state.bin";
 static constexpr const char *PALM_STATE_SD_TEMP_PATH = "/palm_iiic_state.tmp";
@@ -2192,6 +2196,7 @@ static void logTouchEdge(const char *mode, bool down, uint16_t adcX, uint16_t ad
 }
 #endif
 
+#if PALM_OS_TRAP_BRIDGE
 static bool palmRamRangeOk(uint32_t address, uint32_t bytes) {
   uint32_t end = address + bytes;
   return end >= address && address >= PALM_RAM_BASE &&
@@ -2316,6 +2321,7 @@ static uint32_t callPalmEvtEnqueuePenPoint(bool down, int16_t palmX, int16_t pal
   return 0;
 }
 #endif
+#endif
 
 #if PALM_COLD_BOOT_SEED_TIME_MANAGER
 static uint32_t configuredColdBootPalmSeconds() {
@@ -2365,6 +2371,7 @@ static void scheduleColdBootTimeSeed(bool restoredState) {
 static void maybeSeedColdBootTime() {}
 #endif
 
+#if PALM_TOUCH_USE_EVENT_QUEUE
 static void enqueuePalmOsPenPoint(bool down, int palmX, int palmY) {
   uint32_t err = callPalmEvtEnqueuePenPoint(down,
                                             static_cast<int16_t>(palmX),
@@ -2378,6 +2385,7 @@ static void enqueuePalmOsPenPoint(bool down, int palmX, int palmY) {
                 (unsigned long)err);
 #endif
 }
+#endif
 
 static void drawPalmBorder() {
   surfaceFill(TFT_BLACK);
@@ -3733,9 +3741,7 @@ void setup() {
   }
 }
 
-void loop() {
-  updatePalmLowPowerMode();
-
+static void servicePalmTouchInput() {
 #if PALM_TOUCH_USE_EVENT_QUEUE
   int palmX;
   int palmY;
@@ -3842,6 +3848,10 @@ void loop() {
     setPalmPowerButtonFromTouch(false);
   }
 #endif
+}
+
+void loop() {
+  updatePalmLowPowerMode();
 
   servicePalmStateSaveRequest();
   servicePalmOsResetRequest();
@@ -3859,6 +3869,13 @@ void loop() {
     now = millis();
     nextFrameMs = lastFrameMs + PALM_LCD_REDRAW_INTERVAL_MS;
   }
+
+  servicePalmTouchInput();
+  servicePalmStateSaveRequest();
+  servicePalmOsResetRequest();
+  updatePalmLowPowerMode();
+  updatePalmBacklightFromOs();
+  servicePalmUartBridge();
 
   if (palmLowPowerModeActive) {
     palmHwCycle();
