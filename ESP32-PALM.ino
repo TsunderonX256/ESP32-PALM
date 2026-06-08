@@ -17,6 +17,7 @@
 
 #include "palm_hw.h"
 #include "palm_memory.h"
+#include "palm_palmday.h"
 #include "silkscreen_asset.h"
 
 #include <SPI.h>
@@ -125,6 +126,9 @@ static uint32_t lastPerfRenderTotalMicros = 0;
 #endif
 static uint32_t lastWakeStatsSlices = 0;
 static bool restoredStateLoaded = false;
+static bool coldBootTimeSeedPending = false;
+static uint8_t coldBootTimeSeedAttempts = 0;
+static uint32_t coldBootTimeSeedNextSlice = 0;
 #if PALM_DEBUG_SERIAL_ENABLED
 static bool debugSerialActive = false;
 #endif
@@ -214,6 +218,7 @@ static constexpr int TOUCH_ADC_X_MAX_VALUE = PALM_LCD_W - 1;
 static constexpr int TOUCH_ADC_Y_MAX_VALUE = PALM_DIGITIZER_H - 1;
 static constexpr uint16_t SYS_TRAP_EVT_ENQUEUE_PEN_POINT = 0xa126;
 static constexpr uint16_t SYS_TRAP_EVT_WAKEUP = 0xa12f;
+static constexpr uint16_t SYS_TRAP_TIM_SET_SECONDS = 0xa0f6;
 static constexpr uint32_t PALM_CALL_STUB_ADDRESS = PALM_RAM_BASE + PALM_RAM_LOGICAL_SIZE - 0x100;
 #if PALM_HARDWARE_PROFILE == PALM_PROFILE_IIIC_EXPERIMENTAL
 static constexpr const char *PALM_STATE_SD_PATH = "/palm_iiic_state.bin";
@@ -2266,6 +2271,12 @@ static uint32_t callPalmTrapNoArgs(uint16_t trap) {
   return callPalmTrapStack(trap, nullptr, 0);
 }
 
+static uint32_t callPalmTimSetSeconds(uint32_t palmSeconds) {
+  uint8_t stackBytes[4] = {};
+  palmWriteStack32(stackBytes, 0, palmSeconds);
+  return callPalmTrapStack(SYS_TRAP_TIM_SET_SECONDS, stackBytes, sizeof(stackBytes));
+}
+
 static uint32_t callPalmEvtEnqueuePenPoint(bool down, int16_t palmX, int16_t palmY) {
   uint32_t oldSp = m68k_get_reg(nullptr, M68K_REG_SP);
   if (oldSp < 8) return 0;
@@ -2283,6 +2294,11 @@ static uint32_t callPalmTrapNoArgs(uint16_t trap) {
   return 0;
 }
 
+static uint32_t callPalmTimSetSeconds(uint32_t palmSeconds) {
+  (void)palmSeconds;
+  return 0;
+}
+
 static uint32_t callPalmEvtEnqueuePenPoint(bool down, int16_t palmX, int16_t palmY) {
   (void)down;
   (void)palmX;
@@ -2290,6 +2306,55 @@ static uint32_t callPalmEvtEnqueuePenPoint(bool down, int16_t palmX, int16_t pal
   return 0;
 }
 #endif
+
+static uint32_t configuredColdBootPalmSeconds() {
+  return palmPalmDaySecondsFromDisplayDate(PALM_COLD_BOOT_DISPLAY_YEAR,
+                                           PALM_COLD_BOOT_DISPLAY_MONTH,
+                                           PALM_COLD_BOOT_DISPLAY_DAY,
+                                           PALM_COLD_BOOT_DISPLAY_HOUR,
+                                           PALM_COLD_BOOT_DISPLAY_MINUTE,
+                                           PALM_COLD_BOOT_DISPLAY_SECOND);
+}
+
+static void scheduleColdBootTimeSeed(bool restoredState) {
+#if PALM_COLD_BOOT_SEED_TIME_MANAGER
+  coldBootTimeSeedPending = !restoredState;
+  coldBootTimeSeedAttempts = 0;
+  coldBootTimeSeedNextSlice = cpuSlices + PALM_COLD_BOOT_SEED_MIN_SLICES;
+#else
+  (void)restoredState;
+  coldBootTimeSeedPending = false;
+  coldBootTimeSeedAttempts = 0;
+  coldBootTimeSeedNextSlice = 0;
+#endif
+}
+
+static void maybeSeedColdBootTime() {
+#if PALM_COLD_BOOT_SEED_TIME_MANAGER
+  if (!coldBootTimeSeedPending || !cpuReady) return;
+  if (cpuSlices < coldBootTimeSeedNextSlice) return;
+  if (palmHwIsAsleep()) return;
+
+  ++coldBootTimeSeedAttempts;
+  uint32_t seconds = configuredColdBootPalmSeconds();
+  (void)callPalmTimSetSeconds(seconds);
+
+  // TimSetSeconds is a void trap, so there is no reliable error return. Give
+  // Palm OS a few delayed attempts after reset, then stop touching the clock.
+  if (coldBootTimeSeedAttempts >= PALM_COLD_BOOT_SEED_MAX_ATTEMPTS) {
+    coldBootTimeSeedPending = false;
+#if PALM_BOOT_SERIAL_STATS
+    PALM_DBG_PRINTF("Cold boot Palm time seeded to display %u-%02u-%02u%s\n",
+                    PALM_COLD_BOOT_DISPLAY_YEAR,
+                    PALM_COLD_BOOT_DISPLAY_MONTH,
+                    PALM_COLD_BOOT_DISPLAY_DAY,
+                    PALM_PALMDAY_PATCH_ENABLED ? " (PalmDay offset)" : "");
+#endif
+  } else {
+    coldBootTimeSeedNextSlice = cpuSlices + PALM_COLD_BOOT_SEED_RETRY_SLICES;
+  }
+#endif
+}
 
 static void enqueuePalmOsPenPoint(bool down, int palmX, int palmY) {
   uint32_t err = callPalmEvtEnqueuePenPoint(down,
@@ -3647,6 +3712,7 @@ void setup() {
     initCpu();
     bool stateRestored = restorePalmStateFromSd();
     cpuReady = true;
+    scheduleColdBootTimeSeed(stateRestored);
     if (stateRestored) {
       autoWakeRestoredPalm();
       drawPalmFrameFromEmulatedLcd();
@@ -3809,6 +3875,7 @@ void loop() {
       runPalmCpuForBudget(cpuBudgetMs);
     }
   }
+  maybeSeedColdBootTime();
   servicePalmUartBridge();
 
 #if PALM_RUNTIME_SERIAL_STATS

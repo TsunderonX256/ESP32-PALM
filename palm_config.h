@@ -85,3 +85,32 @@ typedef uint16_t PanelPixel;
 #define PALM_BUS_ERROR_ON_RAM_LIMIT 0
 #define PALM_MIRROR_LOGICAL_RAM 1
 #define PALM_MEMORY_COMPATIBLE_ACCESS 0
+
+// PalmDay mitigation plumbing.
+//
+// Palm OS stores DateType.year as an offset from 1904 with only 7 bits, so
+// native dates stop at 2031. A PalmDay-style mitigation keeps Palm's internal
+// date in the supported range while showing a display year offset at selected
+// API/UI boundaries. The compile script only changes the embedded temporary ROM
+// when a profile-specific SHA-checked manifest entry matches the selected ROM.
+#define PALM_PALMDAY_PATCH_ENABLED 1
+#define PALM_PALMDAY_YEAR_OFFSET 56
+// When enabled, CompileEsp32Palm.ps1 fails the build if no SHA-checked PalmDay
+// patch entry matches the selected ROM.
+#define PALM_PALMDAY_ROM_PATCH_REQUIRED 1
+
+// Desired visible date for a fresh RAM/cold boot. If PalmDay is enabled, this
+// is converted to an internal Palm year by subtracting PALM_PALMDAY_YEAR_OFFSET.
+#define PALM_COLD_BOOT_DISPLAY_YEAR 2026
+#define PALM_COLD_BOOT_DISPLAY_MONTH 1
+#define PALM_COLD_BOOT_DISPLAY_DAY 1
+#define PALM_COLD_BOOT_DISPLAY_HOUR 0
+#define PALM_COLD_BOOT_DISPLAY_MINUTE 0
+#define PALM_COLD_BOOT_DISPLAY_SECOND 0
+
+// Calls Palm OS TimSetSeconds shortly after a fresh RAM boot. Restored snapshots
+// keep their saved Palm time and are advanced by the emulated RTC instead.
+#define PALM_COLD_BOOT_SEED_TIME_MANAGER 0
+#define PALM_COLD_BOOT_SEED_MIN_SLICES 250
+#define PALM_COLD_BOOT_SEED_RETRY_SLICES 40
+#define PALM_COLD_BOOT_SEED_MAX_ATTEMPTS 4

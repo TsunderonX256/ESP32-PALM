@@ -1,0 +1,60 @@
+{
+  "version": 1,
+  "notes": [
+    "Manifest-driven ROM patches for temporary ESP32 firmware ROM copies.",
+    "Original user ROM files are never modified.",
+    "PalmDay patch entries must be profile and ROM SHA-256 specific."
+  ],
+  "patchSets": [
+    {
+      "name": "PalmDay 56-year display offset for Palm IIIc 4.1 EN",
+      "enabled": true,
+      "feature": "PalmDay",
+      "profile": "IIIC_EXPERIMENTAL",
+      "romFileName": "Palm-IIIc-4.1-en.rom",
+      "sha256": "7868071640918296ebfef6e72b07e22e18a0804a8fceb52d4f8386f1d4a25183",
+      "notes": [
+        "Adds 56 to DateTemplateToAscii's year argument in a ROM code cave.",
+        "Adds 56 to SelectDay's initial and redraw year labels only; selected dates remain internal Palm years."
+      ],
+      "patches": [
+        {
+          "name": "DateTemplateToAscii entry jump",
+          "offset": "0x03A82E",
+          "expected": "48 E7 1F 38 28 6E 00 12",
+          "replace": "4E F9 10 DA BD 6C 4E 71"
+        },
+        {
+          "name": "DateTemplateToAscii +56 cave",
+          "offset": "0x1A3D6C",
+          "expected": "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00",
+          "replace": "06 6E 00 38 00 10 48 E7 1F 38 28 6E 00 12 4E F9 10 C4 28 36"
+        },
+        {
+          "name": "SelectDay redraw year-label jump",
+          "offset": "0x061AD4",
+          "expected": "30 6A 00 0C 2F 08",
+          "replace": "4E F9 10 DA BD 80"
+        },
+        {
+          "name": "SelectDay redraw year-label +56 cave",
+          "offset": "0x1A3D80",
+          "expected": "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00",
+          "replace": "70 00 30 2A 00 0C 06 40 00 38 2F 00 4E F9 10 C6 9A DA"
+        },
+        {
+          "name": "SelectDay initial year-label jump",
+          "offset": "0x061BA0",
+          "expected": "20 46 32 50 2F 09",
+          "replace": "4E F9 10 DA BD 94"
+        },
+        {
+          "name": "SelectDay initial year-label +56 cave",
+          "offset": "0x1A3D94",
+          "expected": "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00",
+          "replace": "70 00 30 10 06 40 00 38 2F 00 4E F9 10 C6 9B A6"
+        }
+      ]
+    }
+  ]
+}

@@ -13,18 +13,29 @@ $ErrorActionPreference = "Stop"
 
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 $configText = Get-Content -LiteralPath (Join-Path $repoRoot "palm_config.h") -Raw
+$hardwareProfile = "IIIX"
 if ([string]::IsNullOrWhiteSpace($RomFileName)) {
     if ($configText -match "PALM_HARDWARE_PROFILE\s+PALM_PROFILE_IIIC_EXPERIMENTAL") {
+        $hardwareProfile = "IIIC_EXPERIMENTAL"
         $RomFileName = "Palm-IIIc-4.1-en.rom"
     } elseif ($configText -match "PALM_HARDWARE_PROFILE\s+PALM_PROFILE_M100_EXPERIMENTAL") {
+        $hardwareProfile = "M100_EXPERIMENTAL"
         $RomFileName = "Palm-m100-3.51-en.rom"
     } else {
         $RomFileName = "Palm-IIIx-3.1.rom"
     }
+} elseif ($configText -match "PALM_HARDWARE_PROFILE\s+PALM_PROFILE_IIIC_EXPERIMENTAL") {
+    $hardwareProfile = "IIIC_EXPERIMENTAL"
+} elseif ($configText -match "PALM_HARDWARE_PROFILE\s+PALM_PROFILE_M100_EXPERIMENTAL") {
+    $hardwareProfile = "M100_EXPERIMENTAL"
 }
 $romFileName = $RomFileName
 $romPath = Join-Path $repoRoot $romFileName
 $partitionCsv = Join-Path $repoRoot "Tools\esp32_palm_16mb_partitions.csv"
+$romPatcher = Join-Path $repoRoot "Tools\PatchPalmRom.ps1"
+
+$palmDayPatchEnabled = $configText -match "#define\s+PALM_PALMDAY_PATCH_ENABLED\s+1\b"
+$palmDayPatchRequired = $configText -match "#define\s+PALM_PALMDAY_ROM_PATCH_REQUIRED\s+1\b"
 
 if ([string]::IsNullOrWhiteSpace($ArduinoCli)) {
     $ArduinoCli = Join-Path $env:LOCALAPPDATA "Programs\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe"
@@ -74,7 +85,40 @@ $currentRomPath = Join-Path $sketchRoot "palm_current.rom"
 if ($CodeCheckOnly) {
     [IO.File]::WriteAllBytes($currentRomPath, [byte[]](0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
 } else {
-    Copy-Item -LiteralPath $romPath -Destination $currentRomPath -Force
+    if ($palmDayPatchEnabled) {
+        $patchArgs = @(
+            "-ExecutionPolicy", "Bypass",
+            "-File", $romPatcher,
+            "-InputRom", $romPath,
+            "-OutputRom", $currentRomPath,
+            "-Feature", "PalmDay",
+            "-Profile", $hardwareProfile,
+            "-RomFileName", $romFileName
+        )
+        if ($palmDayPatchRequired) {
+            $patchArgs += "-Strict"
+        }
+        & powershell @patchArgs
+        if ($LASTEXITCODE -ne 0) {
+            throw "PalmDay ROM patcher failed with exit code $LASTEXITCODE."
+        }
+    } else {
+        Copy-Item -LiteralPath $romPath -Destination $currentRomPath -Force
+    }
+}
+
+$romAsmPath = Join-Path $sketchRoot "palm_rom.S"
+if (Test-Path -LiteralPath $romAsmPath) {
+    # palm_rom.S uses .incbin, and Arduino's dependency cache does not know that
+    # palm_current.rom is an input. Put the ROM SHA in a separate harmless section
+    # so the assembly source content changes whenever the selected or patched ROM
+    # changes, forcing the embedded ROM object to be rebuilt.
+    $romSha = (Get-FileHash -LiteralPath $currentRomPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    Add-Content -LiteralPath $romAsmPath -Value ""
+    Add-Content -LiteralPath $romAsmPath -Value '    .section .rodata.palm_rom_build_id, "a"'
+    Add-Content -LiteralPath $romAsmPath -Value '    .global palm_rom_build_id'
+    Add-Content -LiteralPath $romAsmPath -Value 'palm_rom_build_id:'
+    Add-Content -LiteralPath $romAsmPath -Value ('    .ascii "' + $romSha + '"')
 }
 
 Push-Location -LiteralPath $sketchRoot

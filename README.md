@@ -210,6 +210,16 @@ local `cyd_ref/005638_005638_Jingcai_ESP32_4827S043C_simple_GT911_touch.ino`
 reference. That profile uses Arduino_GFX for the 480x272 RGB panel, GT911 touch,
 an SD card for snapshots, and PSRAM for most Palm RAM.
 
+PalmDay mitigation is scaffolded in `palm_config.h` and `palm_palmday.h`.
+When `PALM_PALMDAY_PATCH_ENABLED` is set, `Tools/CompileEsp32Palm.ps1` runs
+`Tools/PatchPalmRom.ps1` against the temporary `palm_current.rom` copy before
+Arduino embeds it. Patch entries live in `Tools/PalmRomPatches.json` and must
+match the selected profile, ROM file name, SHA-256, offset, and expected bytes;
+the original user ROM is never modified. The current manifest includes a strict
+Palm IIIc 4.1 EN patch set for the local ROM SHA-256. Cold-boot
+`TimSetSeconds` seeding is intentionally disabled so Palm OS time is driven
+through emulated hardware/RTC behavior.
+
 The ESP32 path keeps:
 
 - a configurable low Palm RAM segment in internal DRAM via
