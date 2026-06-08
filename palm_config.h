@@ -86,18 +86,19 @@ typedef uint16_t PanelPixel;
 #define PALM_MIRROR_LOGICAL_RAM 1
 #define PALM_MEMORY_COMPATIBLE_ACCESS 0
 
-// PalmDay mitigation plumbing.
+// PalmDay mitigation plumbing. Keep disabled for the normal ESP32 performance
+// baseline; enable only when intentionally testing the future-date ROM patch.
 //
 // Palm OS stores DateType.year as an offset from 1904 with only 7 bits, so
 // native dates stop at 2031. A PalmDay-style mitigation keeps Palm's internal
 // date in the supported range while showing a display year offset at selected
 // API/UI boundaries. The compile script only changes the embedded temporary ROM
 // when a profile-specific SHA-checked manifest entry matches the selected ROM.
-#define PALM_PALMDAY_PATCH_ENABLED 1
+#define PALM_PALMDAY_PATCH_ENABLED 0
 #define PALM_PALMDAY_YEAR_OFFSET 56
 // When enabled, CompileEsp32Palm.ps1 fails the build if no SHA-checked PalmDay
 // patch entry matches the selected ROM.
-#define PALM_PALMDAY_ROM_PATCH_REQUIRED 1
+#define PALM_PALMDAY_ROM_PATCH_REQUIRED 0
 
 // Desired visible date for a fresh RAM/cold boot. If PalmDay is enabled, this
 // is converted to an internal Palm year by subtracting PALM_PALMDAY_YEAR_OFFSET.
