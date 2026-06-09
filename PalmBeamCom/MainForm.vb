@@ -35,13 +35,21 @@ Namespace PalmBeamCom
         Private irdaReceiveNext As Byte
         Private irdaTransmitNext As Byte
         Private irdaLastInformationResponse As Byte()
+        Private irdaLastInformationResponseData As Byte()
+        Private irdaLastInformationResponseSendSequence As Byte
         Private irdaLastInformationResponseLabel As String = ""
+        Private irdaLastInformationResponseAcked As Boolean
         Private irdaObexObjectName As String = ""
         Private irdaObexObjectType As String = ""
+        Private irdaObexObjectLength As Integer = -1
+        Private irdaObexLastProgressPercent As Integer = -1
         Private ReadOnly irdaObexBody As New List(Of Byte)
         Private ReadOnly irdaObexPacket As New List(Of Byte)
         Private irdaObexExpectedLength As Integer
         Private irdaObexClientLsap As Byte
+        Private irdaObexFragmentOffset As Integer = 3
+        Private irdaObexLastFragmentLogCount As Integer
+        Private irdaTinyTpPacketsSinceCreditGrant As Integer
         Private pendingIrdaResponse As Byte()
         Private pendingIrdaResponseLabel As String = ""
         Private pendingIrdaResponseDueTick As Long
@@ -62,6 +70,9 @@ Namespace PalmBeamCom
         Private irdaBeamRemoteObexLsap As Byte = IrdaObexLsap
         Private irdaBeamIasQueryIndex As Integer
         Private irdaBeamLastBodyProgressPercent As Integer = -1
+        Private irdaBeamBodyChunkSize As Integer = IrdaBeamDefaultBodyChunkSize
+        Private irdaBeamLastInformationFrame As Byte()
+        Private irdaBeamLastInformationLabel As String = ""
 
         Private Const IrdaSirBof As Byte = &HC0
         Private Const IrdaSirEof As Byte = &HC1
@@ -86,13 +97,22 @@ Namespace PalmBeamCom
         Private Const IrdaObexLsap As Byte = &H2
         Private Const IrdaHostAddress As UInteger = &H45535032UI
         Private Const IrdaTurnaroundDelayMs As Long = 20
+        Private Const IrdaLinkSetupTurnaroundDelayMs As Long = 0
         Private Const IrdaConnectedTurnaroundDelayMs As Long = 0
         Private Const IrdaTxQuietBeforeResponseMs As Long = 2
-        Private Const IrdaBeamBodyChunkSize As Integer = 40
+        Private Const IrdaTinyTpCreditGrant As Byte = &H10
+        Private Const IrdaTinyTpCreditLowWatermark As Integer = 8
+        Private Const IrdaBeamDefaultBodyChunkSize As Integer = 40
+        Private Const IrdaBeamMaxBodyChunkSize As Integer = 224
+        Private Const IrdaBeamBodyPacketOverhead As Integer = 9
+        Private Const IrdaIFieldSize64Bit As Byte = &H1
+        Private Const IrdaIFieldSize128Bit As Byte = &H2
+        Private Const IrdaIFieldSize256Bit As Byte = &H4
+        Private Const IrdaBeamOfferedIFieldSizeMask As Byte = IrdaIFieldSize64Bit Or IrdaIFieldSize128Bit Or IrdaIFieldSize256Bit
         Private Const IrdaBeamDiscoveryRetryMs As Long = 250
         Private Const IrdaBeamTimeoutMs As Long = 15000
         Private Const PalmMemoMaxBytes As Integer = 4096
-        Private Shared ReadOnly IrdaBeamObexIasClasses As String() = {"OBEX", "OBEX:IrXfer"}
+        Private Shared ReadOnly IrdaObexIasClasses As String() = {"OBEX", "OBEX:IrXfer", "OBEX:Default", "OBEX:Inbox"}
 
         Private NotInheritable Class IrdaPendingResponse
             Public Sub New(frameBytes As Byte(), labelText As String, dueTick As Long)
@@ -366,7 +386,7 @@ Namespace PalmBeamCom
 
         Private Sub HandleIrdaFrame(frame As Byte())
             If Not IrdaFrameHasValidFcs(frame) Then
-                Append("RX frame with bad FCS ignored.")
+                AppendDiag("RX frame with bad FCS ignored.")
                 Return
             End If
             If irdaBeamState <> IrdaBeamSendState.Idle AndAlso HandleIrdaBeamSenderFrame(frame) Then Return
@@ -384,6 +404,11 @@ Namespace PalmBeamCom
             If frame.Length >= 4 AndAlso irdaConnectionAddress <> 0 AndAlso
                 (frame(0) = irdaConnectionAddress OrElse frame(0) = (irdaConnectionAddress Or 1)) Then
                 HandleIrdaConnectedFrame(frame)
+                Return
+            End If
+
+            If fullDiagnosticsCheck.Checked Then
+                Append($"RX ignored frame addr=${frame(0):X2} ctrl=${If(frame.Length > 1, frame(1).ToString("X2", CultureInfo.InvariantCulture), "--")} len={Math.Max(0, frame.Length - 2)} data={FormatBytes(frame.Take(Math.Min(frame.Length, 32)))}")
             End If
         End Sub
 
@@ -416,7 +441,10 @@ Namespace PalmBeamCom
             irdaReceiveNext = 0
             irdaTransmitNext = 0
             irdaLastInformationResponse = Nothing
+            irdaLastInformationResponseData = Nothing
+            irdaLastInformationResponseSendSequence = 0
             irdaLastInformationResponseLabel = ""
+            irdaLastInformationResponseAcked = False
             Dim parameterCount = Math.Max(0, frame.Length - 13)
             Dim parameters As Byte() = Array.Empty(Of Byte)()
             If parameterCount > 0 Then
@@ -424,26 +452,64 @@ Namespace PalmBeamCom
                 Array.Copy(frame, 11, parameters, 0, parameterCount)
             End If
 
-            Append($"RX link request peer=${sourceAddress:X8}.")
-            SendIrdaUaResponse(sourceAddress, connectionAddress, NegotiateIrdaParameters(parameters))
+            Dim negotiatedParameters = NegotiateIrdaParameters(parameters)
+            AppendDiag($"RX link request peer=${sourceAddress:X8} ca=${connectionAddress:X2} params={FormatIrdaParameters(parameters)}.")
+            AppendDiag($"TX link response params={FormatIrdaParameters(negotiatedParameters)}.")
+            SendIrdaUaResponse(sourceAddress, connectionAddress, negotiatedParameters)
         End Sub
 
         Private Sub HandleIrdaConnectedFrame(frame As Byte())
             Dim control = frame(1)
+            If ShouldLogIrdaControlFrame(control) Then
+                AppendDiag($"RX link ctrl=${control:X2} ns={(control >> 1) And &H7} nr={(control >> 5) And &H7} len={Math.Max(0, frame.Length - 4)}.")
+            End If
+
             If IsIrdaInformationControl(control) Then
                 HandleIrdaInformationFrame(frame)
             ElseIf IsIrdaReceiveReadyControl(control) Then
-                SendIrdaReceiveReady("RR")
+                HandleIrdaReceiveReadyFrame(control)
             ElseIf control = IrdaDiscControl Then
+                AppendDiag("RX link disconnect.")
                 SendIrdaConnectedControl(IrdaUaResponseControl, "UA-DISC")
                 ResetIrdaConnectionState()
             End If
+        End Sub
+
+        Private Function ShouldLogIrdaControlFrame(control As Byte) As Boolean
+            If fullDiagnosticsCheck.Checked Then Return True
+            If control = IrdaDiscControl Then Return True
+            Return IsIrdaInformationControl(control)
+        End Function
+
+        Private Sub HandleIrdaReceiveReadyFrame(control As Byte)
+            HandleIrdaReceiveAck(control, True)
+        End Sub
+
+        Private Sub HandleIrdaReceiveAck(control As Byte, sendIdleReceiveReady As Boolean)
+            Dim receiveAck = CByte((control >> 5) And &H7)
+            If receiveAck = irdaTransmitNext Then
+                If irdaLastInformationResponse IsNot Nothing Then
+                    irdaLastInformationResponseAcked = True
+                ElseIf sendIdleReceiveReady Then
+                    SendIrdaReceiveReady("RR")
+                End If
+                Return
+            End If
+
+            If irdaLastInformationResponse IsNot Nothing Then
+                QueueIrdaInformationRetransmit($"{irdaLastInformationResponseLabel} RETX")
+                irdaLastInformationResponseAcked = False
+                Return
+            End If
+
+            If sendIdleReceiveReady Then SendIrdaReceiveReady("RR")
         End Sub
 
         Private Sub HandleIrdaInformationFrame(frame As Byte())
             If frame.Length < 6 Then Return
 
             Dim control = frame(1)
+            HandleIrdaReceiveAck(control, False)
             Dim sendSequence = CByte((control >> 1) And &H7)
             If sendSequence = irdaReceiveNext Then
                 irdaReceiveNext = CByte((irdaReceiveNext + 1) And &H7)
@@ -452,7 +518,8 @@ Namespace PalmBeamCom
                 Array.Copy(frame, 2, data, 0, dataLength)
                 If HandleIrdaInformationPayload(data) Then Return
             ElseIf irdaLastInformationResponse IsNot Nothing Then
-                QueueIrdaResponse(irdaLastInformationResponse, irdaLastInformationResponseLabel, IrdaConnectedTurnaroundDelayMs)
+                QueueIrdaInformationRetransmit(irdaLastInformationResponseLabel)
+                irdaLastInformationResponseAcked = False
                 Return
             End If
 
@@ -463,7 +530,7 @@ Namespace PalmBeamCom
             If data.Length >= 4 AndAlso (data(0) And IrdaControlBit) <> 0 AndAlso data(2) = IrdaLmpConnectCommand Then
                 Dim destinationLsap = CByte(data(0) And &H7F)
                 Dim sourceLsap = CByte(data(1) And &H7F)
-                Dim initialCredit As Byte = If(destinationLsap = IrdaObexLsap, CByte(&H10), CByte(0))
+                Dim initialCredit As Byte = If(destinationLsap = IrdaObexLsap, IrdaTinyTpCreditGrant, CByte(0))
                 Dim responseLength = If(initialCredit = 0, 4, 5)
                 Dim response(responseLength - 1) As Byte
                 response(0) = CByte(sourceLsap Or IrdaControlBit)
@@ -471,6 +538,7 @@ Namespace PalmBeamCom
                 response(2) = IrdaLmpConnectConfirm
                 response(3) = 0
                 If responseLength > 4 Then response(4) = initialCredit
+                If destinationLsap = IrdaObexLsap Then irdaTinyTpPacketsSinceCreditGrant = 0
                 SendIrdaInformationResponse(response, $"LMP-CONNECT-CNF dlsap=${sourceLsap:X2}")
                 Return True
             End If
@@ -488,40 +556,114 @@ Namespace PalmBeamCom
             Dim destinationLsap = CByte(data(0) And &H7F)
             Dim sourceLsap = CByte(data(1) And &H7F)
             If destinationLsap <> IrdaObexLsap Then Return False
+            irdaTinyTpPacketsSinceCreditGrant += 1
 
-            Dim obexOffset = 3
-            If irdaObexExpectedLength > 0 Then
-                If data.Length <= obexOffset Then Return False
-                AppendObexFragment(data, obexOffset, data.Length - obexOffset)
-                If irdaObexPacket.Count < irdaObexExpectedLength Then Return False
+            Dim obexOffset = FindReceiveObexOffset(data)
+            If obexOffset < 0 AndAlso irdaObexExpectedLength <= 0 Then Return False
+            If obexOffset < 0 Then obexOffset = FindReceiveObexContinuationOffset(data)
+            Dim cursor = obexOffset
+            Dim handledAny = False
 
-                Dim packet = irdaObexPacket.Take(irdaObexExpectedLength).ToArray()
-                irdaObexPacket.Clear()
-                irdaObexExpectedLength = 0
-                Return HandleCompleteObexPacket(packet, irdaObexClientLsap)
-            End If
+            While cursor < data.Length
+                If irdaObexExpectedLength > 0 Then
+                    Dim needed = irdaObexExpectedLength - irdaObexPacket.Count
+                    Dim available = data.Length - cursor
+                    If needed <= 0 Then
+                        irdaObexExpectedLength = 0
+                        irdaObexPacket.Clear()
+                        Continue While
+                    End If
 
-            If data.Length - obexOffset < 3 Then Return False
-            Dim packetLength = (CInt(data(obexOffset + 1)) << 8) Or data(obexOffset + 2)
-            If packetLength < 3 Then Return False
+                    Dim fragmentBytes = Math.Min(needed, available)
+                    If fragmentBytes <= 0 Then Exit While
 
-            If obexOffset + packetLength > data.Length Then
-                irdaObexExpectedLength = packetLength
-                irdaObexClientLsap = sourceLsap
-                irdaObexPacket.Clear()
-                AppendObexFragment(data, obexOffset, data.Length - obexOffset)
-                Return False
-            End If
+                    AppendObexFragment(data, cursor, fragmentBytes)
+                    cursor += fragmentBytes
+                    If irdaObexPacket.Count < irdaObexExpectedLength Then
+                        LogObexFragmentProgress(obexOffset)
+                        If ShouldGrantIrdaTinyTpCredit() Then
+                            SendIrdaTinyTpCredit(sourceLsap)
+                            handledAny = True
+                        End If
+                        Exit While
+                    End If
 
-            Dim completePacket(packetLength - 1) As Byte
-            Array.Copy(data, obexOffset, completePacket, 0, packetLength)
-            Return HandleCompleteObexPacket(completePacket, sourceLsap)
+                    Dim packet = irdaObexPacket.Take(irdaObexExpectedLength).ToArray()
+                    irdaObexPacket.Clear()
+                    irdaObexExpectedLength = 0
+                    irdaObexLastFragmentLogCount = 0
+                    handledAny = HandleCompleteObexPacket(packet, irdaObexClientLsap) OrElse handledAny
+                    Continue While
+                End If
+
+                If data.Length - cursor < 3 Then Exit While
+                Dim packetLength = (CInt(data(cursor + 1)) << 8) Or data(cursor + 2)
+                If packetLength < 3 Then Exit While
+
+                If cursor + packetLength > data.Length Then
+                    irdaObexExpectedLength = packetLength
+                    irdaObexClientLsap = sourceLsap
+                    irdaObexFragmentOffset = cursor
+                    irdaObexPacket.Clear()
+                    AppendObexFragment(data, cursor, data.Length - cursor)
+                    irdaObexLastFragmentLogCount = 0
+                    LogObexFragmentProgress(cursor)
+                    If ShouldGrantIrdaTinyTpCredit() Then
+                        SendIrdaTinyTpCredit(sourceLsap)
+                        handledAny = True
+                    End If
+                    Exit While
+                End If
+
+                Dim completePacket(packetLength - 1) As Byte
+                Array.Copy(data, cursor, completePacket, 0, packetLength)
+                handledAny = HandleCompleteObexPacket(completePacket, sourceLsap) OrElse handledAny
+                cursor += packetLength
+            End While
+
+            Return handledAny
+        End Function
+
+        Private Shared Function FindReceiveObexOffset(data As Byte()) As Integer
+            If data Is Nothing Then Return -1
+
+            For Each offset In New Integer() {3, 2}
+                If IsLikelyObexRequest(data, offset) Then Return offset
+            Next
+
+            Return -1
+        End Function
+
+        Private Function FindReceiveObexContinuationOffset(data As Byte()) As Integer
+            If data Is Nothing OrElse data.Length = 0 Then Return 0
+            If irdaObexFragmentOffset >= 0 AndAlso data.Length > irdaObexFragmentOffset Then Return irdaObexFragmentOffset
+            Return 0
+        End Function
+
+        Private Shared Function IsLikelyObexRequest(data As Byte(), offset As Integer) As Boolean
+            If data Is Nothing OrElse offset < 0 OrElse data.Length < offset + 3 Then Return False
+
+            Select Case data(offset)
+                Case &H2, &H80, &H81, &H82
+                    Dim packetLength = (CInt(data(offset + 1)) << 8) Or data(offset + 2)
+                    Return packetLength >= 3
+                Case Else
+                    Return False
+            End Select
         End Function
 
         Private Sub AppendObexFragment(data As Byte(), offset As Integer, count As Integer)
             For i = 0 To count - 1
                 irdaObexPacket.Add(data(offset + i))
             Next
+        End Sub
+
+        Private Sub LogObexFragmentProgress(offset As Integer)
+            If irdaObexExpectedLength <= 0 Then Return
+            If Not fullDiagnosticsCheck.Checked Then Return
+
+            irdaObexLastFragmentLogCount = irdaObexPacket.Count
+            Append($"OBEX fragment {irdaObexPacket.Count}/{irdaObexExpectedLength} offset={offset}.")
         End Sub
 
         Private Function HandleCompleteObexPacket(packet As Byte(), clientLsap As Byte) As Boolean
@@ -534,6 +676,8 @@ Namespace PalmBeamCom
                 Case &H80
                     irdaObexObjectName = ""
                     irdaObexObjectType = ""
+                    irdaObexObjectLength = -1
+                    irdaObexLastProgressPercent = -1
                     irdaObexBody.Clear()
                     Dim response = New Byte() {clientLsap, IrdaObexLsap, &H10, &HA0, &H0, &H7, &H10, &H0, &H4, &H0}
                     SendIrdaInformationResponse(response, "OBEX CONNECT OK")
@@ -542,9 +686,14 @@ Namespace PalmBeamCom
                     SendIrdaObexResponse(clientLsap, &HA0, "OBEX DISCONNECT OK")
                     irdaObexObjectName = ""
                     irdaObexObjectType = ""
+                    irdaObexObjectLength = -1
+                    irdaObexLastProgressPercent = -1
                     irdaObexBody.Clear()
                     irdaObexPacket.Clear()
                     irdaObexExpectedLength = 0
+                    irdaObexFragmentOffset = 3
+                    irdaObexLastFragmentLogCount = 0
+                    irdaTinyTpPacketsSinceCreditGrant = 0
                     Return True
                 Case &H2, &H82
                     HandleObexHeaders(packet, 3, packetLength)
@@ -556,13 +705,23 @@ Namespace PalmBeamCom
                     End If
                     Return True
                 Case Else
-                    Append($"OBEX opcode ${opcode:X2} ignored.")
+                    AppendDiag($"OBEX opcode ${opcode:X2} ignored.")
                     Return False
             End Select
         End Function
 
         Private Sub SendIrdaObexResponse(clientLsap As Byte, responseCode As Byte, label As String)
-            SendIrdaInformationResponse(New Byte() {clientLsap, IrdaObexLsap, &H10, responseCode, &H0, &H3}, label)
+            irdaTinyTpPacketsSinceCreditGrant = 0
+            SendIrdaInformationResponse(New Byte() {clientLsap, IrdaObexLsap, IrdaTinyTpCreditGrant, responseCode, &H0, &H3}, label)
+        End Sub
+
+        Private Function ShouldGrantIrdaTinyTpCredit() As Boolean
+            Return irdaTinyTpPacketsSinceCreditGrant >= IrdaTinyTpCreditLowWatermark
+        End Function
+
+        Private Sub SendIrdaTinyTpCredit(clientLsap As Byte)
+            irdaTinyTpPacketsSinceCreditGrant = 0
+            SendIrdaInformationResponse(New Byte() {clientLsap, IrdaObexLsap, IrdaTinyTpCreditGrant}, "TTP-CREDIT")
         End Sub
 
         Private Sub HandleObexHeaders(data As Byte(), startOffset As Integer, endOffset As Integer)
@@ -581,23 +740,44 @@ Namespace PalmBeamCom
 
                         If headerId = &H1 Then
                             irdaObexObjectName = DecodeObexUnicode(data, cursor, valueLength)
-                            Append($"RX name: {irdaObexObjectName}")
+                            AppendDiag($"RX name: {irdaObexObjectName}")
                         ElseIf headerId = &H42 Then
                             irdaObexObjectType = DecodeObexAscii(data, cursor, valueLength)
-                            Append($"RX type: {irdaObexObjectType}")
+                            AppendDiag($"RX type: {irdaObexObjectType}")
                         ElseIf headerId = &H48 OrElse headerId = &H49 Then
                             For i = 0 To valueLength - 1
                                 irdaObexBody.Add(data(cursor + i))
                             Next
-                            Append($"RX body bytes: {irdaObexBody.Count}")
+                            If fullDiagnosticsCheck.Checked Then Append($"RX body bytes: {irdaObexBody.Count}")
+                            LogReceiveProgress(headerId = &H49)
                         End If
                         cursor += valueLength
                     Case &H80
                         cursor += 1
                     Case &HC0
+                        If cursor + 4 > endOffset Then Exit While
+                        If headerId = &HC3 Then
+                            Dim lengthValue = ReadU32(data, cursor)
+                            If lengthValue <= CUInt(Integer.MaxValue) Then irdaObexObjectLength = CInt(lengthValue)
+                            irdaObexLastProgressPercent = -1
+                            AppendQuiet($"Receiving {If(String.IsNullOrWhiteSpace(irdaObexObjectName), "beam", irdaObexObjectName)} ({If(irdaObexObjectLength >= 0, irdaObexObjectLength.ToString(CultureInfo.InvariantCulture), "?")} bytes).")
+                        ElseIf fullDiagnosticsCheck.Checked Then
+                            Append($"RX OBEX header ${headerId:X2} value=${ReadU32(data, cursor):X8}")
+                        End If
                         cursor += 4
                 End Select
             End While
+        End Sub
+
+        Private Sub LogReceiveProgress(finalChunk As Boolean)
+            If irdaObexObjectLength <= 0 Then Return
+
+            Dim percent = CInt(Math.Floor((irdaObexBody.Count * 100.0R) / Math.Max(1, irdaObexObjectLength)))
+            Dim progressPercent = If(finalChunk OrElse irdaObexBody.Count >= irdaObexObjectLength, 100, Math.Min(100, (percent \ 5) * 5))
+            If progressPercent >= 5 AndAlso progressPercent > irdaObexLastProgressPercent Then
+                irdaObexLastProgressPercent = progressPercent
+                AppendQuiet($"Receive {progressPercent}% ({irdaObexBody.Count}/{irdaObexObjectLength} bytes).")
+            End If
         End Sub
 
         Private Sub SaveIrdaObexObject()
@@ -607,6 +787,7 @@ Namespace PalmBeamCom
 
             Dim fileName = If(String.IsNullOrWhiteSpace(irdaObexObjectName), $"beam_{DateTime.Now:yyyyMMdd_HHmmss}.bin", irdaObexObjectName)
             fileName = SanitizeFileName(fileName)
+            fileName = AddPalmBeamExtension(fileName, irdaObexObjectType)
             Dim outputPath = UniquePath(Path.Combine(capturePath, fileName))
             File.WriteAllBytes(outputPath, irdaObexBody.ToArray())
             Append($"Saved {Path.GetFileName(outputPath)} ({irdaObexBody.Count} bytes).")
@@ -642,8 +823,8 @@ Namespace PalmBeamCom
             If parameters.Length > 0 Then Array.Copy(parameters, 0, payload, 10, parameters.Length)
 
             pendingIrdaResponse = BuildIrdaSirFrame(payload)
-            pendingIrdaResponseLabel = $"UA ca=${connectionAddress:X2}"
-            pendingIrdaResponseDueTick = Environment.TickCount64 + IrdaTurnaroundDelayMs
+            pendingIrdaResponseLabel = $"UA ca=${connectionAddress:X2} payload={FormatBytes(payload)}"
+            pendingIrdaResponseDueTick = Environment.TickCount64 + IrdaLinkSetupTurnaroundDelayMs
         End Sub
 
         Private Shared Function NegotiateIrdaParameters(requested As Byte()) As Byte()
@@ -659,17 +840,52 @@ Namespace PalmBeamCom
 
                 Select Case pi
                     Case &H1
-                        If length >= 1 Then negotiated(valueIndex) = CByte(negotiated(valueIndex) And &H2)
+                        If length >= 1 Then negotiated(valueIndex) = PickIrdaParameterMask(negotiated(valueIndex), &H2, &H1, &H4, &H8, &H10, &H20)
                     Case &H83
-                        If length >= 1 Then negotiated(valueIndex) = CByte(negotiated(valueIndex) And &H1)
+                        If length >= 1 Then negotiated(valueIndex) = PickIrdaParameterMask(negotiated(valueIndex), IrdaIFieldSize64Bit, IrdaIFieldSize128Bit, IrdaIFieldSize256Bit)
                     Case &H84
-                        If length >= 1 Then negotiated(valueIndex) = CByte(negotiated(valueIndex) And &H1)
+                        If length >= 1 Then negotiated(valueIndex) = PickIrdaParameterMask(negotiated(valueIndex), &H1)
                 End Select
 
                 index += 2 + length
             End While
 
             Return negotiated
+        End Function
+
+        Private Shared Function PickIrdaParameterMask(requestedMask As Byte, ParamArray preferredMasks As Byte()) As Byte
+            For Each preferred In preferredMasks
+                If (requestedMask And preferred) <> 0 Then Return preferred
+            Next
+
+            For bit = 7 To 0 Step -1
+                Dim mask = CByte(1 << bit)
+                If (requestedMask And mask) <> 0 Then Return mask
+            Next
+
+            Return requestedMask
+        End Function
+
+        Private Shared Function FormatIrdaParameters(parameters As Byte()) As String
+            If parameters Is Nothing OrElse parameters.Length = 0 Then Return "(none)"
+
+            Dim parts As New List(Of String)
+            Dim cursor = 0
+            While cursor + 2 < parameters.Length
+                Dim parameterId = parameters(cursor)
+                Dim length = parameters(cursor + 1)
+                Dim valueOffset = cursor + 2
+                If valueOffset + length > parameters.Length Then
+                    parts.Add($"${parameterId:X2}=truncated")
+                    Exit While
+                End If
+
+                parts.Add($"${parameterId:X2}:{FormatBytes(parameters.Skip(valueOffset).Take(length))}")
+                cursor += 2 + length
+            End While
+
+            If cursor < parameters.Length Then parts.Add($"tail:{FormatBytes(parameters.Skip(cursor))}")
+            Return String.Join(" ", parts)
         End Function
 
         Private Sub SendIrdaConnectedControl(control As Byte, label As String)
@@ -685,19 +901,36 @@ Namespace PalmBeamCom
         Private Sub SendIrdaInformationResponse(data As Byte(), label As String)
             If irdaConnectionAddress = 0 Then Return
 
-            Dim control = CByte(IrdaFinalBit Or ((irdaTransmitNext And &H7) << 1) Or ((irdaReceiveNext And &H7) << 5))
-            Dim payload(2 + data.Length - 1) As Byte
-            payload(0) = irdaConnectionAddress
-            payload(1) = control
-            Array.Copy(data, 0, payload, 2, data.Length)
-
+            Dim sendSequence = irdaTransmitNext
+            Dim payload = BuildIrdaInformationPayload(data, sendSequence)
             Dim frame = BuildIrdaSirFrame(payload)
-            Dim responseLabel = $"{label} ctrl=${control:X2}"
+            Dim responseLabel = $"{label} ctrl=${payload(1):X2}"
             irdaTransmitNext = CByte((irdaTransmitNext + 1) And &H7)
             irdaLastInformationResponse = frame
+            irdaLastInformationResponseData = CType(data.Clone(), Byte())
+            irdaLastInformationResponseSendSequence = sendSequence
             irdaLastInformationResponseLabel = responseLabel
+            irdaLastInformationResponseAcked = False
             QueueIrdaResponse(frame, responseLabel, IrdaConnectedTurnaroundDelayMs)
         End Sub
+
+        Private Sub QueueIrdaInformationRetransmit(label As String)
+            If irdaLastInformationResponseData Is Nothing Then Return
+
+            Dim payload = BuildIrdaInformationPayload(irdaLastInformationResponseData, irdaLastInformationResponseSendSequence)
+            irdaLastInformationResponse = BuildIrdaSirFrame(payload)
+            QueueIrdaResponse(irdaLastInformationResponse, $"{label} ctrl=${payload(1):X2}", IrdaConnectedTurnaroundDelayMs)
+        End Sub
+
+        Private Function BuildIrdaInformationPayload(data As Byte(), sendSequence As Byte) As Byte()
+            Dim safeData = If(data, Array.Empty(Of Byte)())
+            Dim control = CByte(IrdaFinalBit Or ((sendSequence And &H7) << 1) Or ((irdaReceiveNext And &H7) << 5))
+            Dim payload(2 + safeData.Length - 1) As Byte
+            payload(0) = irdaConnectionAddress
+            payload(1) = control
+            Array.Copy(safeData, 0, payload, 2, safeData.Length)
+            Return payload
+        End Function
 
         Private Sub QueueIrdaResponse(frame As Byte(), label As String, delayMs As Long)
             pendingIrdaResponses.Enqueue(New IrdaPendingResponse(frame, label, Environment.TickCount64 + delayMs))
@@ -776,36 +1009,44 @@ Namespace PalmBeamCom
         Private Function HandleIrdaBeamSenderFrame(frame As Byte()) As Boolean
             If frame.Length < 2 Then Return False
             If fullDiagnosticsCheck.Checked OrElse irdaBeamState <> IrdaBeamSendState.ObexPutBody Then
-                Append($"RX beam state={irdaBeamState} addr=${frame(0):X2} ctrl=${frame(1):X2} len={frame.Length}.")
+                AppendDiag($"RX beam state={irdaBeamState} addr=${frame(0):X2} ctrl=${frame(1):X2} len={frame.Length}.")
             End If
 
             If irdaBeamState = IrdaBeamSendState.Discover AndAlso
                 frame.Length >= 13 AndAlso frame(0) = IrdaDiscoveryResponseAddress AndAlso frame(1) = IrdaXidResponseControl Then
                 irdaBeamPeerAddress = ReadU32(frame, 3)
                 irdaBeamLastProgressTick = Environment.TickCount64
-                Append($"Beam peer found: ${irdaBeamPeerAddress:X8}.")
+                AppendDiag($"Beam peer found: ${irdaBeamPeerAddress:X8}.")
                 irdaBeamState = IrdaBeamSendState.Snrm
                 SendIrdaBeamSnrm()
                 Return True
             End If
 
             If irdaBeamState = IrdaBeamSendState.Snrm AndAlso frame.Length >= 2 AndAlso frame(1) = IrdaUaResponseControl Then
+                ConfigureIrdaBeamBodyChunkSize(frame)
                 irdaBeamReceiveNext = 0
                 irdaBeamTransmitNext = 0
                 irdaBeamLastProgressTick = Environment.TickCount64
-                Append("Beam link established.")
+                AppendDiag($"Beam link established. Body chunk {irdaBeamBodyChunkSize} bytes.")
                 irdaBeamState = IrdaBeamSendState.IasConnect
                 SendIrdaBeamInformation(BuildLmpConnectPayload(0, 1, 0), "IAS-CONNECT")
                 Return True
             End If
 
             If frame(0) <> irdaBeamConnectionAddress AndAlso frame(0) <> (irdaBeamConnectionAddress Or 1) Then
-                Append($"Beam ignored frame state={irdaBeamState}: {FormatBytes(frame.Take(Math.Min(frame.Length, 24)))}")
+                AppendDiag($"Beam ignored frame state={irdaBeamState}: {FormatBytes(frame.Take(Math.Min(frame.Length, 24)))}")
                 Return False
             End If
             Dim control = frame(1)
             If IsIrdaReceiveReadyControl(control) Then
                 irdaBeamLastProgressTick = Environment.TickCount64
+                Dim receiveAck = CByte((control >> 5) And &H7)
+                If receiveAck = irdaBeamTransmitNext Then
+                    irdaBeamLastInformationFrame = Nothing
+                    irdaBeamLastInformationLabel = ""
+                ElseIf irdaBeamLastInformationFrame IsNot Nothing Then
+                    WriteSerial(irdaBeamLastInformationFrame, $"{irdaBeamLastInformationLabel} RETX")
+                End If
                 Return True
             End If
             If control = IrdaDiscControl Then
@@ -816,7 +1057,12 @@ Namespace PalmBeamCom
             If Not IsIrdaInformationControl(control) OrElse frame.Length < 6 Then Return True
 
             Dim sendSequence = CByte((control >> 1) And &H7)
-            If sendSequence = irdaBeamReceiveNext Then irdaBeamReceiveNext = CByte((irdaBeamReceiveNext + 1) And &H7)
+            If sendSequence <> irdaBeamReceiveNext Then
+                SendIrdaBeamReceiveReady("BEAM-RR-DUP")
+                Return True
+            End If
+
+            irdaBeamReceiveNext = CByte((irdaBeamReceiveNext + 1) And &H7)
             Dim dataLength = frame.Length - 4
             Dim data(dataLength - 1) As Byte
             Array.Copy(frame, 2, data, 0, dataLength)
@@ -829,67 +1075,67 @@ Namespace PalmBeamCom
             Select Case irdaBeamState
                 Case IrdaBeamSendState.IasConnect
                     If data.Length >= 4 AndAlso (data(0) And &H7F) = 1 AndAlso data(2) = IrdaLmpConnectConfirm Then
-                        Append("Beam IAS connected; querying OBEX LSAP.")
+                        AppendDiag("Beam IAS connected; querying OBEX LSAP.")
                         irdaBeamState = IrdaBeamSendState.IasQuery
                         irdaBeamIasQueryIndex = 0
                         SendNextIrdaBeamIasQuery()
                     Else
-                        Append($"Beam unexpected IAS response: {FormatBytes(data.Take(Math.Min(data.Length, 16)))}")
+                        AppendDiag($"Beam unexpected IAS response: {FormatBytes(data.Take(Math.Min(data.Length, 16)))}")
                     End If
                 Case IrdaBeamSendState.IasQuery
                     Dim lsap As Byte = 0
                     If TryParseIasLsapResponse(data, lsap) Then
                         irdaBeamRemoteObexLsap = lsap
-                        Append($"Beam IAS returned OBEX LSAP=${irdaBeamRemoteObexLsap:X2}; connecting OBEX.")
+                        AppendDiag($"Beam IAS returned OBEX LSAP=${irdaBeamRemoteObexLsap:X2}; connecting OBEX.")
                         irdaBeamState = IrdaBeamSendState.ObexLmpConnect
                         SendIrdaBeamInformation(BuildLmpConnectPayload(irdaBeamRemoteObexLsap, 3, &H10), "OBEX-LMP-CONNECT")
                     ElseIf data.Length >= 4 AndAlso (data(2) And &H7F) = IrdaIasGetValueByClass Then
-                        Append($"Beam IAS query rejected status=${data(3):X2}: {FormatBytes(data.Take(Math.Min(data.Length, 24)))}")
-                        If Not SendNextIrdaBeamIasQuery() Then Append("Beam IAS query exhausted.")
+                        AppendDiag($"Beam IAS query rejected status=${data(3):X2}: {FormatBytes(data.Take(Math.Min(data.Length, 24)))}")
+                        If Not SendNextIrdaBeamIasQuery() Then AppendDiag("Beam IAS query exhausted.")
                     Else
-                        Append($"Beam unexpected IAS query response: {FormatBytes(data.Take(Math.Min(data.Length, 24)))}")
+                        AppendDiag($"Beam unexpected IAS query response: {FormatBytes(data.Take(Math.Min(data.Length, 24)))}")
                     End If
                 Case IrdaBeamSendState.ObexLmpConnect
                     If data.Length >= 4 AndAlso data(2) = IrdaLmpConnectConfirm Then
-                        Append("Beam OBEX link connected.")
+                        AppendDiag("Beam OBEX link connected.")
                         irdaBeamState = IrdaBeamSendState.ObexConnect
                         SendIrdaBeamInformation(WrapTinyTpObex(BuildObexConnectPacket()), "OBEX-CONNECT")
                     Else
-                        Append($"Beam unexpected OBEX link response: {FormatBytes(data.Take(Math.Min(data.Length, 16)))}")
+                        AppendDiag($"Beam unexpected OBEX link response: {FormatBytes(data.Take(Math.Min(data.Length, 16)))}")
                     End If
                 Case IrdaBeamSendState.ObexConnect
                     If IsObexResponse(data, &HA0) Then
-                        Append("Beam OBEX connected; sending metadata.")
+                        AppendDiag("Beam OBEX connected; sending metadata.")
                         irdaBeamState = IrdaBeamSendState.ObexPutMeta
                         SendIrdaBeamPutMetadata()
                     Else
-                        Append($"Beam unexpected OBEX connect response: {FormatBytes(data.Take(Math.Min(data.Length, 16)))}")
+                        AppendDiag($"Beam unexpected OBEX connect response: {FormatBytes(data.Take(Math.Min(data.Length, 16)))}")
                     End If
                 Case IrdaBeamSendState.ObexPutMeta
                     If IsObexResponse(data, &H90) OrElse IsObexResponse(data, &HA0) Then
-                        Append("Beam metadata accepted; sending file body.")
+                        AppendDiag("Beam metadata accepted; sending file body.")
                         irdaBeamState = IrdaBeamSendState.ObexPutBody
                         SendIrdaBeamNextBodyChunk()
                     Else
-                        Append($"Beam unexpected metadata response: {FormatBytes(data.Take(Math.Min(data.Length, 16)))}")
+                        AppendDiag($"Beam unexpected metadata response: {FormatBytes(data.Take(Math.Min(data.Length, 16)))}")
                     End If
                 Case IrdaBeamSendState.ObexPutBody
                     If IsObexResponse(data, &H90) Then
                         SendIrdaBeamNextBodyChunk()
                     ElseIf IsObexResponse(data, &HA0) Then
-                        If fullDiagnosticsCheck.Checked Then Append("Beam body accepted; disconnecting.")
+                        AppendDiag("Beam body accepted; disconnecting.")
                         irdaBeamState = IrdaBeamSendState.ObexDisconnect
                         SendIrdaBeamInformation(WrapTinyTpObex(New Byte() {&H81, &H0, &H3}), "OBEX-DISCONNECT")
                     ElseIf fullDiagnosticsCheck.Checked Then
-                        Append($"Beam unexpected body response: {FormatBytes(data.Take(Math.Min(data.Length, 16)))}")
+                        AppendDiag($"Beam unexpected body response: {FormatBytes(data.Take(Math.Min(data.Length, 16)))}")
                     End If
                 Case IrdaBeamSendState.ObexDisconnect
                     If IsObexResponse(data, &HA0) Then
-                        Append("Beam OBEX disconnected.")
+                        AppendDiag("Beam OBEX disconnected.")
                         irdaBeamState = IrdaBeamSendState.LinkDisconnect
                         SendIrdaBeamControl(IrdaDiscControl, "BEAM-DISC")
                     Else
-                        Append($"Beam unexpected disconnect response: {FormatBytes(data.Take(Math.Min(data.Length, 16)))}")
+                        AppendDiag($"Beam unexpected disconnect response: {FormatBytes(data.Take(Math.Min(data.Length, 16)))}")
                     End If
             End Select
         End Sub
@@ -915,7 +1161,7 @@ Namespace PalmBeamCom
             Dim parameters = New Byte() {
                 &H1, &H1, &H2,
                 &H82, &H1, &H1,
-                &H83, &H1, &H1,
+                &H83, &H1, IrdaBeamOfferedIFieldSizeMask,
                 &H84, &H1, &H1,
                 &H85, &H1, &H8,
                 &H86, &H1, &H7,
@@ -937,8 +1183,12 @@ Namespace PalmBeamCom
             payload(0) = CByte(irdaBeamConnectionAddress Or 1)
             payload(1) = control
             Array.Copy(data, 0, payload, 2, data.Length)
+            Dim frame = BuildIrdaSirFrame(payload)
+            irdaBeamLastInformationFrame = frame
+            irdaBeamLastInformationLabel = $"{label} ctrl=${control:X2}"
             irdaBeamTransmitNext = CByte((irdaBeamTransmitNext + 1) And &H7)
-            SendIrdaBeamPayload(payload, $"{label} ctrl=${control:X2}")
+            WriteSerial(frame, irdaBeamLastInformationLabel)
+            irdaBeamLastProgressTick = Environment.TickCount64
         End Sub
 
         Private Sub SendIrdaBeamControl(control As Byte, label As String)
@@ -953,6 +1203,11 @@ Namespace PalmBeamCom
             Dim frame = BuildIrdaSirFrame(payload)
             WriteSerial(frame, label)
             irdaBeamLastProgressTick = Environment.TickCount64
+        End Sub
+
+        Private Sub SendIrdaBeamReceiveReady(label As String)
+            Dim control = CByte(IrdaRrPollFinalControl Or ((irdaBeamReceiveNext And &H7) << 5))
+            SendIrdaBeamControl(control, label)
         End Sub
 
         Private Sub SendIrdaBeamPutMetadata()
@@ -984,7 +1239,7 @@ Namespace PalmBeamCom
                 Return
             End If
 
-            Dim chunk = Math.Min(IrdaBeamBodyChunkSize, remaining)
+            Dim chunk = Math.Min(irdaBeamBodyChunkSize, remaining)
             Dim body(chunk - 1) As Byte
             Array.Copy(irdaBeamFileBytes, irdaBeamOffset, body, 0, chunk)
             irdaBeamOffset += chunk
@@ -997,8 +1252,8 @@ Namespace PalmBeamCom
         Private Function BuildIrdaBeamBodyProgressLabel(finalChunk As Boolean) As String
             If irdaBeamFileBytes Is Nothing OrElse irdaBeamFileBytes.Length = 0 Then Return "OBEX-PUT-BODY 100%"
 
-            Dim totalPackets = CInt(Math.Ceiling(irdaBeamFileBytes.Length / CDbl(IrdaBeamBodyChunkSize)))
-            Dim sentPackets = CInt(Math.Ceiling(irdaBeamOffset / CDbl(IrdaBeamBodyChunkSize)))
+            Dim totalPackets = CInt(Math.Ceiling(irdaBeamFileBytes.Length / CDbl(irdaBeamBodyChunkSize)))
+            Dim sentPackets = CInt(Math.Ceiling(irdaBeamOffset / CDbl(irdaBeamBodyChunkSize)))
             Dim percent = CInt(Math.Floor((sentPackets * 100.0R) / Math.Max(1, totalPackets)))
             Dim progressPercent = If(finalChunk, 100, Math.Min(100, (percent \ 5) * 5))
 
@@ -1017,6 +1272,8 @@ Namespace PalmBeamCom
             irdaFrameBuffer.Clear()
             irdaInFrame = False
             irdaEscaped = False
+            irdaRespondedInDiscovery = False
+            irdaLastDiscoverySource = 0
             pendingIrdaResponse = Nothing
             pendingIrdaResponses.Clear()
             ResetIrdaConnectionState()
@@ -1028,13 +1285,21 @@ Namespace PalmBeamCom
             irdaReceiveNext = 0
             irdaTransmitNext = 0
             irdaLastInformationResponse = Nothing
+            irdaLastInformationResponseData = Nothing
+            irdaLastInformationResponseSendSequence = 0
             irdaLastInformationResponseLabel = ""
+            irdaLastInformationResponseAcked = False
             irdaObexObjectName = ""
             irdaObexObjectType = ""
+            irdaObexObjectLength = -1
+            irdaObexLastProgressPercent = -1
             irdaObexBody.Clear()
             irdaObexPacket.Clear()
             irdaObexExpectedLength = 0
             irdaObexClientLsap = 0
+            irdaObexFragmentOffset = 3
+            irdaObexLastFragmentLogCount = 0
+            irdaTinyTpPacketsSinceCreditGrant = 0
             irdaTxQuietSinceTick = 0
         End Sub
 
@@ -1053,13 +1318,60 @@ Namespace PalmBeamCom
             irdaBeamRemoteObexLsap = IrdaObexLsap
             irdaBeamIasQueryIndex = 0
             irdaBeamLastBodyProgressPercent = -1
+            irdaBeamBodyChunkSize = IrdaBeamDefaultBodyChunkSize
+            irdaBeamLastInformationFrame = Nothing
+            irdaBeamLastInformationLabel = ""
         End Sub
+
+        Private Sub ConfigureIrdaBeamBodyChunkSize(uaFrame As Byte())
+            irdaBeamBodyChunkSize = IrdaBeamDefaultBodyChunkSize
+            If uaFrame Is Nothing OrElse uaFrame.Length <= 12 Then Return
+
+            Dim parametersLength = uaFrame.Length - 12
+            Dim selectedIFieldSize = ParseNegotiatedIFieldSize(uaFrame, 10, parametersLength)
+            If selectedIFieldSize <= 0 Then Return
+
+            Dim bodyChunkSize = Math.Max(IrdaBeamDefaultBodyChunkSize, selectedIFieldSize - IrdaBeamBodyPacketOverhead)
+            irdaBeamBodyChunkSize = Math.Min(IrdaBeamMaxBodyChunkSize, bodyChunkSize)
+        End Sub
+
+        Private Shared Function ParseNegotiatedIFieldSize(buffer As Byte(), offset As Integer, count As Integer) As Integer
+            Dim endOffset = Math.Min(buffer.Length - 2, offset + count)
+            Dim cursor = offset
+            While cursor + 2 < endOffset
+                Dim parameterId = buffer(cursor)
+                Dim length = buffer(cursor + 1)
+                Dim valueOffset = cursor + 2
+                If valueOffset + length > endOffset Then Exit While
+
+                If parameterId = &H83 AndAlso length >= 1 Then
+                    Return IFieldSizeFromMask(buffer(valueOffset))
+                End If
+
+                cursor += 2 + length
+            End While
+
+            Return 0
+        End Function
+
+        Private Shared Function IFieldSizeFromMask(mask As Byte) As Integer
+            If (mask And IrdaIFieldSize256Bit) <> 0 Then Return 256
+            If (mask And IrdaIFieldSize128Bit) <> 0 Then Return 128
+            If (mask And IrdaIFieldSize64Bit) <> 0 Then Return 64
+            Return 0
+        End Function
 
         Private Sub WriteSerial(bytes As Byte(), label As String)
             If serial Is Nothing OrElse Not serial.IsOpen OrElse bytes Is Nothing OrElse bytes.Length = 0 Then Return
             Try
                 serial.Write(bytes, 0, bytes.Length)
-                If ShouldLogSerialLabel(label) Then Append($"TX {label} ({bytes.Length} bytes).")
+                If ShouldLogSerialLabel(label) Then
+                    If fullDiagnosticsCheck.Checked Then
+                        Append($"TX {label} ({bytes.Length} bytes).")
+                    Else
+                        Append(FormatQuietSerialLabel(label))
+                    End If
+                End If
             Catch ex As Exception
                 Append($"TX failed: {ex.Message}")
             End Try
@@ -1067,8 +1379,29 @@ Namespace PalmBeamCom
 
         Private Function ShouldLogSerialLabel(label As String) As Boolean
             If label.StartsWith("BEAM-XID", StringComparison.Ordinal) Then Return False
-            If Not fullDiagnosticsCheck.Checked AndAlso label.StartsWith("OBEX-PUT-BODY ctrl=", StringComparison.Ordinal) Then Return False
-            Return True
+            If fullDiagnosticsCheck.Checked Then Return True
+
+            Return label.StartsWith("OBEX-PUT-BODY ", StringComparison.Ordinal) AndAlso
+                label.IndexOf("%", StringComparison.Ordinal) >= 0
+        End Function
+
+        Private Shared Function FormatQuietSerialLabel(label As String) As String
+            Const prefix = "OBEX-PUT-BODY "
+            If Not label.StartsWith(prefix, StringComparison.Ordinal) Then Return label
+
+            Dim percentEnd = label.IndexOf("%", StringComparison.Ordinal)
+            If percentEnd < 0 Then Return "Send progress."
+
+            Dim percentText = label.Substring(prefix.Length, percentEnd - prefix.Length + 1)
+            Dim bytesMarker = " bytes"
+            Dim bytesEnd = label.IndexOf(bytesMarker, StringComparison.Ordinal)
+            If bytesEnd < 0 Then Return $"Send {percentText}."
+
+            Dim commaBeforeBytes = label.LastIndexOf(", ", bytesEnd, StringComparison.Ordinal)
+            If commaBeforeBytes < 0 Then Return $"Send {percentText}."
+
+            Dim bytesText = label.Substring(commaBeforeBytes + 2, bytesEnd - commaBeforeBytes - 2)
+            Return $"Send {percentText} ({bytesText} bytes)."
         End Function
 
         Private Shared Function BuildLmpConnectPayload(destinationLsap As Byte, sourceLsap As Byte, initialCredit As Byte) As Byte()
@@ -1079,9 +1412,9 @@ Namespace PalmBeamCom
         End Function
 
         Private Function SendNextIrdaBeamIasQuery() As Boolean
-            If irdaBeamIasQueryIndex >= IrdaBeamObexIasClasses.Length Then Return False
+            If irdaBeamIasQueryIndex >= IrdaObexIasClasses.Length Then Return False
 
-            Dim className = IrdaBeamObexIasClasses(irdaBeamIasQueryIndex)
+            Dim className = IrdaObexIasClasses(irdaBeamIasQueryIndex)
             irdaBeamIasQueryIndex += 1
             SendIrdaBeamInformation(BuildIasObexQueryPayload(className), $"IAS-OBEX-QUERY {className}")
             Return True
@@ -1258,6 +1591,11 @@ Namespace PalmBeamCom
             Return (data(0) And &H7F) = 0 AndAlso (data(2) And &H7F) = IrdaIasGetValueByClass
         End Function
 
+        Private Shared Function IsSupportedIrdaObexIasQuery(className As String, attributeName As String) As Boolean
+            If Not String.Equals(attributeName, "IrDA:TinyTP:LsapSel", StringComparison.OrdinalIgnoreCase) Then Return False
+            Return IrdaObexIasClasses.Any(Function(name) String.Equals(name, className, StringComparison.OrdinalIgnoreCase))
+        End Function
+
         Private Sub SendIrdaIasGetValueByClassResponse(request As Byte())
             Dim className = ""
             Dim attributeName = ""
@@ -1277,6 +1615,12 @@ Namespace PalmBeamCom
             End If
 
             Dim clientLsap = CByte(request(1) And &H7F)
+            If Not IsSupportedIrdaObexIasQuery(className, attributeName) Then
+                Dim emptyResponse = New Byte() {clientLsap, 0, CByte(IrdaIasGetValueByClass Or IrdaIasLast), IrdaIasSuccess, 0, 0}
+                SendIrdaInformationResponse(emptyResponse, $"IAS {className}/{attributeName} no match")
+                Return
+            End If
+
             Dim response(12) As Byte
             response(0) = clientLsap
             response(1) = 0
@@ -1408,10 +1752,33 @@ Namespace PalmBeamCom
             Return sanitized
         End Function
 
+        Private Shared Function AddPalmBeamExtension(fileName As String, objectType As String) As String
+            If Not String.IsNullOrWhiteSpace(Path.GetExtension(fileName)) Then Return fileName
+
+            Select Case If(objectType, "").Trim().ToLowerInvariant()
+                Case "text/x-vcard", "text/vcard"
+                    Return fileName & ".vcf"
+                Case "text/x-vcalendar", "text/calendar"
+                    Return fileName & ".vcs"
+                Case "text/plain"
+                    Return fileName & ".txt"
+                Case Else
+                    Return fileName
+            End Select
+        End Function
+
         Private Shared Function FormatBytes(bytes As IEnumerable(Of Byte)) As String
             If bytes Is Nothing Then Return ""
             Return String.Join(" ", bytes.Select(Function(value) value.ToString("X2", CultureInfo.InvariantCulture)))
         End Function
+
+        Private Sub AppendDiag(message As String)
+            If fullDiagnosticsCheck.Checked Then Append(message)
+        End Sub
+
+        Private Sub AppendQuiet(message As String)
+            Append(message)
+        End Sub
 
         Private Sub Append(message As String)
             Dim line = $"{DateTime.Now:HH:mm:ss.fff}  {message}{Environment.NewLine}"
