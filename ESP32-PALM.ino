@@ -58,6 +58,8 @@ extern "C" void m68k_pulse_reset(void);
 #define TFT_DARKGREEN 0x7d27
 #define TFT_BUTTON_BITMAP_0 0x8631  // byte-swapped RGB565 for RGB(48,48,48)
 #define TFT_BUTTON_BITMAP_1 0x0C63  // byte-swapped RGB565 for RGB(96,96,96)
+#define TFT_BUTTON_SAVE_OK 0xE007  // byte-swapped RGB565 for RGB(0,255,0)
+#define TFT_BUTTON_SAVE_ERROR 0x00F8  // byte-swapped RGB565 for RGB(255,0,0)
 
 static constexpr uint32_t BACKLIGHT_PWM_HZ = 5000;
 static constexpr uint8_t BACKLIGHT_PWM_BITS = 8;
@@ -65,8 +67,9 @@ static constexpr uint8_t BACKLIGHT_DEFAULT_DUTY = 128;
 static constexpr uint8_t BACKLIGHT_PALM_MIN_DUTY = 26;   // 10%
 static constexpr uint8_t BACKLIGHT_PALM_MAX_DUTY = 128;  // 50%
 static constexpr uint8_t BACKLIGHT_SAVE_DUTY = 13;
-static constexpr unsigned long PALM_STATE_SAVE_HOLD_MS = 1000;
-static constexpr unsigned long PALM_OS_RESET_HOLD_MS = 1000;
+static constexpr unsigned long PALM_STATE_SAVE_HOLD_MS = 3000;
+static constexpr unsigned long PALM_OS_RESET_HOLD_MS = 3000;
+static constexpr unsigned long PALM_SAVE_RESULT_DISPLAY_MS = 3000;
 static constexpr unsigned long PALM_BUTTON_HOLD_RELEASE_GRACE_MS = 350;
 static constexpr int PALM_STATE_SAVE_SLEEP_PULSE_SLICES = 220;
 static constexpr int PALM_STATE_SAVE_WAKE_PULSE_SLICES = 220;
@@ -269,7 +272,10 @@ static constexpr uint16_t VIRTUAL_BUTTON_RESET_OS = 0x2000;
 static constexpr uint16_t VIRTUAL_BUTTON_SAVE_STATE = 0x4000;
 static constexpr uint16_t VIRTUAL_BUTTON_TOP_UNUSED = 0x8000;
 static constexpr uint16_t VIRTUAL_BUTTON_HOLD_MASK = VIRTUAL_BUTTON_RESET_OS |
-                                                     VIRTUAL_BUTTON_SAVE_STATE;
+                                                      VIRTUAL_BUTTON_SAVE_STATE;
+static constexpr uint8_t SAVE_BUTTON_RESULT_NONE = 0;
+static constexpr uint8_t SAVE_BUTTON_RESULT_OK = 1;
+static constexpr uint8_t SAVE_BUTTON_RESULT_ERROR = 2;
 static constexpr uint16_t VIRTUAL_BUTTON_HW_MASK = VIRTUAL_BUTTON_POWER |
                                                    VIRTUAL_BUTTON_HARD1 |
                                                    VIRTUAL_BUTTON_HARD2 |
@@ -721,6 +727,8 @@ static PanelPixel * volatile activePanelFrame = nullptr;
 static PanelPixel *pendingPanelFrame = nullptr;
 static volatile bool panelFrameBoundary = true;
 static bool panelStaticFramesReady = false;
+static volatile uint32_t panelStaticGeneration = 1;
+static uint32_t panelFrameStaticGeneration[2] = {0, 0};
 static uint8_t drawPanelFrameIndex = 0;
 #if PALM_HAS_SED1375 && PALM_SED1375_DECODE_ON_RENDER_CORE
 static constexpr uint32_t SED1375_RENDER_MAX_LINE_BYTES = 320;
@@ -751,6 +759,8 @@ static bool saveButtonHoldTriggered = false;
 static bool saveButtonReleaseRequired = false;
 static unsigned long saveButtonHoldStartMs = 0;
 static unsigned long saveButtonHoldLastLogMs = 0;
+static volatile uint8_t saveButtonResultState = SAVE_BUTTON_RESULT_NONE;
+static unsigned long saveButtonResultUntilMs = 0;
 static bool palmOsResetRequested = false;
 static bool palmOsResetInProgress = false;
 static bool resetButtonHoldActive = false;
@@ -1166,6 +1176,21 @@ static void panelDrawSystemBitmapIcon(PanelPixel *target, int x, int y, int w, i
   }
 }
 
+static void panelDrawSystemBitmapIconMask(PanelPixel *target, int x, int y, int w, int h,
+                                          const uint8_t *bits, uint16_t color) {
+  int ix = x + (w - SYSTEM_BUTTON_ICON_W) / 2;
+  int iy = y + (h - SYSTEM_BUTTON_ICON_H) / 2;
+
+  for (int py = 0; py < SYSTEM_BUTTON_ICON_H; ++py) {
+    for (int px = 0; px < SYSTEM_BUTTON_ICON_W; ++px) {
+      uint8_t rowByte = pgm_read_byte(bits + py * SYSTEM_BUTTON_ICON_STRIDE + px / 8);
+      if ((rowByte & (0x80 >> (px & 7))) != 0) {
+        panelFillRect(target, ix + px, iy + py, 1, 1, color);
+      }
+    }
+  }
+}
+
 static inline uint8_t silkscreenPixelIndex(int x, int y) {
   uint8_t packed = pgm_read_byte(kSilkscreenPixels4bpp +
                                  static_cast<uint32_t>(y) * SILKSCREEN_IMAGE_STRIDE +
@@ -1310,15 +1335,26 @@ static void renderVirtualPowerStrip(PanelPixel *target) {
   int saveY1 = (SCREEN_H * (VIRTUAL_SAVE_SLOT + 1)) / VIRTUAL_BUTTON_COUNT;
   int saveBy = saveY0 + inset;
   int saveBh = (saveY1 - saveY0) - inset * 2;
-  panelFillRect(target, bx, saveBy, bw, saveBh, TFT_BUTTON_BITMAP_0);
-  panelDrawSystemBitmapIcon(target, bx, saveBy, bw, saveBh, kBtnSavePngBits);
+  uint8_t saveResult = saveButtonResultState;
+  if (saveResult == SAVE_BUTTON_RESULT_OK) {
+    panelFillRect(target, bx, saveBy, bw, saveBh, TFT_BUTTON_SAVE_OK);
+  } else if (saveResult == SAVE_BUTTON_RESULT_ERROR) {
+    panelFillRect(target, bx, saveBy, bw, saveBh, TFT_BUTTON_SAVE_ERROR);
+  } else {
+    panelFillRect(target, bx, saveBy, bw, saveBh, TFT_BUTTON_BITMAP_0);
+  }
+  panelDrawSystemBitmapIconMask(target, bx, saveBy, bw, saveBh,
+                                kBtnSavePngBits,
+                                saveResult == SAVE_BUTTON_RESULT_NONE ?
+                                  TFT_BUTTON_BITMAP_1 : TFT_WHITE);
 
   int resetY0 = (SCREEN_H * VIRTUAL_RESET_SLOT) / VIRTUAL_BUTTON_COUNT;
   int resetY1 = (SCREEN_H * (VIRTUAL_RESET_SLOT + 1)) / VIRTUAL_BUTTON_COUNT;
   int resetBy = resetY0 + inset;
   int resetBh = (resetY1 - resetY0) - inset * 2;
   panelFillRect(target, bx, resetBy, bw, resetBh, TFT_BUTTON_BITMAP_0);
-  panelDrawSystemBitmapIcon(target, bx, resetBy, bw, resetBh, kBtnResetPngBits);
+  panelDrawSystemBitmapIconMask(target, bx, resetBy, bw, resetBh,
+                                kBtnResetPngBits, TFT_BUTTON_BITMAP_1);
 }
 
 static void renderPanelStaticFrameFromSurface(PanelPixel *target) {
@@ -1344,16 +1380,24 @@ static void publishPanelFrame() {
   decodeSed1375RenderSnapshotToSurface();
 #endif
   if (!panelStaticFramesReady) {
+    uint32_t staticGeneration = panelStaticGeneration;
     renderPanelStaticFrameFromSurface(panelFrames[0]);
     memcpy(panelFrames[1], panelFrames[0], SCREEN_W * SCREEN_H * sizeof(PanelPixel));
     activePanelFrame = panelFrames[0];
     drawPanelFrameIndex = 0;
+    panelFrameStaticGeneration[0] = staticGeneration;
+    panelFrameStaticGeneration[1] = staticGeneration;
     panelStaticFramesReady = true;
     ++renderFrames;
     return;
   }
 
   uint8_t nextIndex = drawPanelFrameIndex ^ 1;
+  if (panelFrameStaticGeneration[nextIndex] != panelStaticGeneration) {
+    renderVirtualButtonStrip(panelFrames[nextIndex]);
+    renderVirtualPowerStrip(panelFrames[nextIndex]);
+    panelFrameStaticGeneration[nextIndex] = panelStaticGeneration;
+  }
   renderPanelLcdFrameFromSurface(panelFrames[nextIndex]);
   pendingPanelFrame = panelFrames[nextIndex];
   if (activePanelFrame == nullptr) {
@@ -1422,6 +1466,14 @@ static void requestPanelRender() {
     return;
   }
   publishPanelFrame();
+}
+
+static void invalidatePanelStaticLayer() {
+  uint32_t nextGeneration = panelStaticGeneration + 1;
+  panelStaticGeneration = nextGeneration != 0 ? nextGeneration : 1;
+  if (panelStaticFramesReady && panelFrames[0] != nullptr && panelFrames[1] != nullptr) {
+    requestPanelRender();
+  }
 }
 
 static int mapClamped(int value, int inMin, int inMax, int outMin, int outMax) {
@@ -1625,6 +1677,16 @@ static void setVirtualButtonBits(uint16_t bits, int index, int rawX, int rawY) {
   virtualButtonIndexDown = bits != 0 ? index : -1;
 }
 
+static void setSaveButtonResult(uint8_t result, unsigned long now) {
+  if (result > SAVE_BUTTON_RESULT_ERROR) result = SAVE_BUTTON_RESULT_NONE;
+  unsigned long untilMs = result == SAVE_BUTTON_RESULT_NONE ?
+                          0 : now + PALM_SAVE_RESULT_DISPLAY_MS;
+  bool changed = saveButtonResultState != result;
+  saveButtonResultState = result;
+  saveButtonResultUntilMs = untilMs;
+  if (changed) invalidatePanelStaticLayer();
+}
+
 static void resetSaveButtonHold(bool clearReleaseGate = true) {
   if (saveButtonHoldActive || saveButtonHoldTriggered || saveButtonReleaseRequired) {
     PALM_HOLD_DBG_PRINTF("Save hold reset clearGate=%u active=%u trig=%u gate=%u raw=%d,%d\n",
@@ -1698,6 +1760,9 @@ static void updateSaveButtonHold(bool down, unsigned long now) {
     saveButtonHoldTriggered = false;
     saveButtonHoldStartMs = now;
     saveButtonHoldLastLogMs = now;
+    if (saveButtonResultState != SAVE_BUTTON_RESULT_NONE) {
+      setSaveButtonResult(SAVE_BUTTON_RESULT_NONE, now);
+    }
     PALM_HOLD_DBG_PRINTF("Save hold start raw=%d,%d\n", lastTouchRawX, lastTouchRawY);
     return;
   }
@@ -3413,6 +3478,8 @@ static void servicePalmStateSaveRequest() {
     setPanelOutputEnabled(false);
     setBacklightDuty(0);
   }
+  setSaveButtonResult((saveOk && wakeOk) ? SAVE_BUTTON_RESULT_OK : SAVE_BUTTON_RESULT_ERROR,
+                      millis());
   lastFrameMs = 0;
   touchInputDisabled = false;
   palmStateSaveInProgress = false;
@@ -3462,6 +3529,13 @@ static void servicePalmOsResetRequest() {
 
 static bool timeReached(unsigned long now, unsigned long target) {
   return static_cast<long>(now - target) >= 0;
+}
+
+static void serviceSaveButtonResultIndicator(unsigned long now) {
+  if (saveButtonResultState != SAVE_BUTTON_RESULT_NONE &&
+      timeReached(now, saveButtonResultUntilMs)) {
+    setSaveButtonResult(SAVE_BUTTON_RESULT_NONE, now);
+  }
 }
 
 static void executePalmCpuSlice(uint32_t cycles) {
@@ -3860,6 +3934,7 @@ void loop() {
   servicePalmUartBridge();
 
   unsigned long now = millis();
+  serviceSaveButtonResultIndicator(now);
   maybePrintWakeHeartbeat(now);
   maybePrintPerfStats(now);
   unsigned long nextFrameMs = lastFrameMs + PALM_LCD_REDRAW_INTERVAL_MS;
