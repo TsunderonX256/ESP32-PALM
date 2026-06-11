@@ -228,9 +228,12 @@ The ESP32 path keeps:
   RAM segment gets priority, with the rest in PSRAM
 - CPU/register/timer hot state in internal DRAM
 - ROM in flash
-- 16 MB flash layout with two 4 MB app slots and a FATFS partition
+- 16 MB flash layout with two large 7.94 MB OTA app slots and no internal
+  FATFS partition; ROMs and snapshots live on SD card
 - 10 FPS interval LCD updates, with only the 160x160 Palm LCD area refreshed
   dynamically
+- m100 DragonBall LCD rendering captures the compact LCD source bytes on the
+  main emulator core, then unpacks pixels and scales on the core-0 render task
 - optional indexed 8-bit RGB panel frame buffers with
   `PALM_PANEL_INDEXED_FRAMEBUFFER`. When enabled, the active and pending
   full-screen panel frames take about 261 KB instead of 522 KB; a small RGB565
@@ -244,7 +247,9 @@ The ESP32 path keeps:
 - GT911 touch mapped into the ADS/digitizer emulation
 - virtual app/up/down buttons on the left side of the panel
 - virtual power, save snapshot, and reset controls on the right side of the
-  panel
+  panel; holding reset for about 3 seconds triggers a Palm OS reset, and
+  keeping reset held for about 8 seconds switches to the other valid OTA
+  firmware slot and restarts
 - Palm OS m100 brightness/contrast writes mapped from `$A36 = 0x0180..0x01aa`
   to a 10-50% ESP32 backlight PWM range
 - m100 Port F bit `0x20` backlight state mapped to the LCD render palette, so
@@ -256,7 +261,11 @@ The ESP32 path keeps:
 - automatic restore from `/palm_m100_state.bin` on the SD card, with wake from
   saved sleep state
 - low-power Palm sleep mode that turns off the display/backlight, lowers CPU
-  frequency, and uses light sleep between 250 ms touch polls
+  frequency, and uses light sleep between 250 ms touch polls. On the
+  ESP32-4827S043C/ILI6485 test board, LCD standby is also wired through
+  GPIO17/STBYB: the firmware drives STBYB low while Palm OS is asleep and high
+  again before panel output resumes. This is display standby only; it does not
+  power-gate the whole LCD module or other board peripherals.
 - SD snapshot access is short-lived: the firmware mounts the card only for
   save/restore, then calls `SD.end()`, stops the SPI bus, holds CS high, and
   releases the SD SPI pins to input
@@ -308,6 +317,19 @@ Build and upload to the board on `COM4`:
 powershell -ExecutionPolicy Bypass -File .\Tools\CompileEsp32Palm.ps1 -Upload -Port COM4
 ```
 
+Build a specific profile without editing `palm_config.h`:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Tools\CompileEsp32Palm.ps1 -HardwareProfile M100_EXPERIMENTAL
+powershell -ExecutionPolicy Bypass -File .\Tools\CompileEsp32Palm.ps1 -HardwareProfile IIIC_EXPERIMENTAL
+```
+
+Flash only an app image into an OTA slot for the on-device firmware switcher:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Tools\CompileEsp32Palm.ps1 -HardwareProfile M100_EXPERIMENTAL -FlashAppSlot app1 -Port COM4
+```
+
 The helper copies the checkout to a temporary folder named `ESP32-PALM`, because
 Arduino CLI expects the sketch folder to match `ESP32-PALM.ino`. It also checks
 that the user-supplied `Palm-m100-3.51-en.rom` exists before compiling. For a
@@ -319,9 +341,14 @@ powershell -ExecutionPolicy Bypass -File .\Tools\CompileEsp32Palm.ps1 -CodeCheck
 
 The default helper build uses
 [Tools/esp32_palm_16mb_partitions.csv](Tools/esp32_palm_16mb_partitions.csv),
-a custom 16 MB layout with two 4 MB app slots and a 7.9 MB FATFS partition.
-This gives the speed-focused ESP32-S3 build more headroom than Arduino's
-standard `app3M_fat9M_16MB` layout.
+a custom 16 MB layout with two 7.94 MB OTA app slots, plus small `nvs`,
+`otadata`, and coredump partitions. It intentionally removes internal FATFS
+because the firmware uses SD card for ROM/state files and compiles static art
+into flash. This gives the speed-focused ESP32-S3 build more headroom than
+Arduino's standard `app3M_fat9M_16MB` layout and leaves enough room for separate
+m100/IIIc firmware images. The firmware switch action only changes the ESP32
+OTA boot metadata after verifying that the other OTA slot contains a valid app
+image; if the other slot is empty, the reset button briefly shows an error.
 
 The underlying Arduino CLI command is:
 

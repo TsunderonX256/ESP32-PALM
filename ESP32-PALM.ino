@@ -8,6 +8,8 @@
 #include <freertos/task.h>
 #include <esp_lcd_panel_rgb.h>
 #include <esp_lcd_panel_ops.h>
+#include <esp_ota_ops.h>
+#include <esp_partition.h>
 #include <esp_sleep.h>
 #if PALM_DISABLE_UNUSED_RADIOS
 #include <esp_bt.h>
@@ -34,6 +36,7 @@ extern "C" void m68k_pulse_reset(void);
 #endif
 
 #define TFT_BL        2
+#define ILI6485_STBYB 17
 #define GT911_SCL     20
 #define GT911_SDA     19
 #define GT911_INT     -1
@@ -69,6 +72,7 @@ static constexpr uint8_t BACKLIGHT_PALM_MAX_DUTY = 128;  // 50%
 static constexpr uint8_t BACKLIGHT_SAVE_DUTY = 13;
 static constexpr unsigned long PALM_STATE_SAVE_HOLD_MS = 3000;
 static constexpr unsigned long PALM_OS_RESET_HOLD_MS = 3000;
+static constexpr unsigned long PALM_FIRMWARE_SWITCH_HOLD_MS = 8000;
 static constexpr unsigned long PALM_SAVE_RESULT_DISPLAY_MS = 3000;
 static constexpr unsigned long PALM_BUTTON_HOLD_RELEASE_GRACE_MS = 350;
 static constexpr int PALM_STATE_SAVE_SLEEP_PULSE_SLICES = 220;
@@ -77,6 +81,7 @@ static constexpr unsigned long PALM_STATE_SAVE_SLEEP_SETTLE_MS = 1000;
 static constexpr unsigned long PALM_STATE_SAVE_SLEEP_TIMEOUT_MS = 4000;
 static constexpr uint32_t ESP32_ACTIVE_CPU_MHZ = 240;
 static constexpr uint32_t ESP32_PALM_SLEEP_CPU_MHZ = 80;
+static constexpr unsigned long ILI6485_STANDBY_EXIT_DELAY_MS = 120;
 static constexpr int32_t RGB_PANEL_PIXEL_CLOCK_HZ = 8000000;
 static constexpr bool RGB_PANEL_PCLK_ACTIVE_NEG = false;
 static constexpr int RGB_PANEL_HSYNC_FRONT_PORCH = 8;
@@ -197,6 +202,7 @@ static constexpr unsigned long TOUCH_STABLE_DOWN_MS = 8;
 static constexpr int TOUCH_STABLE_PALM_TOLERANCE = 12;
 static TaskHandle_t renderTaskHandle = nullptr;
 static SemaphoreHandle_t renderSurfaceMutex = nullptr;
+static bool ili6485StandbyActive = false;
 static volatile uint32_t renderFrames = 0;
 static uint32_t palmLcdViewToSourceX[PALM_LCD_VIEW_H];
 static uint32_t palmLcdViewToSourceY[PALM_LCD_VIEW_W];
@@ -276,6 +282,8 @@ static constexpr uint16_t VIRTUAL_BUTTON_HOLD_MASK = VIRTUAL_BUTTON_RESET_OS |
 static constexpr uint8_t SAVE_BUTTON_RESULT_NONE = 0;
 static constexpr uint8_t SAVE_BUTTON_RESULT_OK = 1;
 static constexpr uint8_t SAVE_BUTTON_RESULT_ERROR = 2;
+static constexpr uint8_t RESET_BUTTON_RESULT_NONE = 0;
+static constexpr uint8_t RESET_BUTTON_RESULT_ERROR = 1;
 static constexpr uint16_t VIRTUAL_BUTTON_HW_MASK = VIRTUAL_BUTTON_POWER |
                                                    VIRTUAL_BUTTON_HARD1 |
                                                    VIRTUAL_BUTTON_HARD2 |
@@ -746,6 +754,20 @@ static uint8_t *sed1375RenderVram = nullptr;
 static bool sed1375RenderVramInInternalRam = false;
 static Sed1375RenderSnapshot sed1375RenderSnapshot = {};
 #endif
+#if PALM_DRAGONBALL_DECODE_ON_RENDER_CORE
+static constexpr uint32_t DRAGONBALL_RENDER_MAX_LINE_BYTES = 320;
+static constexpr uint32_t DRAGONBALL_RENDER_MAX_BYTES = DRAGONBALL_RENDER_MAX_LINE_BYTES * PALM_LCD_H;
+struct DragonBallRenderSnapshot {
+  PalmLcdState lcd;
+  uint16_t palette565[16];
+  uint16_t drawW;
+  uint16_t drawH;
+  bool valid;
+};
+static uint8_t *dragonballRenderLcd = nullptr;
+static bool dragonballRenderLcdInInternalRam = false;
+static DragonBallRenderSnapshot dragonballRenderSnapshot = {};
+#endif
 static uint16_t virtualButtonBitsDown = 0;
 static int virtualButtonIndexDown = -1;
 static bool virtualTouchActive = false;
@@ -765,9 +787,14 @@ static bool palmOsResetRequested = false;
 static bool palmOsResetInProgress = false;
 static bool resetButtonHoldActive = false;
 static bool resetButtonHoldTriggered = false;
+static bool resetButtonFirmwareSwitchTriggered = false;
 static bool resetButtonReleaseRequired = false;
 static unsigned long resetButtonHoldStartMs = 0;
 static unsigned long resetButtonHoldLastLogMs = 0;
+static volatile uint8_t resetButtonResultState = RESET_BUTTON_RESULT_NONE;
+static unsigned long resetButtonResultUntilMs = 0;
+static bool firmwareSwitchRequested = false;
+static bool firmwareSwitchInProgress = false;
 static uint16_t latchedHoldButtonBits = 0;
 static int latchedHoldRawX = -1;
 static int latchedHoldRawY = -1;
@@ -811,6 +838,9 @@ static bool initRenderBuffers() {
 #if PALM_HAS_SED1375 && PALM_SED1375_DECODE_ON_RENDER_CORE
   if (palmSurface != nullptr && panelFrames[0] != nullptr && panelFrames[1] != nullptr &&
       sed1375RenderVram != nullptr) return true;
+#elif PALM_DRAGONBALL_DECODE_ON_RENDER_CORE
+  if (palmSurface != nullptr && panelFrames[0] != nullptr && panelFrames[1] != nullptr &&
+      dragonballRenderLcd != nullptr) return true;
 #else
   if (palmSurface != nullptr && panelFrames[0] != nullptr && panelFrames[1] != nullptr) return true;
 #endif
@@ -849,6 +879,18 @@ static bool initRenderBuffers() {
                                                                 MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
   }
 #endif
+#if PALM_DRAGONBALL_DECODE_ON_RENDER_CORE
+  dragonballRenderLcdInInternalRam = false;
+#if defined(MALLOC_CAP_SPIRAM)
+  dragonballRenderLcd = static_cast<uint8_t *>(heap_caps_malloc(DRAGONBALL_RENDER_MAX_BYTES,
+                                                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+#endif
+  if (dragonballRenderLcd == nullptr) {
+    dragonballRenderLcdInInternalRam = true;
+    dragonballRenderLcd = static_cast<uint8_t *>(heap_caps_malloc(DRAGONBALL_RENDER_MAX_BYTES,
+                                                                  MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  }
+#endif
 #else
   panelPaletteReset();
   palmSurface = static_cast<uint16_t *>(malloc(PALM_SURFACE_W * PALM_SURFACE_H * sizeof(uint16_t)));
@@ -858,10 +900,17 @@ static bool initRenderBuffers() {
   sed1375RenderVramInInternalRam = true;
   sed1375RenderVram = static_cast<uint8_t *>(malloc(SED1375_RENDER_MAX_BYTES));
 #endif
+#if PALM_DRAGONBALL_DECODE_ON_RENDER_CORE
+  dragonballRenderLcdInInternalRam = true;
+  dragonballRenderLcd = static_cast<uint8_t *>(malloc(DRAGONBALL_RENDER_MAX_BYTES));
+#endif
 #endif
   if (palmSurface == nullptr || panelFrames[0] == nullptr || panelFrames[1] == nullptr) return false;
 #if PALM_HAS_SED1375 && PALM_SED1375_DECODE_ON_RENDER_CORE
   if (sed1375RenderVram == nullptr) return false;
+#endif
+#if PALM_DRAGONBALL_DECODE_ON_RENDER_CORE
+  if (dragonballRenderLcd == nullptr) return false;
 #endif
   for (uint32_t i = 0; i < static_cast<uint32_t>(PALM_SURFACE_W) * PALM_SURFACE_H; ++i) {
     palmSurface[i] = TFT_WHITE;
@@ -900,6 +949,103 @@ static void buildLcdPalette(uint16_t *palette, uint8_t bpp, bool backlightOn) {
     palette[i] = gray565(backlightOn ? backlitShade : normalShade);
   }
 }
+
+#if PALM_DRAGONBALL_DECODE_ON_RENDER_CORE
+static bool captureDragonBallRenderSnapshot(const PalmLcdState &lcd, bool backlightOn) {
+  dragonballRenderSnapshot.valid = false;
+  if (dragonballRenderLcd == nullptr || !lcd.valid || lcd.bpp == 0 || lcd.bpp > 4 ||
+      lcd.bytesPerLine == 0 || lcd.bytesPerLine > DRAGONBALL_RENDER_MAX_LINE_BYTES) {
+    return false;
+  }
+
+  uint16_t drawW = min<uint16_t>(PALM_LCD_W, lcd.width);
+  uint16_t drawH = min<uint16_t>(PALM_LCD_H, lcd.height);
+  if (drawW == 0 || drawH == 0 ||
+      static_cast<uint32_t>(lcd.bytesPerLine) * drawH > DRAGONBALL_RENDER_MAX_BYTES) {
+    return false;
+  }
+
+  buildLcdPalette(dragonballRenderSnapshot.palette565, lcd.bpp, backlightOn);
+  for (uint16_t y = 0; y < drawH; ++y) {
+    uint32_t srcLine = lcd.startAddr + static_cast<uint32_t>(y) * lcd.bytesPerLine;
+    uint8_t *dst = dragonballRenderLcd + static_cast<uint32_t>(y) * lcd.bytesPerLine;
+    for (uint16_t x = 0; x < lcd.bytesPerLine; ++x) {
+      dst[x] = palmRead8(srcLine + x);
+    }
+  }
+
+  dragonballRenderSnapshot.lcd = lcd;
+  dragonballRenderSnapshot.drawW = drawW;
+  dragonballRenderSnapshot.drawH = drawH;
+  dragonballRenderSnapshot.valid = true;
+  return true;
+}
+
+static void decodeDragonBallRenderSnapshotToSurface() {
+  if (!dragonballRenderSnapshot.valid || dragonballRenderLcd == nullptr || palmSurface == nullptr) return;
+
+  PalmLcdState lcd = dragonballRenderSnapshot.lcd;
+  uint16_t drawW = dragonballRenderSnapshot.drawW;
+  uint16_t drawH = dragonballRenderSnapshot.drawH;
+  const uint16_t *palette = dragonballRenderSnapshot.palette565;
+  if (drawW < PALM_LCD_W || drawH < PALM_LCD_H) {
+    surfaceFillRect(0, 0, PALM_LCD_W, PALM_LCD_H, palette[0]);
+  }
+
+  if (lcd.bpp == 1 && lcd.margin == 0) {
+    uint16_t offColor = palette[0];
+    uint16_t onColor = palette[1];
+    uint16_t fullBytes = drawW >> 3;
+    uint16_t tailPixels = drawW & 7;
+
+    for (uint16_t y = 0; y < drawH; ++y) {
+      const uint8_t *srcBytes = dragonballRenderLcd + static_cast<uint32_t>(y) * lcd.bytesPerLine;
+      uint16_t *row = palmSurface + static_cast<uint32_t>(y) * PALM_SURFACE_W;
+      uint16_t x = 0;
+      for (uint16_t bx = 0; bx < fullBytes; ++bx) {
+        uint8_t bits = srcBytes[bx];
+        row[x++] = (bits & 0x80) ? onColor : offColor;
+        row[x++] = (bits & 0x40) ? onColor : offColor;
+        row[x++] = (bits & 0x20) ? onColor : offColor;
+        row[x++] = (bits & 0x10) ? onColor : offColor;
+        row[x++] = (bits & 0x08) ? onColor : offColor;
+        row[x++] = (bits & 0x04) ? onColor : offColor;
+        row[x++] = (bits & 0x02) ? onColor : offColor;
+        row[x++] = (bits & 0x01) ? onColor : offColor;
+      }
+      if (tailPixels != 0) {
+        uint8_t bits = srcBytes[fullBytes];
+        for (uint16_t bit = 0; bit < tailPixels; ++bit) {
+          row[x++] = (bits & (0x80 >> bit)) ? onColor : offColor;
+        }
+      }
+    }
+  } else {
+    for (uint16_t y = 0; y < drawH; ++y) {
+      const uint8_t *srcBytes = dragonballRenderLcd + static_cast<uint32_t>(y) * lcd.bytesPerLine;
+      uint16_t *dstRow = palmSurface + static_cast<uint32_t>(y) * PALM_SURFACE_W;
+      uint32_t cachedByteIndex = 0xffffffffUL;
+      uint8_t cachedByte = 0;
+      for (uint16_t x = 0; x < drawW; ++x) {
+        uint8_t value = 0;
+        if (lcd.bpp == 1 || lcd.bpp == 2 || lcd.bpp == 4) {
+          uint32_t bitIndex = static_cast<uint32_t>(x + lcd.margin) * lcd.bpp;
+          uint32_t byteIndex = bitIndex >> 3;
+          if (byteIndex != cachedByteIndex) {
+            cachedByteIndex = byteIndex;
+            cachedByte = byteIndex < lcd.bytesPerLine ? srcBytes[byteIndex] : 0;
+          }
+          uint8_t shift = 8 - lcd.bpp - (bitIndex & 7);
+          value = (cachedByte >> shift) & ((1 << lcd.bpp) - 1);
+        }
+        dstRow[x] = palette[value];
+      }
+    }
+  }
+
+  dragonballRenderSnapshot.valid = false;
+}
+#endif
 
 static void drawLcd1BppNoMargin(const PalmLcdState &lcd, uint16_t drawW, uint16_t drawH,
                                 const uint16_t *palette) {
@@ -1352,9 +1498,14 @@ static void renderVirtualPowerStrip(PanelPixel *target) {
   int resetY1 = (SCREEN_H * (VIRTUAL_RESET_SLOT + 1)) / VIRTUAL_BUTTON_COUNT;
   int resetBy = resetY0 + inset;
   int resetBh = (resetY1 - resetY0) - inset * 2;
-  panelFillRect(target, bx, resetBy, bw, resetBh, TFT_BUTTON_BITMAP_0);
+  uint8_t resetResult = resetButtonResultState;
+  panelFillRect(target, bx, resetBy, bw, resetBh,
+                resetResult == RESET_BUTTON_RESULT_ERROR ?
+                  TFT_BUTTON_SAVE_ERROR : TFT_BUTTON_BITMAP_0);
   panelDrawSystemBitmapIconMask(target, bx, resetBy, bw, resetBh,
-                                kBtnResetPngBits, TFT_BUTTON_BITMAP_1);
+                                kBtnResetPngBits,
+                                resetResult == RESET_BUTTON_RESULT_NONE ?
+                                  TFT_BUTTON_BITMAP_1 : TFT_WHITE);
 }
 
 static void renderPanelStaticFrameFromSurface(PanelPixel *target) {
@@ -1378,6 +1529,9 @@ static void renderPanelStaticFrameFromSurface(PanelPixel *target) {
 static void publishPanelFrame() {
 #if PALM_HAS_SED1375 && PALM_SED1375_DECODE_ON_RENDER_CORE
   decodeSed1375RenderSnapshotToSurface();
+#endif
+#if PALM_DRAGONBALL_DECODE_ON_RENDER_CORE
+  decodeDragonBallRenderSnapshotToSurface();
 #endif
   if (!panelStaticFramesReady) {
     uint32_t staticGeneration = panelStaticGeneration;
@@ -1687,6 +1841,16 @@ static void setSaveButtonResult(uint8_t result, unsigned long now) {
   if (changed) invalidatePanelStaticLayer();
 }
 
+static void setResetButtonResult(uint8_t result, unsigned long now) {
+  if (result > RESET_BUTTON_RESULT_ERROR) result = RESET_BUTTON_RESULT_NONE;
+  unsigned long untilMs = result == RESET_BUTTON_RESULT_NONE ?
+                          0 : now + PALM_SAVE_RESULT_DISPLAY_MS;
+  bool changed = resetButtonResultState != result;
+  resetButtonResultState = result;
+  resetButtonResultUntilMs = untilMs;
+  if (changed) invalidatePanelStaticLayer();
+}
+
 static void resetSaveButtonHold(bool clearReleaseGate = true) {
   if (saveButtonHoldActive || saveButtonHoldTriggered || saveButtonReleaseRequired) {
     PALM_HOLD_DBG_PRINTF("Save hold reset clearGate=%u active=%u trig=%u gate=%u raw=%d,%d\n",
@@ -1721,6 +1885,7 @@ static void resetResetButtonHold(bool clearReleaseGate = true) {
   }
   resetButtonHoldActive = false;
   resetButtonHoldTriggered = false;
+  resetButtonFirmwareSwitchTriggered = false;
   resetButtonHoldStartMs = 0;
   resetButtonHoldLastLogMs = 0;
   if (clearReleaseGate) resetButtonReleaseRequired = false;
@@ -1791,9 +1956,14 @@ static void updateResetButtonHold(bool down, unsigned long now) {
     return;
   }
 
-  if (palmOsResetInProgress || touchInputDisabled) {
-    PALM_HOLD_DBG_PRINTF("Reset hold blocked busy reset=%u touchDisabled=%u\n",
+  if (palmOsResetInProgress || firmwareSwitchInProgress || touchInputDisabled) {
+    if (palmOsResetInProgress && resetButtonHoldActive &&
+        resetButtonHoldTriggered && !resetButtonFirmwareSwitchTriggered) {
+      return;
+    }
+    PALM_HOLD_DBG_PRINTF("Reset hold blocked busy reset=%u switch=%u touchDisabled=%u\n",
                          palmOsResetInProgress ? 1 : 0,
+                         firmwareSwitchInProgress ? 1 : 0,
                          touchInputDisabled ? 1 : 0);
     resetResetButtonHold(false);
     return;
@@ -1812,27 +1982,39 @@ static void updateResetButtonHold(bool down, unsigned long now) {
   if (!resetButtonHoldActive) {
     resetButtonHoldActive = true;
     resetButtonHoldTriggered = false;
+    resetButtonFirmwareSwitchTriggered = false;
     resetButtonHoldStartMs = now;
     resetButtonHoldLastLogMs = now;
+    if (resetButtonResultState != RESET_BUTTON_RESULT_NONE) {
+      setResetButtonResult(RESET_BUTTON_RESULT_NONE, now);
+    }
     PALM_HOLD_DBG_PRINTF("Reset hold start raw=%d,%d\n", lastTouchRawX, lastTouchRawY);
     return;
   }
 
-  if (!resetButtonHoldTriggered && now - resetButtonHoldLastLogMs >= 250) {
+  unsigned long heldMs = now - resetButtonHoldStartMs;
+  if (!resetButtonFirmwareSwitchTriggered && now - resetButtonHoldLastLogMs >= 250) {
     resetButtonHoldLastLogMs = now;
-    PALM_HOLD_DBG_PRINTF("Reset hold progress %lu/%lu raw=%d,%d\n",
-                         static_cast<unsigned long>(now - resetButtonHoldStartMs),
+    PALM_HOLD_DBG_PRINTF("Reset hold progress %lu reset=%lu switch=%lu raw=%d,%d\n",
+                         static_cast<unsigned long>(heldMs),
                          PALM_OS_RESET_HOLD_MS,
+                         PALM_FIRMWARE_SWITCH_HOLD_MS,
                          lastTouchRawX,
                          lastTouchRawY);
   }
 
-  if (!resetButtonHoldTriggered && now - resetButtonHoldStartMs >= PALM_OS_RESET_HOLD_MS) {
+  if (!resetButtonFirmwareSwitchTriggered && heldMs >= PALM_FIRMWARE_SWITCH_HOLD_MS) {
+    resetButtonFirmwareSwitchTriggered = true;
     resetButtonHoldTriggered = true;
     resetButtonReleaseRequired = true;
+    firmwareSwitchRequested = true;
+    PALM_HOLD_DBG_PRINTF("Firmware switch hold accepted after %lu ms\n",
+                         static_cast<unsigned long>(heldMs));
+  } else if (!resetButtonHoldTriggered && heldMs >= PALM_OS_RESET_HOLD_MS) {
+    resetButtonHoldTriggered = true;
     palmOsResetRequested = true;
     PALM_HOLD_DBG_PRINTF("Reset hold accepted after %lu ms\n",
-                         static_cast<unsigned long>(now - resetButtonHoldStartMs));
+                         static_cast<unsigned long>(heldMs));
   }
 }
 
@@ -1845,8 +2027,27 @@ static void palmTouchToScreen(int palmX, int palmY, int &screenX, int &screenY) 
   screenY = constrain(screenY, PALM_VIEW_Y, PALM_VIEW_Y + PALM_VIEW_H - 1);
 }
 
+static void setIli6485Standby(bool standby) {
+#if defined(ESP32) && ILI6485_STBYB >= 0
+  if (standby == ili6485StandbyActive) return;
+
+  digitalWrite(ILI6485_STBYB, standby ? LOW : HIGH);
+  pinMode(ILI6485_STBYB, OUTPUT);
+  ili6485StandbyActive = standby;
+  if (!standby) delay(ILI6485_STANDBY_EXIT_DELAY_MS);
+#else
+  (void)standby;
+#endif
+}
+
 static void lcdInit() {
 #if defined(ESP32)
+#if ILI6485_STBYB >= 0
+  digitalWrite(ILI6485_STBYB, HIGH);
+  pinMode(ILI6485_STBYB, OUTPUT);
+  ili6485StandbyActive = false;
+#endif
+
   esp_lcd_rgb_panel_config_t panelConfig = {};
   panelConfig.clk_src = LCD_CLK_SRC_DEFAULT;
   panelConfig.timings.pclk_hz = RGB_PANEL_PIXEL_CLOCK_HZ;
@@ -1923,8 +2124,12 @@ static void restartRgbPanelIfNeeded() {
 static void setPanelOutputEnabled(bool enabled) {
 #if defined(ESP32)
   if (rgbPanel != nullptr) {
-    if (enabled) restartRgbPanelIfNeeded();
+    if (enabled) {
+      setIli6485Standby(false);
+      restartRgbPanelIfNeeded();
+    }
     esp_lcd_panel_disp_on_off(rgbPanel, enabled);
+    if (!enabled) setIli6485Standby(true);
   }
 #else
   (void)enabled;
@@ -2074,7 +2279,10 @@ static bool getPalmScreenTouch(int &screenX, int &screenY) {
     setVirtualButtonBits(0, -1, lastTouchRawX, lastTouchRawY);
     resetVirtualTouchLatch();
     resetSaveButtonHold(false);
-    resetResetButtonHold(false);
+    if (!(palmOsResetInProgress && resetButtonHoldActive &&
+          resetButtonHoldTriggered && !resetButtonFirmwareSwitchTriggered)) {
+      resetResetButtonHold(false);
+    }
     cachedTouchDown = false;
     touchCandidateActive = false;
     lastTouchDown = false;
@@ -2532,6 +2740,29 @@ static bool drawPalmFrameFromEmulatedLcd() {
     lcdWaitingDrawn = false;
     drawPalmShellOnce();
     bool captured = captureSed1375RenderSnapshot(lcd);
+    unlockRenderSurface();
+    if (!captured) {
+      drawWaitingFrame();
+      return false;
+    }
+
+    requestPanelRender();
+#if PALM_PERF_SERIAL_STATS
+    uint32_t renderMicros = micros() - renderStartMicros;
+    renderTotalMicros += renderMicros;
+    if (renderMicros > renderMaxMicros) renderMaxMicros = renderMicros;
+    ++renderMeasuredFrames;
+#endif
+    return true;
+  }
+#endif
+
+#if PALM_DRAGONBALL_DECODE_ON_RENDER_CORE
+  if (!useSed1375) {
+    if (!tryLockRenderSurface()) return false;
+    lcdWaitingDrawn = false;
+    drawPalmShellOnce();
+    bool captured = captureDragonBallRenderSnapshot(lcd, palmHwLcdBacklightOn());
     unlockRenderSurface();
     if (!captured) {
       drawWaitingFrame();
@@ -3342,10 +3573,10 @@ static bool savePalmStateToSd() {
 
 static void executePalmCpuSlice(uint32_t cycles);
 
-static void releaseTouchForStateSave() {
+static void releaseTouchForStateSave(bool preserveResetHold = false) {
   setVirtualButtonBits(0, -1, lastTouchRawX, lastTouchRawY);
   resetSaveButtonHold(false);
-  resetResetButtonHold(false);
+  if (!preserveResetHold) resetResetButtonHold(false);
   cachedTouchDown = false;
   touchCandidateActive = false;
   lastTouchDown = false;
@@ -3439,7 +3670,7 @@ static bool wakePalmAfterStateSave() {
 }
 
 static void servicePalmStateSaveRequest() {
-  if (!palmStateSaveRequested || palmStateSaveInProgress) return;
+  if (!palmStateSaveRequested || palmStateSaveInProgress || firmwareSwitchInProgress) return;
   PALM_HOLD_DBG_PRINTLN("Save service start");
   palmStateSaveRequested = false;
   palmStateSaveInProgress = true;
@@ -3486,13 +3717,79 @@ static void servicePalmStateSaveRequest() {
   PALM_HOLD_DBG_PRINTLN("Save service end");
 }
 
+#if defined(ESP32)
+static bool firmwarePartitionLooksValid(const esp_partition_t *partition) {
+  if (partition == nullptr) return false;
+  esp_app_desc_t appDesc = {};
+  return esp_ota_get_partition_description(partition, &appDesc) == ESP_OK;
+}
+
+static const esp_partition_t *findAlternateFirmwarePartition() {
+  const esp_partition_t *running = esp_ota_get_running_partition();
+
+  for (uint8_t i = 0; i < 16; ++i) {
+    esp_partition_subtype_t subtype =
+        static_cast<esp_partition_subtype_t>(ESP_PARTITION_SUBTYPE_APP_OTA_0 + i);
+    const esp_partition_t *candidate =
+        esp_partition_find_first(ESP_PARTITION_TYPE_APP, subtype, nullptr);
+    if (candidate == nullptr) continue;
+    if (running != nullptr && candidate->address == running->address) continue;
+    if (firmwarePartitionLooksValid(candidate)) return candidate;
+  }
+
+  return nullptr;
+}
+
+static bool switchToAlternateFirmwarePartition() {
+  const esp_partition_t *target = findAlternateFirmwarePartition();
+  if (target == nullptr) return false;
+  if (esp_ota_set_boot_partition(target) != ESP_OK) return false;
+  delay(50);
+  esp_restart();
+  return true;
+}
+#else
+static bool switchToAlternateFirmwarePartition() {
+  return false;
+}
+#endif
+
+static void serviceFirmwareSwitchRequest() {
+  if (!firmwareSwitchRequested || firmwareSwitchInProgress ||
+      palmStateSaveInProgress || palmOsResetInProgress) {
+    return;
+  }
+
+  PALM_HOLD_DBG_PRINTLN("Firmware switch service start");
+  firmwareSwitchRequested = false;
+  firmwareSwitchInProgress = true;
+  touchInputDisabled = true;
+  releaseTouchForStateSave();
+  if (palmLowPowerModeActive) setPalmLowPowerMode(false);
+#if defined(ESP32)
+  setCpuFrequencyMhz(ESP32_ACTIVE_CPU_MHZ);
+#endif
+  setPanelOutputEnabled(true);
+  setBacklightDuty(BACKLIGHT_DEFAULT_DUTY);
+
+  if (!switchToAlternateFirmwarePartition()) {
+    setResetButtonResult(RESET_BUTTON_RESULT_ERROR, millis());
+    touchInputDisabled = false;
+    firmwareSwitchInProgress = false;
+    PALM_HOLD_DBG_PRINTLN("Firmware switch failed");
+  }
+}
+
 static void servicePalmOsResetRequest() {
-  if (!palmOsResetRequested || palmOsResetInProgress || palmStateSaveInProgress) return;
+  if (!palmOsResetRequested || palmOsResetInProgress ||
+      palmStateSaveInProgress || firmwareSwitchInProgress) {
+    return;
+  }
   PALM_HOLD_DBG_PRINTLN("Reset service start");
   palmOsResetRequested = false;
   palmOsResetInProgress = true;
   touchInputDisabled = true;
-  releaseTouchForStateSave();
+  releaseTouchForStateSave(true);
   if (palmLowPowerModeActive) setPalmLowPowerMode(false);
 #if defined(ESP32)
   setCpuFrequencyMhz(ESP32_ACTIVE_CPU_MHZ);
@@ -3535,6 +3832,10 @@ static void serviceSaveButtonResultIndicator(unsigned long now) {
   if (saveButtonResultState != SAVE_BUTTON_RESULT_NONE &&
       timeReached(now, saveButtonResultUntilMs)) {
     setSaveButtonResult(SAVE_BUTTON_RESULT_NONE, now);
+  }
+  if (resetButtonResultState != RESET_BUTTON_RESULT_NONE &&
+      timeReached(now, resetButtonResultUntilMs)) {
+    setResetButtonResult(RESET_BUTTON_RESULT_NONE, now);
   }
 }
 
@@ -3739,6 +4040,11 @@ void setup() {
                 sed1375RenderVram,
                 sed1375RenderVramInInternalRam ? "INTERNAL" : "PSRAM");
 #endif
+#if PALM_DRAGONBALL_DECODE_ON_RENDER_CORE
+  PALM_DBG_PRINTF("DragonBall render snapshot: lcd=%p %s\n",
+                dragonballRenderLcd,
+                dragonballRenderLcdInInternalRam ? "INTERNAL" : "PSRAM");
+#endif
   PALM_DBG_PRINTF("RGB timing: pclk=%ld edge=%s idle=%s bounce=%u h=%d/%d/%d v=%d/%d/%d\n",
                 (long)RGB_PANEL_PIXEL_CLOCK_HZ,
                 RGB_PANEL_PCLK_ACTIVE_NEG ? "neg" : "pos",
@@ -3928,6 +4234,7 @@ void loop() {
   updatePalmLowPowerMode();
 
   servicePalmStateSaveRequest();
+  serviceFirmwareSwitchRequest();
   servicePalmOsResetRequest();
   updatePalmLowPowerMode();
   updatePalmBacklightFromOs();
@@ -3947,6 +4254,7 @@ void loop() {
 
   servicePalmTouchInput();
   servicePalmStateSaveRequest();
+  serviceFirmwareSwitchRequest();
   servicePalmOsResetRequest();
   updatePalmLowPowerMode();
   updatePalmBacklightFromOs();

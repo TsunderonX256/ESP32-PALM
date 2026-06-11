@@ -3,6 +3,11 @@ param(
     [string]$Fqbn = "",
     [string]$BuildRoot = "",
     [string]$RomFileName = "",
+    [ValidateSet("", "IIIX", "M100_EXPERIMENTAL", "IIIC_EXPERIMENTAL")]
+    [string]$HardwareProfile = "",
+    [ValidateSet("", "app0", "app1")]
+    [string]$FlashAppSlot = "",
+    [string]$Esptool = "",
     [string]$Port = "",
     [switch]$CodeCheckOnly,
     [switch]$LargeApp,
@@ -12,22 +17,51 @@ param(
 $ErrorActionPreference = "Stop"
 
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
-$configText = Get-Content -LiteralPath (Join-Path $repoRoot "palm_config.h") -Raw
-$hardwareProfile = "IIIX"
-if ([string]::IsNullOrWhiteSpace($RomFileName)) {
+$configPath = Join-Path $repoRoot "palm_config.h"
+$configText = Get-Content -LiteralPath $configPath -Raw
+
+$profileInfo = @{
+    "IIIX" = @{
+        Macro = "PALM_PROFILE_IIIX"
+        Rom = "Palm-IIIx-3.1.rom"
+    }
+    "M100_EXPERIMENTAL" = @{
+        Macro = "PALM_PROFILE_M100_EXPERIMENTAL"
+        Rom = "Palm-m100-3.51-en.rom"
+    }
+    "IIIC_EXPERIMENTAL" = @{
+        Macro = "PALM_PROFILE_IIIC_EXPERIMENTAL"
+        Rom = "Palm-IIIc-4.1-en.rom"
+    }
+}
+
+$selectedHardwareProfile = "IIIX"
+if (-not [string]::IsNullOrWhiteSpace($HardwareProfile)) {
+    $selectedHardwareProfile = $HardwareProfile
+    $profileMacro = $profileInfo[$selectedHardwareProfile].Macro
+    $configText = [regex]::Replace(
+        $configText,
+        "(?m)^(\s*#define\s+PALM_HARDWARE_PROFILE\s+)PALM_PROFILE_\w+",
+        ('$1' + $profileMacro),
+        1
+    )
+    if ([string]::IsNullOrWhiteSpace($RomFileName)) {
+        $RomFileName = $profileInfo[$selectedHardwareProfile].Rom
+    }
+} elseif ([string]::IsNullOrWhiteSpace($RomFileName)) {
     if ($configText -match "PALM_HARDWARE_PROFILE\s+PALM_PROFILE_IIIC_EXPERIMENTAL") {
-        $hardwareProfile = "IIIC_EXPERIMENTAL"
+        $selectedHardwareProfile = "IIIC_EXPERIMENTAL"
         $RomFileName = "Palm-IIIc-4.1-en.rom"
     } elseif ($configText -match "PALM_HARDWARE_PROFILE\s+PALM_PROFILE_M100_EXPERIMENTAL") {
-        $hardwareProfile = "M100_EXPERIMENTAL"
+        $selectedHardwareProfile = "M100_EXPERIMENTAL"
         $RomFileName = "Palm-m100-3.51-en.rom"
     } else {
         $RomFileName = "Palm-IIIx-3.1.rom"
     }
 } elseif ($configText -match "PALM_HARDWARE_PROFILE\s+PALM_PROFILE_IIIC_EXPERIMENTAL") {
-    $hardwareProfile = "IIIC_EXPERIMENTAL"
+    $selectedHardwareProfile = "IIIC_EXPERIMENTAL"
 } elseif ($configText -match "PALM_HARDWARE_PROFILE\s+PALM_PROFILE_M100_EXPERIMENTAL") {
-    $hardwareProfile = "M100_EXPERIMENTAL"
+    $selectedHardwareProfile = "M100_EXPERIMENTAL"
 }
 $romFileName = $RomFileName
 $romPath = Join-Path $repoRoot $romFileName
@@ -43,6 +77,21 @@ if ([string]::IsNullOrWhiteSpace($ArduinoCli)) {
 
 if (-not (Test-Path -LiteralPath $ArduinoCli)) {
     throw "arduino-cli was not found. Pass -ArduinoCli or install Arduino IDE."
+}
+
+if (-not [string]::IsNullOrWhiteSpace($FlashAppSlot)) {
+    if ([string]::IsNullOrWhiteSpace($Port)) {
+        throw "Pass -Port when using -FlashAppSlot."
+    }
+    if ($Upload) {
+        throw "Use either -Upload for normal Arduino upload or -FlashAppSlot for app-only OTA-slot flashing, not both."
+    }
+    if ([string]::IsNullOrWhiteSpace($Esptool)) {
+        $Esptool = Join-Path $env:LOCALAPPDATA "Arduino15\packages\esp32\tools\esptool_py\5.2.0\esptool.exe"
+    }
+    if (-not (Test-Path -LiteralPath $Esptool)) {
+        throw "esptool was not found. Pass -Esptool or install the ESP32 Arduino package."
+    }
 }
 
 if ([string]::IsNullOrWhiteSpace($Fqbn)) {
@@ -67,6 +116,10 @@ $sketchRoot = Join-Path ([IO.Path]::GetFullPath($BuildRoot)) "ESP32-PALM"
 if (Test-Path -LiteralPath $sketchRoot) {
     Remove-Item -LiteralPath $sketchRoot -Recurse -Force
 }
+$arduinoBuildPath = Join-Path ([IO.Path]::GetFullPath($BuildRoot)) "arduino-build"
+if (Test-Path -LiteralPath $arduinoBuildPath) {
+    Remove-Item -LiteralPath $arduinoBuildPath -Recurse -Force
+}
 
 New-Item -ItemType Directory -Path $sketchRoot | Out-Null
 
@@ -76,6 +129,8 @@ Get-ChildItem -LiteralPath $repoRoot -Force |
     ForEach-Object {
         Copy-Item -LiteralPath $_.FullName -Destination $sketchRoot -Recurse -Force
     }
+
+Set-Content -LiteralPath (Join-Path $sketchRoot "palm_config.h") -Value $configText -NoNewline
 
 if ($useCustomPartition) {
     Copy-Item -LiteralPath $partitionCsv -Destination (Join-Path $sketchRoot "partitions.csv") -Force
@@ -92,7 +147,7 @@ if ($CodeCheckOnly) {
             "-InputRom", $romPath,
             "-OutputRom", $currentRomPath,
             "-Feature", "PalmDay",
-            "-Profile", $hardwareProfile,
+            "-Profile", $selectedHardwareProfile,
             "-RomFileName", $romFileName
         )
         if ($palmDayPatchRequired) {
@@ -123,7 +178,7 @@ if (Test-Path -LiteralPath $romAsmPath) {
 
 Push-Location -LiteralPath $sketchRoot
 try {
-    $args = @("compile", "--fqbn", $Fqbn)
+    $args = @("compile", "--fqbn", $Fqbn, "--build-path", $arduinoBuildPath)
     if ($Upload) {
         if ([string]::IsNullOrWhiteSpace($Port)) {
             throw "Pass -Port when using -Upload."
@@ -139,4 +194,31 @@ try {
 }
 finally {
     Pop-Location
+}
+
+if (-not [string]::IsNullOrWhiteSpace($FlashAppSlot)) {
+    $appBin = Get-ChildItem -LiteralPath $arduinoBuildPath -Recurse -Filter "*.ino.bin" |
+        Where-Object { $_.Name -notmatch "\.(bootloader|partitions)\.bin$" } |
+        Select-Object -First 1
+    if ($null -eq $appBin) {
+        throw "Could not find compiled app .bin in $arduinoBuildPath"
+    }
+
+    $slotOffset = if ($FlashAppSlot -eq "app1") { "0x800000" } else { "0x10000" }
+    $esptoolArgs = @(
+        "--chip", "esp32s3",
+        "--port", $Port,
+        "--baud", "921600",
+        "--before", "default-reset",
+        "--after", "hard-reset",
+        "write-flash",
+        "--flash-size", "16MB",
+        $slotOffset,
+        $appBin.FullName
+    )
+    Write-Host "Flashing $selectedHardwareProfile app image to $FlashAppSlot at $slotOffset"
+    & $Esptool @esptoolArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "esptool app-slot flash failed with exit code $LASTEXITCODE."
+    }
 }

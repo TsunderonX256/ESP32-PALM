@@ -129,9 +129,10 @@ arduino-cli compile --fqbn "esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=cu
 ```
 
 The helper copies `Tools/esp32_palm_16mb_partitions.csv` into the temporary
-sketch as `partitions.csv`. That custom 16 MB layout uses two 4 MB app slots
-and a 7.9 MB FATFS partition, giving the `-O2` ESP32-S3 build more room than
-Arduino's standard `app3M_fat9M_16MB` layout.
+sketch as `partitions.csv`. That custom 16 MB layout uses two 7.94 MB OTA app
+slots and no internal FATFS partition, giving the `-O2` ESP32-S3 build more
+room than Arduino's standard `app3M_fat9M_16MB` layout and leaving room for
+separate m100/IIIc firmware images.
 
 Current next work is polish and compatibility: improve CPU speed, make
 HotSync/serial more robust, emulate RTC stopwatch behavior, and add Beam/IR if
