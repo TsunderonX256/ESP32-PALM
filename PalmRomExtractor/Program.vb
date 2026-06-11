@@ -97,13 +97,14 @@ Module Program
         Dim romBase = ParseOptionalRomBase(args, 3)
         Dim nameFilter = GetOptionValue(args, "--name")
         Dim creatorFilter = GetOptionValue(args, "--creator")
+        Dim includeRelated = HasOption(args, "--include-related")
         Dim exportAll = HasOption(args, "--all") OrElse (String.IsNullOrWhiteSpace(nameFilter) AndAlso String.IsNullOrWhiteSpace(creatorFilter))
 
         Directory.CreateDirectory(outputDirectory)
 
         Dim rom = File.ReadAllBytes(romPath)
         Dim databases = FindDatabases(rom, romBase)
-        Dim apps = databases.Where(Function(db) db.IsApplication)
+        Dim apps = databases.Where(Function(db) db.IsApplication OrElse (includeRelated AndAlso db.IsResourceDatabase AndAlso db.TypeCode = "ovly"))
 
         If Not exportAll Then
             If Not String.IsNullOrWhiteSpace(nameFilter) Then
@@ -128,7 +129,7 @@ Module Program
         Next
 
         Console.WriteLine()
-        Console.WriteLine($"Exported {selectedApps.Count} application(s).")
+        Console.WriteLine($"Exported {selectedApps.Count} database(s).")
         Return 0
     End Function
 
@@ -485,6 +486,7 @@ Module Program
         Console.WriteLine("Examples:")
         Console.WriteLine("  dotnet run --project PalmRomExtractor -- list Palm-m100-3.51-en.rom")
         Console.WriteLine("  dotnet run --project PalmRomExtractor -- export Palm-m100-3.51-en.rom ExtractedApps --all")
+        Console.WriteLine("  dotnet run --project PalmRomExtractor -- export Palm-m100-3.51-en.rom ExtractedApps --creator cclk --include-related")
         Console.WriteLine("  dotnet run --project PalmRomExtractor -- export Palm-m100-3.51-en.rom ExtractedApps --name ""Memo Pad""")
     End Sub
 End Module
