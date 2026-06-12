@@ -9,7 +9,12 @@
 #include "palm_profile.h"
 
 #define PALM_STATE_MAGIC 0x50414c4du
+#define PALM_STATE_VERSION_BASE 2u
+#if PALM_HAS_SED1375
+#define PALM_STATE_VERSION 3u
+#else
 #define PALM_STATE_VERSION 2u
+#endif
 #define PALM_CALL_STUB_ADDRESS 0x003fff00u
 #define PALM_CALL_RETURN_ADDRESS 0x003fff04u
 #define SYS_TRAP_MEM_PTR_NEW 0xa013u
@@ -1511,6 +1516,11 @@ unsigned int m68k_read_memory_8(unsigned int address) { return read8(address, 0)
 unsigned int m68k_read_memory_16(unsigned int address) { return read16(address, 0); }
 unsigned int m68k_read_memory_32(unsigned int address) { return read32(address, 0); }
 unsigned int palm_read_instr_16(unsigned int address) { return read16(address, 1); }
+unsigned int m68k_read_immediate_16(unsigned int address) { return read16(address, 1); }
+unsigned int m68k_read_immediate_32(unsigned int address) { return read32(address, 1); }
+unsigned int m68k_read_pcrelative_8(unsigned int address) { return read8(address, 1); }
+unsigned int m68k_read_pcrelative_16(unsigned int address) { return read16(address, 1); }
+unsigned int m68k_read_pcrelative_32(unsigned int address) { return read32(address, 1); }
 
 void m68k_write_memory_8(unsigned int address, unsigned int value) { write8(address, (uint8_t)value); }
 void m68k_write_memory_16(unsigned int address, unsigned int value) {
@@ -1697,7 +1707,12 @@ PALM_EXPORT int palm_native_load_state(const uint8_t *buffer, uint32_t buffer_si
 
     PalmNativeStateHeader header;
     memcpy(&header, buffer, sizeof(header));
-    if (header.magic != PALM_STATE_MAGIC || header.version != PALM_STATE_VERSION) return 0;
+    if (header.magic != PALM_STATE_MAGIC) return 0;
+#if PALM_HAS_SED1375
+    if (header.version != PALM_STATE_VERSION && header.version != PALM_STATE_VERSION_BASE) return 0;
+#else
+    if (header.version != PALM_STATE_VERSION) return 0;
+#endif
     if (header.ramSize != g_ram_size || header.regSize != PALM_DB_REG_SIZE || header.romSize != g_rom_size) return 0;
     if (header.totalSize != palm_native_state_size()) return 0;
     if (buffer_size < header.totalSize) return 0;
@@ -2025,6 +2040,8 @@ PALM_EXPORT uint32_t palm_native_ram_highest_written(void) {
     return g_ram_highest_written == 0xffffffffu ? 0 : g_ram_highest_written;
 }
 PALM_EXPORT uint32_t palm_native_get_build_id(void) { return 0x20260525u; }
+PALM_EXPORT uint32_t palm_native_hardware_profile(void) { return (uint32_t)PALM_HARDWARE_PROFILE; }
+PALM_EXPORT const char *palm_native_profile_name(void) { return PALM_PROFILE_NAME; }
 PALM_EXPORT int palm_native_sound_enabled(void) { return g_pwm_sound_enabled; }
 PALM_EXPORT double palm_native_sound_frequency(void) { return g_pwm_sound_frequency; }
 PALM_EXPORT double palm_native_sound_duty(void) { return g_pwm_sound_duty; }

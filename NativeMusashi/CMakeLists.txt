@@ -4,7 +4,7 @@ project(PalmMusashi C)
 # Keep this native profile in sync with PalmDesktopHarness/PalmConfig.vb.
 # The VB harness chooses the ROM/state filename while this DLL chooses the
 # hardware map; mismatches can produce confusing boot or persistence bugs.
-set(PALM_PROFILE "IIIX" CACHE STRING "Palm hardware profile: IIIX, M100_EXPERIMENTAL, or IIIC_EXPERIMENTAL")
+set(PALM_PROFILE "IIIC_EXPERIMENTAL" CACHE STRING "Palm hardware profile: IIIX, M100_EXPERIMENTAL, or IIIC_EXPERIMENTAL")
 set_property(CACHE PALM_PROFILE PROPERTY STRINGS IIIX M100_EXPERIMENTAL IIIC_EXPERIMENTAL)
 
 add_library(PalmMusashi SHARED

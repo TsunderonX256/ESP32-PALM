@@ -112,6 +112,8 @@ PALM_EXPORT uint32_t palm_native_ram_physical_size(void);
 PALM_EXPORT uint32_t palm_native_ram_dirty_pages(void);
 PALM_EXPORT uint32_t palm_native_ram_highest_written(void);
 PALM_EXPORT uint32_t palm_native_get_build_id(void);
+PALM_EXPORT uint32_t palm_native_hardware_profile(void);
+PALM_EXPORT const char *palm_native_profile_name(void);
 PALM_EXPORT int palm_native_install_prc_image(const uint8_t *buffer, uint32_t buffer_size, uint32_t *result_out);
 PALM_EXPORT uint32_t palm_native_copy_trace(char *buffer, uint32_t buffer_size);
 PALM_EXPORT uint32_t palm_native_copy_pc_trace(char *buffer, uint32_t buffer_size);

@@ -43,6 +43,8 @@ Namespace PalmDesktopHarness
         Private Const KeyBitHard4 As UShort = &H40US
         Private Const KeyBitResetOs As UShort = &H2000US
         Private Const KeyBitSaveState As UShort = &H4000US
+        Private Shared ReadOnly BoardButtonFillColor As Color = Color.FromArgb(48, 48, 48)
+        Private Shared ReadOnly BoardButtonIconColor As Color = Color.FromArgb(96, 96, 96)
 
         Private frameBytes As Byte()
         Private frameWidth As Integer
@@ -61,6 +63,7 @@ Namespace PalmDesktopHarness
         Private boardPenActive As Boolean
         Private boardPaintingWithTransform As Boolean
         Private Shared ReadOnly boardImages As New Dictionary(Of String, Image)(StringComparer.OrdinalIgnoreCase)
+        Private Shared ReadOnly boardIconMasks As New Dictionary(Of String, Image)(StringComparer.OrdinalIgnoreCase)
 
         Public Event PenChanged(down As Boolean, x As Integer, y As Integer)
         Public Event ButtonChanged(bits As UShort, down As Boolean, label As String)
@@ -310,17 +313,12 @@ Namespace PalmDesktopHarness
         End Sub
 
         Private Sub DrawSingleBoardButton(g As Graphics, logicalRect As RectangleF, label As String, iconName As String, down As Boolean)
-            Dim rect = Rectangle.Round(BoardToClient(logicalRect))
-            Using path = RoundedPath(rect, Math.Max(4, CInt(rect.Height * 0.14F)))
-                Using fill As New SolidBrush(If(down, Color.FromArgb(72, 72, 72), Color.FromArgb(48, 48, 48)))
-                    g.FillPath(fill, path)
-                End Using
-                Using pen As New Pen(Color.FromArgb(96, 96, 96), If(down, 2.0F, 1.0F))
-                    g.DrawPath(pen, path)
-                End Using
+            Dim rect = BoardToClient(logicalRect)
+            Using fill As New SolidBrush(BoardButtonFillColor)
+                g.FillRectangle(fill, rect)
             End Using
 
-            Dim icon = LoadBoardImage(iconName)
+            Dim icon = LoadBoardIconMask(iconName, BoardButtonIconColor)
             If icon IsNot Nothing Then
                 Dim imageRect = CenteredIconRect(logicalRect, icon)
                 g.DrawImage(icon, BoardToClient(imageRect))
@@ -328,7 +326,7 @@ Namespace PalmDesktopHarness
             End If
 
             Using font As New Font(FontFamily.GenericSansSerif, Math.Max(6.0F, rect.Height * 0.22F), FontStyle.Bold),
-                  brush As New SolidBrush(Color.FromArgb(96, 96, 96)),
+                  brush As New SolidBrush(BoardButtonIconColor),
                   format As New StringFormat With {.Alignment = StringAlignment.Center, .LineAlignment = StringAlignment.Center}
                 g.DrawString(label, font, brush, rect, format)
             End Using
@@ -362,23 +360,48 @@ Namespace PalmDesktopHarness
             Return Nothing
         End Function
 
+        Private Shared Function LoadBoardIconMask(fileName As String, color As Color) As Image
+            Dim source = LoadBoardImage(fileName)
+            If source Is Nothing Then Return Nothing
+
+            Dim key = fileName & ":" & color.ToArgb().ToString("X8")
+            SyncLock boardIconMasks
+                Dim cached As Image = Nothing
+                If boardIconMasks.TryGetValue(key, cached) Then Return cached
+
+                Dim sourceBitmap = TryCast(source, Bitmap)
+                Dim temporarySource As Bitmap = Nothing
+                If sourceBitmap Is Nothing Then
+                    temporarySource = New Bitmap(source)
+                    sourceBitmap = temporarySource
+                End If
+
+                Try
+                    Dim mask As New Bitmap(source.Width, source.Height, PixelFormat.Format32bppArgb)
+                    For y = 0 To sourceBitmap.Height - 1
+                        For x = 0 To sourceBitmap.Width - 1
+                            If IsBoardIconInk(sourceBitmap.GetPixel(x, y)) Then
+                                mask.SetPixel(x, y, color)
+                            End If
+                        Next
+                    Next
+
+                    boardIconMasks(key) = mask
+                    Return mask
+                Finally
+                    temporarySource?.Dispose()
+                End Try
+            End SyncLock
+        End Function
+
+        Private Shared Function IsBoardIconInk(pixel As Color) As Boolean
+            Return pixel.A >= 32 AndAlso CInt(pixel.R) + CInt(pixel.G) + CInt(pixel.B) < 600
+        End Function
+
         Private Shared Iterator Function BoardImageCandidates(fileName As String) As IEnumerable(Of String)
             Yield Path.Combine(AppContext.BaseDirectory, fileName)
             Yield Path.Combine(Environment.CurrentDirectory, fileName)
             Yield Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..\..\..\..\", fileName))
-        End Function
-
-        Private Shared Function RoundedPath(bounds As Rectangle, radius As Integer) As GraphicsPath
-            Dim path As New GraphicsPath()
-            Dim diameter = Math.Max(2, radius * 2)
-            Dim rect = New Rectangle(bounds.Left, bounds.Top, Math.Max(1, bounds.Width - 1), Math.Max(1, bounds.Height - 1))
-
-            path.AddArc(rect.Left, rect.Top, diameter, diameter, 180, 90)
-            path.AddArc(rect.Right - diameter, rect.Top, diameter, diameter, 270, 90)
-            path.AddArc(rect.Right - diameter, rect.Bottom - diameter, diameter, diameter, 0, 90)
-            path.AddArc(rect.Left, rect.Bottom - diameter, diameter, diameter, 90, 90)
-            path.CloseFigure()
-            Return path
         End Function
 
         Private Sub DrawBoardSilkscreen(g As Graphics)

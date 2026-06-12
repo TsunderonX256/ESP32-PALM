@@ -4,6 +4,7 @@ Imports System.Globalization
 Imports System.IO
 Imports System.Linq
 Imports System.Media
+Imports System.Runtime.InteropServices
 Imports System.Text
 Imports System.Windows.Forms
 
@@ -109,6 +110,7 @@ Namespace PalmDesktopHarness
         Private rxPadpTxId As Byte
         Private rxPadpExpectedSize As Integer
         Private ReadOnly rxPadpPayload As New List(Of Byte)
+        Private nativeInitWarningShown As Boolean
         Private Const VerboseSerialLog As Boolean = False
         Private Const EnableHotSyncTrace As Boolean = False
         Private Const EnableIrdaTrace As Boolean = False
@@ -464,6 +466,73 @@ Namespace PalmDesktopHarness
             Throw New FileNotFoundException($"Could not find {fileName}. Put it next to PalmDesktopHarness.exe.", fileName)
         End Function
 
+        Private Function TryInitNativeMusashi(Optional failurePrefix As String = "Native Musashi") As Boolean
+            Try
+                If Not NativeProfileMatchesSelectedConfig(failurePrefix) Then Return False
+
+                nativeReady = NativeMusashi.palm_native_init(romBytes, CUInt(romBytes.Length), PalmConfig.RamLogicalSize) <> 0
+                If nativeReady AndAlso cradleMenuItem IsNot Nothing Then
+                    cradleMenuItem.Checked = False
+                    NativeMusashi.palm_native_set_in_cradle(0)
+                End If
+                nativeSlices = 0UI
+                lastAutoLcdTick = 0
+                If nativeReady Then
+                    Append("Native Musashi initialized.")
+                Else
+                    ReportNativeInitFailure($"{failurePrefix}: native init failed.")
+                End If
+            Catch ex As DllNotFoundException
+                nativeReady = False
+                ReportNativeInitFailure($"{failurePrefix}: PalmMusashi.dll was not found. Build NativeMusashi first.")
+            Catch ex As EntryPointNotFoundException
+                nativeReady = False
+                ReportNativeInitFailure($"{failurePrefix}: PalmMusashi.dll entry point missing: {ex.Message}")
+            End Try
+
+            Return nativeReady
+        End Function
+
+        Private Function NativeProfileMatchesSelectedConfig(failurePrefix As String) As Boolean
+            Dim nativeProfile = NativeMusashi.palm_native_hardware_profile()
+            If nativeProfile = PalmConfig.NativeHardwareProfileId Then Return True
+
+            nativeReady = False
+            Dim nativeName = $"profile id {nativeProfile}"
+            Dim nativeNamePtr = NativeMusashi.palm_native_profile_name()
+            If nativeNamePtr <> IntPtr.Zero Then
+                nativeName = Marshal.PtrToStringAnsi(nativeNamePtr)
+            End If
+
+            ReportNativeInitFailure(
+                $"{failurePrefix}: PalmMusashi.dll was built for {nativeName}, but VB selected {PalmConfig.ProfileName}." & Environment.NewLine &
+                $"Rebuild NativeMusashi with -DPALM_PROFILE={SelectedNativeCMakeProfileName()} and rebuild PalmDesktopHarness.")
+            Return False
+        End Function
+
+        Private Sub ReportNativeInitFailure(message As String)
+            Append(message)
+            If nativeInitWarningShown Then Return
+
+            nativeInitWarningShown = True
+            MessageBox.Show(Me,
+                            message,
+                            "PalmMusashi native core",
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Warning)
+        End Sub
+
+        Private Shared Function SelectedNativeCMakeProfileName() As String
+            Select Case PalmConfig.ActiveHardwareProfile
+                Case PalmConfig.HardwareProfile.M100Experimental
+                    Return "M100_EXPERIMENTAL"
+                Case PalmConfig.HardwareProfile.IIIcExperimental
+                    Return "IIIC_EXPERIMENTAL"
+                Case Else
+                    Return "IIIX"
+            End Select
+        End Function
+
         Private Sub TryRestorePersistentState()
             If Not PalmConfig.AutoRestorePersistentState Then
                 Append($"Persistent state auto-restore disabled for {PalmConfig.ProfileName}.")
@@ -473,7 +542,7 @@ Namespace PalmDesktopHarness
             If Not File.Exists(statePath) Then Return
 
             If Not nativeReady Then
-                nativeReady = NativeMusashi.palm_native_init(romBytes, CUInt(romBytes.Length), PalmConfig.RamLogicalSize) <> 0
+                TryInitNativeMusashi("Persistent state restore")
             End If
             If Not nativeReady Then
                 Append("Persistent state restore skipped: native init failed.")
@@ -501,8 +570,7 @@ Namespace PalmDesktopHarness
 
         Private Sub StartEmulationByDefault()
             If Not nativeReady Then
-                nativeReady = NativeMusashi.palm_native_init(romBytes, CUInt(romBytes.Length), PalmConfig.RamLogicalSize) <> 0
-                Append(If(nativeReady, "Native Musashi initialized.", "Native Musashi init failed."))
+                TryInitNativeMusashi("Auto run")
             End If
             If Not nativeReady Then Return
 
@@ -736,7 +804,7 @@ Namespace PalmDesktopHarness
                 If dialog.ShowDialog(Me) <> DialogResult.OK Then Return
 
                 If Not nativeReady Then
-                    nativeReady = NativeMusashi.palm_native_init(romBytes, CUInt(romBytes.Length), PalmConfig.RamLogicalSize) <> 0
+                    TryInitNativeMusashi("RAM state restore")
                     If Not nativeReady Then
                         Append("RAM state restore failed: native init failed.")
                         Return
@@ -815,21 +883,8 @@ Namespace PalmDesktopHarness
         End Sub
 
         Private Sub InitCpuButton_Click(sender As Object, e As EventArgs)
-            Try
-                nativeReady = NativeMusashi.palm_native_init(romBytes, CUInt(romBytes.Length), PalmConfig.RamLogicalSize) <> 0
-                If nativeReady AndAlso cradleMenuItem IsNot Nothing Then
-                    cradleMenuItem.Checked = False
-                    NativeMusashi.palm_native_set_in_cradle(0)
-                End If
-                nativeSlices = 0UI
-                lastAutoLcdTick = 0
-                Append(If(nativeReady, "Native Musashi initialized.", "Native Musashi init failed."))
-                RefreshDebugStatus()
-            Catch ex As DllNotFoundException
-                Append("PalmMusashi.dll was not found. Build NativeMusashi first.")
-            Catch ex As EntryPointNotFoundException
-                Append($"PalmMusashi.dll entry point missing: {ex.Message}")
-            End Try
+            TryInitNativeMusashi()
+            RefreshDebugStatus()
         End Sub
 
         Private Sub StepCpuButton_Click(sender As Object, e As EventArgs)

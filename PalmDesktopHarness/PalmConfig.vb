@@ -14,9 +14,10 @@ Namespace PalmDesktopHarness
 
 #If PALM_PROFILE_IIIC_EXPERIMENTAL Then
         Public Const ActiveHardwareProfile As HardwareProfile = HardwareProfile.IIIcExperimental
+        Public Const NativeHardwareProfileId As UInteger = 3UI
         Public Const ProfileName As String = "Palm IIIc experimental"
         Public Const RomFileName As String = "Palm-IIIc-4.1-en.rom"
-        Public Const StateFileName As String = "palm_iiic_4m_state.bin"
+        Public Const StateFileName As String = "palm_iiic_state.bin"
         Public Const RamActivePreset As UInteger = RamPreset4M
         Public Const UseLcdContrastRegister As Boolean = True
         Public Const UseColorLcdPalette As Boolean = True
@@ -25,6 +26,7 @@ Namespace PalmDesktopHarness
         Public Const NativeAutoRunCyclesPerSlice As Integer = 25000
 #ElseIf PALM_PROFILE_M100_EXPERIMENTAL Then
         Public Const ActiveHardwareProfile As HardwareProfile = HardwareProfile.M100Experimental
+        Public Const NativeHardwareProfileId As UInteger = 2UI
         Public Const ProfileName As String = "Palm m100 experimental"
         Public Const RomFileName As String = "Palm-m100-3.51-en.rom"
         Public Const StateFileName As String = "palm_m100_state.bin"
@@ -36,6 +38,7 @@ Namespace PalmDesktopHarness
         Public Const NativeAutoRunCyclesPerSlice As Integer = 20000
 #Else
         Public Const ActiveHardwareProfile As HardwareProfile = HardwareProfile.IIIx
+        Public Const NativeHardwareProfileId As UInteger = 1UI
         Public Const ProfileName As String = "Palm IIIx"
         Public Const RomFileName As String = "Palm-IIIx-3.1.rom"
         Public Const StateFileName As String = "palm_iiix_state.bin"

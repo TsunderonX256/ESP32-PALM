@@ -229,6 +229,14 @@ Namespace PalmDesktopHarness
         End Function
 
         <DllImport("PalmMusashi.dll", CallingConvention:=CallingConvention.Cdecl)>
+        Friend Shared Function palm_native_hardware_profile() As UInteger
+        End Function
+
+        <DllImport("PalmMusashi.dll", CallingConvention:=CallingConvention.Cdecl, CharSet:=CharSet.Ansi)>
+        Friend Shared Function palm_native_profile_name() As IntPtr
+        End Function
+
+        <DllImport("PalmMusashi.dll", CallingConvention:=CallingConvention.Cdecl)>
         Friend Shared Function palm_native_is_asleep() As Integer
         End Function
 
