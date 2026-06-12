@@ -32,6 +32,7 @@ Namespace PalmDesktopHarness
         Private ReadOnly irdaBeamLogPath As String
         Private cradleMenuItem As ToolStripMenuItem
         Private ReadOnly displayModeMenuItems As New List(Of ToolStripMenuItem)
+        Private ReadOnly layoutModeMenuItems As New List(Of ToolStripMenuItem)
         Private nativeReady As Boolean
         Private nativeSlices As UInteger
         Private autoRunTicks As Integer
@@ -173,6 +174,9 @@ Namespace PalmDesktopHarness
         Private Const TouchRawYMin As Integer = 3800
         Private Const TouchRawYMax As Integer = 300
         Private Const TouchHoldMs As Integer = 0
+        Private Const Esp32BoardViewWidth As Integer = 408
+        Private Const Esp32BoardViewHeight As Integer = 720
+        Private currentLayoutMode As LcdPanel.DisplayLayoutMode = LcdPanel.DisplayLayoutMode.PalmHandheld
 
         Private Enum HotSyncInstallState
             Idle
@@ -263,6 +267,7 @@ Namespace PalmDesktopHarness
 
             lcdPanel = New LcdPanel With {.Margin = New Padding(0, 6, 0, 14)}
             AddHandler lcdPanel.PenChanged, AddressOf LcdPanel_PenChanged
+            AddHandler lcdPanel.ButtonChanged, AddressOf LcdPanel_ButtonChanged
             devicePanel.Controls.Add(lcdPanel)
 
             hardwarePanel = New HardwareButtonPanel With {.Margin = New Padding(0, 0, 0, 10)}
@@ -278,6 +283,7 @@ Namespace PalmDesktopHarness
             AddHandler FormClosing, AddressOf MainForm_FormClosing
 
             PrintHeader()
+            ApplyLayoutMode(LcdPanel.DisplayLayoutMode.Esp32Board, False)
             RefreshDebugStatus()
             TryRestorePersistentState()
             StartEmulationByDefault()
@@ -285,16 +291,50 @@ Namespace PalmDesktopHarness
         End Sub
 
         Private Sub DevicePanel_Resize(sender As Object, e As EventArgs)
-            CenterDevicePanelContent()
+            ResizeDeviceCanvas()
         End Sub
 
         Private Sub CenterDevicePanelContent()
             If devicePanel Is Nothing Then Return
 
-            Dim contentWidth = PalmConfig.DigitizerWidth * 2
+            Dim contentWidth = If(lcdPanel IsNot Nothing, lcdPanel.Width, PalmConfig.DigitizerWidth * 2)
             Dim leftPadding = Math.Max(0, (devicePanel.ClientSize.Width - contentWidth) \ 2)
             devicePanel.Padding = New Padding(leftPadding, 0, 0, 0)
         End Sub
+
+        Private Sub ResizeDeviceCanvas()
+            If devicePanel Is Nothing OrElse lcdPanel Is Nothing Then Return
+
+            Dim availableWidth = Math.Max(1, devicePanel.ClientSize.Width - lcdPanel.Margin.Horizontal)
+            Dim availableHeight = Math.Max(1, devicePanel.ClientSize.Height - lcdPanel.Margin.Vertical)
+            If hardwarePanel IsNot Nothing AndAlso hardwarePanel.Visible Then
+                availableHeight = Math.Max(1, availableHeight - hardwarePanel.Height - hardwarePanel.Margin.Vertical)
+            End If
+
+            Dim aspect = CurrentCanvasAspectRatio()
+            Dim width = availableWidth
+            Dim height = CInt(Math.Round(width / aspect))
+            If height > availableHeight Then
+                height = availableHeight
+                width = CInt(Math.Round(height * aspect))
+            End If
+
+            width = Math.Max(1, width)
+            height = Math.Max(1, height)
+            If lcdPanel.Size <> New Size(width, height) Then
+                lcdPanel.Size = New Size(width, height)
+            End If
+
+            CenterDevicePanelContent()
+        End Sub
+
+        Private Function CurrentCanvasAspectRatio() As Double
+            If currentLayoutMode = LcdPanel.DisplayLayoutMode.Esp32Board Then
+                Return Esp32BoardViewWidth / CDbl(Esp32BoardViewHeight)
+            End If
+
+            Return PalmConfig.DigitizerWidth / CDbl(PalmConfig.DigitizerHeight)
+        End Function
 
         Private Function BuildDeviceMenu() As MenuStrip
             Dim menu As New MenuStrip()
@@ -307,6 +347,7 @@ Namespace PalmDesktopHarness
                 deviceItem.DropDownItems.Add(cradleMenuItem)
             End If
             deviceItem.DropDownItems.Add(BuildDisplayModeMenu())
+            deviceItem.DropDownItems.Add(BuildViewLayoutMenu())
             deviceItem.DropDownItems.Add(CreateMenuItem("Backup RAM State...", AddressOf BackupRamStateMenuItem_Click))
             deviceItem.DropDownItems.Add(CreateMenuItem("Restore RAM State...", AddressOf RestoreRamStateMenuItem_Click))
             deviceItem.DropDownItems.Add(New ToolStripSeparator())
@@ -321,6 +362,23 @@ Namespace PalmDesktopHarness
             displayItem.DropDownItems.Add(CreateDisplayModeMenuItem("Normal LCD", LcdPanel.DisplayRenderMode.NormalMono))
             displayItem.DropDownItems.Add(CreateDisplayModeMenuItem("Inverted Green Backlight", LcdPanel.DisplayRenderMode.InvertedGreenBacklight))
             Return displayItem
+        End Function
+
+        Private Function BuildViewLayoutMenu() As ToolStripMenuItem
+            Dim layoutItem As New ToolStripMenuItem("View Layout")
+            layoutItem.DropDownItems.Add(CreateLayoutModeMenuItem("ESP32 Board", LcdPanel.DisplayLayoutMode.Esp32Board))
+            layoutItem.DropDownItems.Add(CreateLayoutModeMenuItem("Palm Handheld", LcdPanel.DisplayLayoutMode.PalmHandheld))
+            Return layoutItem
+        End Function
+
+        Private Function CreateLayoutModeMenuItem(text As String, mode As LcdPanel.DisplayLayoutMode) As ToolStripMenuItem
+            Dim item As New ToolStripMenuItem(text) With {
+                .Tag = mode,
+                .Checked = mode = LcdPanel.DisplayLayoutMode.Esp32Board
+            }
+            AddHandler item.Click, AddressOf LayoutModeMenuItem_Click
+            layoutModeMenuItems.Add(item)
+            Return item
         End Function
 
         Private Function CreateDisplayModeMenuItem(text As String, mode As LcdPanel.DisplayRenderMode) As ToolStripMenuItem
@@ -353,6 +411,39 @@ Namespace PalmDesktopHarness
             For Each item In displayModeMenuItems
                 item.Checked = DirectCast(item.Tag, LcdPanel.DisplayRenderMode) = mode
             Next
+        End Sub
+
+        Private Sub LayoutModeMenuItem_Click(sender As Object, e As EventArgs)
+            Dim item = TryCast(sender, ToolStripMenuItem)
+            If item Is Nothing OrElse item.Tag Is Nothing Then Return
+
+            ApplyLayoutMode(DirectCast(item.Tag, LcdPanel.DisplayLayoutMode), True)
+        End Sub
+
+        Private Sub ApplyLayoutMode(mode As LcdPanel.DisplayLayoutMode, resizeWindow As Boolean)
+            currentLayoutMode = mode
+            lcdPanel.LayoutMode = mode
+            If mode = LcdPanel.DisplayLayoutMode.Esp32Board Then
+                lcdPanel.MinimumSize = New Size(1, 1)
+                hardwarePanel.Visible = False
+            Else
+                lcdPanel.MinimumSize = New Size(1, 1)
+                hardwarePanel.Visible = True
+            End If
+
+            For Each item In layoutModeMenuItems
+                item.Checked = DirectCast(item.Tag, LcdPanel.DisplayLayoutMode) = mode
+            Next
+
+            If resizeWindow Then
+                Dim desiredHeight = lcdPanel.Height + MainMenuStrip.Height + 70 + If(hardwarePanel.Visible, hardwarePanel.Height + 24, 0)
+                ClientSize = New Size(Math.Max(382, lcdPanel.Width + 40), Math.Max(620, desiredHeight))
+            Else
+                Size = If(mode = LcdPanel.DisplayLayoutMode.Esp32Board, New Size(Esp32BoardViewWidth + 60, Esp32BoardViewHeight + 110), New Size(382, 660))
+                MinimumSize = If(mode = LcdPanel.DisplayLayoutMode.Esp32Board, New Size(Esp32BoardViewWidth + 40, 650), New Size(382, 620))
+            End If
+
+            ResizeDeviceCanvas()
         End Sub
 
         Private Sub PrintHeader()
@@ -811,6 +902,34 @@ Namespace PalmDesktopHarness
             SendButtonBitsToNative(bits, down, label)
         End Sub
 
+        Private Sub LcdPanel_ButtonChanged(bits As UShort, down As Boolean, label As String)
+            If label = "Save State" Then
+                If down Then SaveBoardStateSnapshot()
+                Return
+            End If
+
+            If label = "Reset" Then
+                If down Then ResetButton_Click(Me, EventArgs.Empty)
+                Return
+            End If
+
+            SendButtonBitsToNative(bits, down, label)
+        End Sub
+
+        Private Sub SaveBoardStateSnapshot()
+            If Not nativeReady Then
+                InitCpuButton_Click(Me, EventArgs.Empty)
+                If Not nativeReady Then Return
+            End If
+
+            Dim resumeAutoRun = autoRunTimer.Enabled
+            autoRunTimer.Stop()
+            Try
+                If SaveNativeStateTo(statePath, False) Then Append($"RAM state saved: {statePath}")
+            Finally
+                If resumeAutoRun Then autoRunTimer.Start()
+            End Try
+        End Sub
 
         Private Sub AutoRunTimer_Tick(sender As Object, e As EventArgs)
             If Not nativeReady Then

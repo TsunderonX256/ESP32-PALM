@@ -14,5 +14,12 @@
     <None Include="..\Palm-m100-3.51-en.rom" Link="Palm-m100-3.51-en.rom" CopyToOutputDirectory="PreserveNewest" Condition="Exists('..\Palm-m100-3.51-en.rom')" />
     <None Include="..\Palm-IIIc-4.1-en.rom" Link="Palm-IIIc-4.1-en.rom" CopyToOutputDirectory="PreserveNewest" Condition="Exists('..\Palm-IIIc-4.1-en.rom')" />
     <None Include="..\NativeMusashi\build-release\PalmMusashi.dll" Link="PalmMusashi.dll" CopyToOutputDirectory="PreserveNewest" Condition="Exists('..\NativeMusashi\build-release\PalmMusashi.dll')" />
+    <None Include="..\Btn_App.png" Link="Btn_App.png" CopyToOutputDirectory="PreserveNewest" Condition="Exists('..\Btn_App.png')" />
+    <None Include="..\Btn_Down.png" Link="Btn_Down.png" CopyToOutputDirectory="PreserveNewest" Condition="Exists('..\Btn_Down.png')" />
+    <None Include="..\Btn_Power.png" Link="Btn_Power.png" CopyToOutputDirectory="PreserveNewest" Condition="Exists('..\Btn_Power.png')" />
+    <None Include="..\Btn_Reset.png" Link="Btn_Reset.png" CopyToOutputDirectory="PreserveNewest" Condition="Exists('..\Btn_Reset.png')" />
+    <None Include="..\Btn_Save.png" Link="Btn_Save.png" CopyToOutputDirectory="PreserveNewest" Condition="Exists('..\Btn_Save.png')" />
+    <None Include="..\Btn_Up.png" Link="Btn_Up.png" CopyToOutputDirectory="PreserveNewest" Condition="Exists('..\Btn_Up.png')" />
+    <None Include="..\Silkscreen.png" Link="Silkscreen.png" CopyToOutputDirectory="PreserveNewest" Condition="Exists('..\Silkscreen.png')" />
   </ItemGroup>
 </Project>

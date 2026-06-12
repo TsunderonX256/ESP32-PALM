@@ -3,8 +3,8 @@ Namespace PalmDesktopHarness
         ' Keep this VB profile switch in sync with the native CMake PALM_PROFILE
         ' setting. Mismatched VB/native profiles can load the wrong ROM or state file
         ' against a DLL built for a different hardware map.
-#Const PALM_PROFILE_M100_EXPERIMENTAL = True
-#Const PALM_PROFILE_IIIC_EXPERIMENTAL = False
+#Const PALM_PROFILE_M100_EXPERIMENTAL = False
+#Const PALM_PROFILE_IIIC_EXPERIMENTAL = True
 
         Public Enum HardwareProfile
             IIIx
@@ -16,8 +16,8 @@ Namespace PalmDesktopHarness
         Public Const ActiveHardwareProfile As HardwareProfile = HardwareProfile.IIIcExperimental
         Public Const ProfileName As String = "Palm IIIc experimental"
         Public Const RomFileName As String = "Palm-IIIc-4.1-en.rom"
-        Public Const StateFileName As String = "palm_iiic_state.bin"
-        Public Const RamActivePreset As UInteger = RamPreset8M
+        Public Const StateFileName As String = "palm_iiic_4m_state.bin"
+        Public Const RamActivePreset As UInteger = RamPreset4M
         Public Const UseLcdContrastRegister As Boolean = True
         Public Const UseColorLcdPalette As Boolean = True
         Public Const AutoRestorePersistentState As Boolean = True
