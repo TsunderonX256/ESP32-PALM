@@ -113,7 +113,8 @@ Namespace PalmDesktopHarness
         Private nativeInitWarningShown As Boolean
         Private Const VerboseSerialLog As Boolean = False
         Private Const EnableHotSyncTrace As Boolean = False
-        Private Const EnableIrdaTrace As Boolean = False
+        Private Const EnableIrdaTrace As Boolean = True
+        Private Const EnableIrdaBeamLog As Boolean = False
         Private Const IrdaSirBof As Byte = &HC0
         Private Const IrdaSirEof As Byte = &HC1
         Private Const IrdaSirEscape As Byte = &H7D
@@ -2217,6 +2218,7 @@ Namespace PalmDesktopHarness
         End Sub
 
         Private Sub AppendIrdaBeamLog(message As String)
+            If Not EnableIrdaBeamLog Then Return
             Append(message)
             Try
                 File.AppendAllText(irdaBeamLogPath, $"{DateTime.Now:HH:mm:ss.fff} {message}{Environment.NewLine}")
