@@ -7,6 +7,7 @@ Imports System.Media
 Imports System.Runtime.InteropServices
 Imports System.Text
 Imports System.Windows.Forms
+Imports Microsoft.Win32
 
 Namespace PalmDesktopHarness
     Friend NotInheritable Class MainForm
@@ -19,6 +20,8 @@ Namespace PalmDesktopHarness
         Private ReadOnly autoRunTimer As Timer
         Private ReadOnly penUpTimer As Timer
         Private ReadOnly hotSyncButtonReleaseTimer As Timer
+        Private ReadOnly boardSaveHoldTimer As Timer
+        Private ReadOnly boardResetHoldTimer As Timer
         Private ReadOnly soundPlayer As New SoundPlayer()
         Private soundWaveStream As MemoryStream
         Private soundPlaying As Boolean
@@ -177,8 +180,13 @@ Namespace PalmDesktopHarness
         Private Const TouchRawYMin As Integer = 3800
         Private Const TouchRawYMax As Integer = 300
         Private Const TouchHoldMs As Integer = 0
+        Private Const BoardSaveHoldMs As Integer = 3000
+        Private Const BoardResetHoldMs As Integer = 3000
         Private Const Esp32BoardViewWidth As Integer = 408
         Private Const Esp32BoardViewHeight As Integer = 720
+        Private Const ShellHorizontalPadding As Integer = 4
+        Private Const ShellBottomPadding As Integer = 4
+        Private Const MenuContentGap As Integer = 2
         Private currentLayoutMode As LcdPanel.DisplayLayoutMode = LcdPanel.DisplayLayoutMode.PalmHandheld
 
         Private Enum HotSyncInstallState
@@ -228,6 +236,126 @@ Namespace PalmDesktopHarness
         Private Const KeyBitHard3 As UShort = &H20US
         Private Const KeyBitHard4 As UShort = &H40US
         Private Const KeyBitContrast As UShort = &H200US
+        Private Const WmSettingChange As Integer = &H1A
+        Private Const WmThemeChanged As Integer = &H31A
+
+        Private Structure HarnessTheme
+            Public ReadOnly Dark As Boolean
+            Public ReadOnly WindowBack As Color
+            Public ReadOnly ControlBack As Color
+            Public ReadOnly MenuBack As Color
+            Public ReadOnly MenuSelected As Color
+            Public ReadOnly Border As Color
+            Public ReadOnly Text As Color
+
+            Public Sub New(darkMode As Boolean)
+                Dark = darkMode
+                If darkMode Then
+                    WindowBack = Color.FromArgb(32, 32, 32)
+                    ControlBack = Color.FromArgb(38, 38, 38)
+                    MenuBack = Color.FromArgb(45, 45, 48)
+                    MenuSelected = Color.FromArgb(62, 62, 66)
+                    Border = Color.FromArgb(85, 85, 85)
+                    Text = Color.FromArgb(241, 241, 241)
+                Else
+                    WindowBack = SystemColors.Control
+                    ControlBack = SystemColors.Control
+                    MenuBack = SystemColors.Menu
+                    MenuSelected = SystemColors.MenuHighlight
+                    Border = SystemColors.ControlDark
+                    Text = SystemColors.ControlText
+                End If
+            End Sub
+        End Structure
+
+        Private NotInheritable Class HarnessMenuColorTable
+            Inherits ProfessionalColorTable
+
+            Private ReadOnly theme As HarnessTheme
+
+            Public Sub New(activeTheme As HarnessTheme)
+                theme = activeTheme
+                UseSystemColors = False
+            End Sub
+
+            Public Overrides ReadOnly Property ToolStripDropDownBackground As Color
+                Get
+                    Return theme.MenuBack
+                End Get
+            End Property
+
+            Public Overrides ReadOnly Property MenuStripGradientBegin As Color
+                Get
+                    Return theme.MenuBack
+                End Get
+            End Property
+
+            Public Overrides ReadOnly Property MenuStripGradientEnd As Color
+                Get
+                    Return theme.MenuBack
+                End Get
+            End Property
+
+            Public Overrides ReadOnly Property MenuItemSelected As Color
+                Get
+                    Return theme.MenuSelected
+                End Get
+            End Property
+
+            Public Overrides ReadOnly Property MenuItemSelectedGradientBegin As Color
+                Get
+                    Return theme.MenuSelected
+                End Get
+            End Property
+
+            Public Overrides ReadOnly Property MenuItemSelectedGradientEnd As Color
+                Get
+                    Return theme.MenuSelected
+                End Get
+            End Property
+
+            Public Overrides ReadOnly Property MenuItemPressedGradientBegin As Color
+                Get
+                    Return theme.MenuSelected
+                End Get
+            End Property
+
+            Public Overrides ReadOnly Property MenuItemPressedGradientEnd As Color
+                Get
+                    Return theme.MenuSelected
+                End Get
+            End Property
+
+            Public Overrides ReadOnly Property ImageMarginGradientBegin As Color
+                Get
+                    Return theme.MenuBack
+                End Get
+            End Property
+
+            Public Overrides ReadOnly Property ImageMarginGradientMiddle As Color
+                Get
+                    Return theme.MenuBack
+                End Get
+            End Property
+
+            Public Overrides ReadOnly Property ImageMarginGradientEnd As Color
+                Get
+                    Return theme.MenuBack
+                End Get
+            End Property
+
+            Public Overrides ReadOnly Property SeparatorDark As Color
+                Get
+                    Return theme.Border
+                End Get
+            End Property
+
+            Public Overrides ReadOnly Property SeparatorLight As Color
+                Get
+                    Return theme.Border
+                End Get
+            End Property
+        End Class
 
         Public Sub New()
             Text = $"ESP32-PALM {PalmConfig.ProfileName}"
@@ -254,7 +382,10 @@ Namespace PalmDesktopHarness
                 .Dock = DockStyle.Fill,
                 .ColumnCount = 1,
                 .RowCount = 1,
-                .Padding = New Padding(10, deviceMenu.Height + 10, 10, 10)
+                .Padding = New Padding(ShellHorizontalPadding,
+                                       deviceMenu.Height + MenuContentGap,
+                                       ShellHorizontalPadding,
+                                       ShellBottomPadding)
             }
             root.ColumnStyles.Add(New ColumnStyle(SizeType.Percent, 100))
             Controls.Add(root)
@@ -268,7 +399,7 @@ Namespace PalmDesktopHarness
             AddHandler devicePanel.Resize, AddressOf DevicePanel_Resize
             root.Controls.Add(devicePanel, 0, 0)
 
-            lcdPanel = New LcdPanel With {.Margin = New Padding(0, 6, 0, 14)}
+            lcdPanel = New LcdPanel With {.Margin = Padding.Empty}
             AddHandler lcdPanel.PenChanged, AddressOf LcdPanel_PenChanged
             AddHandler lcdPanel.ButtonChanged, AddressOf LcdPanel_ButtonChanged
             devicePanel.Controls.Add(lcdPanel)
@@ -283,8 +414,13 @@ Namespace PalmDesktopHarness
             AddHandler penUpTimer.Tick, AddressOf PenUpTimer_Tick
             hotSyncButtonReleaseTimer = New Timer With {.Interval = 650}
             AddHandler hotSyncButtonReleaseTimer.Tick, AddressOf HotSyncButtonReleaseTimer_Tick
+            boardSaveHoldTimer = New Timer With {.Interval = BoardSaveHoldMs}
+            AddHandler boardSaveHoldTimer.Tick, AddressOf BoardSaveHoldTimer_Tick
+            boardResetHoldTimer = New Timer With {.Interval = BoardResetHoldMs}
+            AddHandler boardResetHoldTimer.Tick, AddressOf BoardResetHoldTimer_Tick
             AddHandler FormClosing, AddressOf MainForm_FormClosing
 
+            ApplyWindowsTheme()
             PrintHeader()
             ApplyLayoutMode(LcdPanel.DisplayLayoutMode.Esp32Board, False)
             RefreshDebugStatus()
@@ -292,6 +428,69 @@ Namespace PalmDesktopHarness
             StartEmulationByDefault()
             CenterDevicePanelContent()
         End Sub
+
+        Protected Overrides Sub WndProc(ByRef m As Message)
+            MyBase.WndProc(m)
+
+            If m.Msg = WmThemeChanged OrElse m.Msg = WmSettingChange Then
+                ApplyWindowsTheme()
+            End If
+        End Sub
+
+        Private Sub ApplyWindowsTheme()
+            Dim theme = New HarnessTheme(IsWindowsAppDarkMode())
+            BackColor = theme.WindowBack
+            ForeColor = theme.Text
+            ApplyThemeToControls(Controls, theme)
+
+            If MainMenuStrip IsNot Nothing Then
+                MainMenuStrip.Renderer = New ToolStripProfessionalRenderer(New HarnessMenuColorTable(theme))
+                ApplyThemeToToolStripItems(MainMenuStrip.Items, theme)
+            End If
+        End Sub
+
+        Private Sub ApplyThemeToControls(controlCollection As Control.ControlCollection, theme As HarnessTheme)
+            For Each control As Control In controlCollection
+                If TypeOf control Is LcdPanel Then
+                    Continue For
+                End If
+
+                control.BackColor = If(TypeOf control Is MenuStrip, theme.MenuBack, theme.ControlBack)
+                control.ForeColor = theme.Text
+
+                Dim toolStrip = TryCast(control, ToolStrip)
+                If toolStrip IsNot Nothing Then
+                    toolStrip.Renderer = New ToolStripProfessionalRenderer(New HarnessMenuColorTable(theme))
+                    ApplyThemeToToolStripItems(toolStrip.Items, theme)
+                End If
+
+                If control.HasChildren Then ApplyThemeToControls(control.Controls, theme)
+                control.Invalidate()
+            Next
+        End Sub
+
+        Private Sub ApplyThemeToToolStripItems(items As ToolStripItemCollection, theme As HarnessTheme)
+            For Each item As ToolStripItem In items
+                item.BackColor = theme.MenuBack
+                item.ForeColor = theme.Text
+
+                Dim menuItem = TryCast(item, ToolStripMenuItem)
+                If menuItem IsNot Nothing Then
+                    ApplyThemeToToolStripItems(menuItem.DropDownItems, theme)
+                End If
+            Next
+        End Sub
+
+        Private Shared Function IsWindowsAppDarkMode() As Boolean
+            Try
+                Dim value = Registry.GetValue("HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+                                              "AppsUseLightTheme",
+                                              1)
+                Return value IsNot Nothing AndAlso Convert.ToInt32(value, CultureInfo.InvariantCulture) = 0
+            Catch
+                Return False
+            End Try
+        End Function
 
         Private Sub DevicePanel_Resize(sender As Object, e As EventArgs)
             ResizeDeviceCanvas()
@@ -439,10 +638,15 @@ Namespace PalmDesktopHarness
             Next
 
             If resizeWindow Then
-                Dim desiredHeight = lcdPanel.Height + MainMenuStrip.Height + 70 + If(hardwarePanel.Visible, hardwarePanel.Height + 24, 0)
-                ClientSize = New Size(Math.Max(382, lcdPanel.Width + 40), Math.Max(620, desiredHeight))
+                Dim desiredHeight = lcdPanel.Height + MainMenuStrip.Height + MenuContentGap + ShellBottomPadding +
+                                    If(hardwarePanel.Visible, hardwarePanel.Height + hardwarePanel.Margin.Vertical, 0)
+                ClientSize = New Size(Math.Max(382, lcdPanel.Width + ShellHorizontalPadding * 2),
+                                      Math.Max(620, desiredHeight))
             Else
-                Size = If(mode = LcdPanel.DisplayLayoutMode.Esp32Board, New Size(Esp32BoardViewWidth + 60, Esp32BoardViewHeight + 110), New Size(382, 660))
+                Size = If(mode = LcdPanel.DisplayLayoutMode.Esp32Board,
+                          New Size(Esp32BoardViewWidth + ShellHorizontalPadding * 2 + 24,
+                                   Esp32BoardViewHeight + MainMenuStrip.Height + MenuContentGap + ShellBottomPadding + 46),
+                          New Size(382, 660))
                 MinimumSize = If(mode = LcdPanel.DisplayLayoutMode.Esp32Board, New Size(Esp32BoardViewWidth + 40, 650), New Size(382, 620))
             End If
 
@@ -566,6 +770,7 @@ Namespace PalmDesktopHarness
 
         Private Sub MainForm_FormClosing(sender As Object, e As FormClosingEventArgs)
             StopSound()
+            CancelBoardHoldTimers()
             SavePersistentState()
         End Sub
 
@@ -844,6 +1049,7 @@ Namespace PalmDesktopHarness
         End Sub
 
         Private Sub ResetButton_Click(sender As Object, e As EventArgs)
+            CancelBoardHoldTimers()
             If Not nativeReady Then
                 InitCpuButton_Click(Me, EventArgs.Empty)
                 If Not nativeReady Then Return
@@ -960,16 +1166,59 @@ Namespace PalmDesktopHarness
 
         Private Sub LcdPanel_ButtonChanged(bits As UShort, down As Boolean, label As String)
             If label = "Save State" Then
-                If down Then SaveBoardStateSnapshot()
+                If down Then
+                    StartBoardSaveHold()
+                Else
+                    StopBoardSaveHold()
+                End If
                 Return
             End If
 
             If label = "Reset" Then
-                If down Then ResetButton_Click(Me, EventArgs.Empty)
+                If down Then
+                    StartBoardResetHold()
+                Else
+                    StopBoardResetHold()
+                End If
                 Return
             End If
 
             SendButtonBitsToNative(bits, down, label)
+        End Sub
+
+        Private Sub StartBoardSaveHold()
+            StopBoardResetHold()
+            boardSaveHoldTimer.Stop()
+            boardSaveHoldTimer.Start()
+        End Sub
+
+        Private Sub StopBoardSaveHold()
+            boardSaveHoldTimer.Stop()
+        End Sub
+
+        Private Sub StartBoardResetHold()
+            StopBoardSaveHold()
+            boardResetHoldTimer.Stop()
+            boardResetHoldTimer.Start()
+        End Sub
+
+        Private Sub StopBoardResetHold()
+            boardResetHoldTimer.Stop()
+        End Sub
+
+        Private Sub CancelBoardHoldTimers()
+            StopBoardSaveHold()
+            StopBoardResetHold()
+        End Sub
+
+        Private Sub BoardSaveHoldTimer_Tick(sender As Object, e As EventArgs)
+            boardSaveHoldTimer.Stop()
+            SaveBoardStateSnapshot()
+        End Sub
+
+        Private Sub BoardResetHoldTimer_Tick(sender As Object, e As EventArgs)
+            boardResetHoldTimer.Stop()
+            ResetButton_Click(Me, EventArgs.Empty)
         End Sub
 
         Private Sub SaveBoardStateSnapshot()

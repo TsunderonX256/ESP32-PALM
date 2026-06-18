@@ -53,7 +53,7 @@ Namespace PalmDesktopHarness
         End Sub
 
         Private Sub DrawButton(g As Graphics, spec As ButtonSpec, down As Boolean)
-            Dim outline = If(down, SystemColors.Highlight, SystemColors.ControlDarkDark)
+            Dim outline = If(down, SystemColors.Highlight, ControlPaint.Dark(ForeColor))
 
             Using path = RoundedPath(spec.Bounds, 8)
                 If down Then

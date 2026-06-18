@@ -45,6 +45,13 @@ Namespace PalmDesktopHarness
         Private Const KeyBitSaveState As UShort = &H4000US
         Private Shared ReadOnly BoardButtonFillColor As Color = Color.FromArgb(48, 48, 48)
         Private Shared ReadOnly BoardButtonIconColor As Color = Color.FromArgb(96, 96, 96)
+        Private Const WmPointerUpdate As Integer = &H245
+        Private Const WmPointerDown As Integer = &H246
+        Private Const WmPointerUp As Integer = &H247
+        Private Const WmPointerCaptureChanged As Integer = &H24C
+        Private Const PointerTypeTouch As UInteger = 2UI
+        Private Const PointerTypePen As UInteger = 3UI
+        Private Const SuppressMouseAfterPointerMs As Long = 700
 
         Private frameBytes As Byte()
         Private frameWidth As Integer
@@ -62,8 +69,41 @@ Namespace PalmDesktopHarness
         Private activeBoardButtonLabel As String = ""
         Private boardPenActive As Boolean
         Private boardPaintingWithTransform As Boolean
+        Private hostPointerActive As Boolean
+        Private hostPointerId As UInteger
+        Private suppressMouseUntilTick As Long
         Private Shared ReadOnly boardImages As New Dictionary(Of String, Image)(StringComparer.OrdinalIgnoreCase)
         Private Shared ReadOnly boardIconMasks As New Dictionary(Of String, Image)(StringComparer.OrdinalIgnoreCase)
+
+        <StructLayout(LayoutKind.Sequential)>
+        Private Structure NativePoint
+            Public X As Integer
+            Public Y As Integer
+        End Structure
+
+        <StructLayout(LayoutKind.Sequential)>
+        Private Structure PointerInfo
+            Public PointerType As UInteger
+            Public PointerId As UInteger
+            Public FrameId As UInteger
+            Public PointerFlags As UInteger
+            Public SourceDevice As IntPtr
+            Public HwndTarget As IntPtr
+            Public PtPixelLocation As NativePoint
+            Public PtHimetricLocation As NativePoint
+            Public PtPixelLocationRaw As NativePoint
+            Public PtHimetricLocationRaw As NativePoint
+            Public Time As UInteger
+            Public HistoryCount As UInteger
+            Public InputData As Integer
+            Public KeyStates As UInteger
+            Public PerformanceCount As ULong
+            Public ButtonChangeType As Integer
+        End Structure
+
+        <DllImport("user32.dll", SetLastError:=True)>
+        Private Shared Function GetPointerInfo(pointerId As UInteger, ByRef pointerInfo As PointerInfo) As Boolean
+        End Function
 
         Public Event PenChanged(down As Boolean, x As Integer, y As Integer)
         Public Event ButtonChanged(bits As UShort, down As Boolean, label As String)
@@ -700,8 +740,33 @@ Namespace PalmDesktopHarness
             Return (frameBytes(byteIndex) >> shift) And mask
         End Function
 
+        Protected Overrides Sub WndProc(ByRef m As Message)
+            Select Case m.Msg
+                Case WmPointerDown
+                    If HandleHostPointerDown(m) Then
+                        m.Result = IntPtr.Zero
+                        Return
+                    End If
+                Case WmPointerUpdate
+                    If HandleHostPointerUpdate(m) Then
+                        m.Result = IntPtr.Zero
+                        Return
+                    End If
+                Case WmPointerUp
+                    If HandleHostPointerUp(m) Then
+                        m.Result = IntPtr.Zero
+                        Return
+                    End If
+                Case WmPointerCaptureChanged
+                    CancelHostPointerInput()
+            End Select
+
+            MyBase.WndProc(m)
+        End Sub
+
         Protected Overrides Sub OnMouseDown(e As MouseEventArgs)
             MyBase.OnMouseDown(e)
+            If ShouldSuppressMouseForHostPointer() Then Return
             If layoutModeValue = DisplayLayoutMode.Esp32Board Then
                 HandleBoardMouseDown(e)
                 Return
@@ -713,6 +778,7 @@ Namespace PalmDesktopHarness
 
         Protected Overrides Sub OnMouseMove(e As MouseEventArgs)
             MyBase.OnMouseMove(e)
+            If ShouldSuppressMouseForHostPointer() Then Return
             If layoutModeValue = DisplayLayoutMode.Esp32Board Then
                 If Capture AndAlso e.Button = MouseButtons.Left AndAlso boardPenActive Then
                     RaiseBoardPenEvent(True, e.Location)
@@ -727,6 +793,7 @@ Namespace PalmDesktopHarness
 
         Protected Overrides Sub OnMouseUp(e As MouseEventArgs)
             MyBase.OnMouseUp(e)
+            If ShouldSuppressMouseForHostPointer() Then Return
             If layoutModeValue = DisplayLayoutMode.Esp32Board Then
                 If activeBoardButtonBits <> 0US Then
                     ReleaseBoardButton()
@@ -744,6 +811,7 @@ Namespace PalmDesktopHarness
 
         Protected Overrides Sub OnMouseLeave(e As EventArgs)
             MyBase.OnMouseLeave(e)
+            If ShouldSuppressMouseForHostPointer() Then Return
             If layoutModeValue = DisplayLayoutMode.Esp32Board Then
                 If Capture Then
                     If activeBoardButtonBits <> 0US Then
@@ -763,6 +831,90 @@ Namespace PalmDesktopHarness
             End If
         End Sub
 
+        Private Function HandleHostPointerDown(m As Message) As Boolean
+            Dim pointerId = HostPointerIdFromMessage(m)
+            If hostPointerActive Then
+                SuppressMouseForHostPointer()
+                Return True
+            End If
+
+            Dim point As Point
+            If Not TryGetHostPointerClientPoint(m, pointerId, point) Then Return False
+
+            hostPointerActive = True
+            hostPointerId = pointerId
+            SuppressMouseForHostPointer()
+            BeginPalmPress(point)
+            Return True
+        End Function
+
+        Private Function HandleHostPointerUpdate(m As Message) As Boolean
+            Dim pointerId = HostPointerIdFromMessage(m)
+            If Not hostPointerActive OrElse pointerId <> hostPointerId Then Return False
+
+            Dim point As Point
+            If Not TryGetHostPointerClientPoint(m, pointerId, point) Then point = lastPoint
+
+            SuppressMouseForHostPointer()
+            If layoutModeValue = DisplayLayoutMode.Esp32Board Then
+                If boardPenActive Then RaiseBoardPenEvent(True, point)
+            ElseIf Capture Then
+                RaisePenEvent(True, point)
+            End If
+            Return True
+        End Function
+
+        Private Function HandleHostPointerUp(m As Message) As Boolean
+            Dim pointerId = HostPointerIdFromMessage(m)
+            If Not hostPointerActive OrElse pointerId <> hostPointerId Then Return False
+
+            Dim point As Point
+            If Not TryGetHostPointerClientPoint(m, pointerId, point) Then point = lastPoint
+
+            SuppressMouseForHostPointer()
+            EndPalmPress(point)
+            hostPointerActive = False
+            hostPointerId = 0UI
+            Return True
+        End Function
+
+        Private Sub CancelHostPointerInput()
+            If Not hostPointerActive Then Return
+
+            SuppressMouseForHostPointer()
+            EndPalmPress(lastPoint)
+            hostPointerActive = False
+            hostPointerId = 0UI
+        End Sub
+
+        Private Sub BeginPalmPress(point As Point)
+            If layoutModeValue = DisplayLayoutMode.Esp32Board Then
+                BeginBoardPress(point)
+                Return
+            End If
+
+            Capture = True
+            RaisePenEvent(True, point)
+        End Sub
+
+        Private Sub EndPalmPress(point As Point)
+            If layoutModeValue = DisplayLayoutMode.Esp32Board Then
+                If activeBoardButtonBits <> 0US Then
+                    ReleaseBoardButton()
+                ElseIf boardPenActive Then
+                    RaiseBoardPenEvent(False, point)
+                    boardPenActive = False
+                End If
+                Capture = False
+                Return
+            End If
+
+            If Capture Then
+                RaisePenEvent(False, point)
+                Capture = False
+            End If
+        End Sub
+
         Private Sub RaisePenEvent(down As Boolean, point As Point)
             lastPoint = point
             Dim x = CInt(Math.Floor(point.X * PalmConfig.DigitizerWidth / CDbl(Math.Max(1, ClientSize.Width))))
@@ -774,10 +926,13 @@ Namespace PalmDesktopHarness
 
         Private Sub HandleBoardMouseDown(e As MouseEventArgs)
             If e.Button <> MouseButtons.Left Then Return
+            BeginBoardPress(e.Location)
+        End Sub
 
+        Private Sub BeginBoardPress(point As Point)
             Dim boardX As Single
             Dim boardY As Single
-            If Not TryClientToBoard(e.Location, boardX, boardY) Then Return
+            If Not TryClientToBoard(point, boardX, boardY) Then Return
 
             Dim label As String = ""
             Dim bits = BoardButtonBitsAt(boardX, boardY, label)
@@ -792,9 +947,46 @@ Namespace PalmDesktopHarness
 
             If BoardPalmSurfaceContains(boardX, boardY) Then
                 boardPenActive = True
-                RaiseBoardPenEvent(True, e.Location)
+                RaiseBoardPenEvent(True, point)
             End If
         End Sub
+
+        Private Shared Function HostPointerIdFromMessage(m As Message) As UInteger
+            Return CUInt(m.WParam.ToInt64() And &HFFFFL)
+        End Function
+
+        Private Function TryGetHostPointerClientPoint(m As Message, pointerId As UInteger, ByRef point As Point) As Boolean
+            Dim pointerInfoValue As New PointerInfo()
+            If GetPointerInfo(pointerId, pointerInfoValue) Then
+                If pointerInfoValue.PointerType <> PointerTypeTouch AndAlso pointerInfoValue.PointerType <> PointerTypePen Then Return False
+                point = PointToClient(New Point(pointerInfoValue.PtPixelLocation.X, pointerInfoValue.PtPixelLocation.Y))
+                Return True
+            End If
+
+            If Not hostPointerActive Then Return False
+            point = New Point(SignedLowWord(m.LParam), SignedHighWord(m.LParam))
+            Return True
+        End Function
+
+        Private Sub SuppressMouseForHostPointer()
+            suppressMouseUntilTick = Environment.TickCount64 + SuppressMouseAfterPointerMs
+        End Sub
+
+        Private Function ShouldSuppressMouseForHostPointer() As Boolean
+            Return suppressMouseUntilTick <> 0 AndAlso Environment.TickCount64 < suppressMouseUntilTick
+        End Function
+
+        Private Shared Function SignedLowWord(value As IntPtr) As Integer
+            Dim raw = CInt(value.ToInt64() And &HFFFFL)
+            If raw >= &H8000 Then raw -= &H10000
+            Return raw
+        End Function
+
+        Private Shared Function SignedHighWord(value As IntPtr) As Integer
+            Dim raw = CInt((value.ToInt64() >> 16) And &HFFFFL)
+            If raw >= &H8000 Then raw -= &H10000
+            Return raw
+        End Function
 
         Private Sub ReleaseBoardButton()
             If activeBoardButtonBits = 0US Then Return
