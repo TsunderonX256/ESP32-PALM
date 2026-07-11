@@ -66,7 +66,7 @@ extern "C" void m68k_pulse_reset(void);
 
 static constexpr uint32_t BACKLIGHT_PWM_HZ = 5000;
 static constexpr uint8_t BACKLIGHT_PWM_BITS = 8;
-static constexpr uint8_t BACKLIGHT_DEFAULT_DUTY = 128;
+static constexpr uint8_t BACKLIGHT_DEFAULT_DUTY = 64;   // 25%
 static constexpr uint8_t BACKLIGHT_PALM_MIN_DUTY = 26;   // 10%
 static constexpr uint8_t BACKLIGHT_PALM_MAX_DUTY = 128;  // 50%
 static constexpr uint8_t BACKLIGHT_SAVE_DUTY = 13;
@@ -1189,7 +1189,8 @@ static bool captureSed1375RenderSnapshot(const PalmLcdState &lcd) {
 }
 
 static bool sed1375RenderSnapshotReusable(const PalmLcdState &lcd) {
-  return sed1375RenderSnapshot.vramGeneration == palmSed1375VramGeneration() &&
+  return sed1375RenderSnapshot.valid &&
+         sed1375RenderSnapshot.vramGeneration == palmSed1375VramGeneration() &&
          sed1375RenderSnapshot.paletteGeneration == palmSed1375PaletteGeneration() &&
          sed1375RenderSnapshot.drawW == min<uint16_t>(PALM_LCD_W, lcd.width) &&
          sed1375RenderSnapshot.drawH == min<uint16_t>(PALM_LCD_H, lcd.height) &&
@@ -1524,6 +1525,35 @@ static void renderPanelStaticFrameFromSurface(PanelPixel *target) {
   int shellViewW = PALM_LCD_VIEW_X - PALM_VIEW_X;
   panelDrawSilkscreenBitmap(target, PALM_VIEW_X, PALM_VIEW_Y, shellViewW, PALM_VIEW_H);
   renderPanelLcdFrameFromSurface(target);
+}
+
+static void publishSleepWhitePanelFrame() {
+  if (panelFrames[0] == nullptr || panelFrames[1] == nullptr) return;
+
+  uint8_t nextIndex = drawPanelFrameIndex ^ 1;
+  PanelPixel *target = panelFrames[nextIndex];
+  for (int y = 0; y < SCREEN_H; ++y) {
+    PanelPixel *row = target + static_cast<uint32_t>(y) * SCREEN_W;
+    PanelPixel encoded = panelEncodeColor(TFT_MIDGREY);
+    for (int x = 0; x < SCREEN_W; ++x) row[x] = encoded;
+  }
+
+  renderVirtualButtonStrip(target);
+  renderVirtualPowerStrip(target);
+  panelFillRect(target, PALM_VIEW_X, PALM_VIEW_Y, PALM_VIEW_W, PALM_VIEW_H, TFT_WHITE);
+
+  pendingPanelFrame = target;
+  if (activePanelFrame == nullptr) {
+    activePanelFrame = pendingPanelFrame;
+    pendingPanelFrame = nullptr;
+  }
+  drawPanelFrameIndex = nextIndex;
+  panelStaticFramesReady = false;
+  staticShellDrawn = false;
+#if PALM_HAS_SED1375 && PALM_SED1375_DECODE_ON_RENDER_CORE
+  sed1375RenderSnapshot.valid = false;
+#endif
+  ++renderFrames;
 }
 
 static void publishPanelFrame() {
@@ -2181,6 +2211,9 @@ static void setPalmLowPowerMode(bool enabled) {
 
   if (enabled) {
     palmLowPowerWakeServiceActive = false;
+    setPanelOutputEnabled(true);
+    drawSleepWhiteFrame();
+    delay(20);
     setBacklightEnabled(false);
     setPanelOutputEnabled(false);
     delay(2);
@@ -2196,6 +2229,11 @@ static void setPalmLowPowerMode(bool enabled) {
     delay(2);
     setPanelOutputEnabled(true);
     setBacklightEnabled(true);
+    staticShellDrawn = false;
+    panelStaticFramesReady = false;
+#if PALM_HAS_SED1375 && PALM_SED1375_DECODE_ON_RENDER_CORE
+    sed1375RenderSnapshot.valid = false;
+#endif
     lastFrameMs = 0;
     palmLowPowerWakeServiceActive = false;
     palmLowPowerRequireTouchRelease = false;
@@ -2714,6 +2752,18 @@ static void drawBootPattern() {
   }
 #endif
   renderStaticSurfaceToPanel();
+  unlockRenderSurface();
+}
+
+static void drawSleepWhiteFrame() {
+  lockRenderSurface();
+  surfaceFill(TFT_WHITE);
+  panelStaticFramesReady = false;
+  staticShellDrawn = false;
+#if PALM_HAS_SED1375 && PALM_SED1375_DECODE_ON_RENDER_CORE
+  sed1375RenderSnapshot.valid = false;
+#endif
+  publishSleepWhitePanelFrame();
   unlockRenderSurface();
 }
 
