@@ -104,7 +104,7 @@ Module Program
 
         Dim rom = File.ReadAllBytes(romPath)
         Dim databases = FindDatabases(rom, romBase)
-        Dim apps = databases.Where(Function(db) db.IsApplication OrElse (includeRelated AndAlso db.IsResourceDatabase AndAlso db.TypeCode = "ovly"))
+        Dim apps = databases.Where(Function(db) db.IsApplication)
 
         If Not exportAll Then
             If Not String.IsNullOrWhiteSpace(nameFilter) Then
@@ -116,11 +116,27 @@ Module Program
             End If
         End If
 
-        Dim selectedApps = apps.OrderBy(Function(db) db.Name, StringComparer.OrdinalIgnoreCase).ToList()
+        Dim selectedApps = apps.ToList()
         If selectedApps.Count = 0 Then
             Console.Error.WriteLine("no matching ROM applications found")
             Return 1
         End If
+
+        If includeRelated Then
+            Dim selectedCreators = selectedApps.
+                Select(Function(db) db.CreatorCode).
+                ToHashSet(StringComparer.OrdinalIgnoreCase)
+            Dim relatedDatabases = databases.Where(
+                Function(db) db.IsResourceDatabase AndAlso
+                    db.TypeCode = "ovly" AndAlso
+                    selectedCreators.Contains(db.CreatorCode))
+            selectedApps.AddRange(relatedDatabases)
+        End If
+
+        selectedApps = selectedApps.
+            DistinctBy(Function(db) db.StartOffset).
+            OrderBy(Function(db) db.Name, StringComparer.OrdinalIgnoreCase).
+            ToList()
 
         For Each app In selectedApps
             Dim outputPath = Path.Combine(outputDirectory, MakeSafeFileName($"{app.Name}-{app.CreatorCode}.prc"))
@@ -164,7 +180,7 @@ Module Program
             Dim db = databases(index)
             db.BoundaryOffset = If(index + 1 < databases.Count, databases(index + 1).StartOffset, rom.Length)
             db.KnownFileOffsets = knownFileOffsets
-            db.Length = EstimateExportLength(rom.Length, db)
+            db.Length = EstimateExportLength(rom, db)
         Next
 
         Return databases
@@ -321,7 +337,7 @@ Module Program
     Private Sub ExportDatabase(rom As Byte(), db As PalmDatabase, outputPath As String)
         Dim entrySize = If(db.IsResourceDatabase, ResourceEntrySize, RecordEntrySize)
         Dim headerLength = DatabaseHeaderSize + CInt(db.EntryCount) * entrySize
-        Dim entryRanges = GetEntryRanges(rom.Length, db)
+        Dim entryRanges = GetEntryRanges(rom, db)
         Dim outputLength = headerLength + entryRanges.Sum(Function(range) range.Length)
         Dim output(outputLength - 1) As Byte
 
@@ -349,19 +365,25 @@ Module Program
         WriteUInt32BE(output, 72, 0UI)
     End Sub
 
-    Private Function EstimateExportLength(romLength As Integer, db As PalmDatabase) As Integer
+    Private Function EstimateExportLength(rom As Byte(), db As PalmDatabase) As Integer
         Dim entrySize = If(db.IsResourceDatabase, ResourceEntrySize, RecordEntrySize)
         Dim headerLength = DatabaseHeaderSize + CInt(db.EntryCount) * entrySize
-        Return headerLength + GetEntryRanges(romLength, db).Sum(Function(range) range.Length)
+        Return headerLength + GetEntryRanges(rom, db).Sum(Function(range) range.Length)
     End Function
 
-    Private Function GetEntryRanges(romLength As Integer, db As PalmDatabase) As List(Of (Start As Integer, Length As Integer))
+    Private Function GetEntryRanges(rom As Byte(), db As PalmDatabase) As List(Of (Start As Integer, Length As Integer))
         Dim sortedOffsets = db.EntryFileOffsets.Distinct().OrderBy(Function(offset) offset).ToList()
         Dim headerStart = db.StartOffset
         Dim rangesByStart As New Dictionary(Of Integer, Integer)()
 
         For i = 0 To sortedOffsets.Count - 1
             Dim current = sortedOffsets(i)
+            Dim chunkDataLength As Integer
+            If TryReadRomChunkDataLength(rom, current, chunkDataLength) Then
+                rangesByStart(current) = chunkDataLength
+                Continue For
+            End If
+
             Dim nextOffset As Integer
 
             Dim nextKnownOffset = db.KnownFileOffsets.FirstOrDefault(Function(offset) offset > current)
@@ -370,7 +392,7 @@ Module Program
             ElseIf current < headerStart Then
                 nextOffset = headerStart
             Else
-                nextOffset = If(db.BoundaryOffset > current, db.BoundaryOffset, romLength)
+                nextOffset = If(db.BoundaryOffset > current, db.BoundaryOffset, rom.Length)
             End If
 
             If nextOffset <= current Then
@@ -381,6 +403,43 @@ Module Program
         Next
 
         Return db.EntryFileOffsets.Select(Function(offset) (Start:=offset, Length:=rangesByStart(offset))).ToList()
+    End Function
+
+    Private Function TryReadRomChunkDataLength(rom As Byte(), dataOffset As Integer, ByRef dataLength As Integer) As Boolean
+        Const chunkHeaderSize As Integer = 8
+        dataLength = 0
+
+        If dataOffset < chunkHeaderSize Then
+            Return False
+        End If
+
+        Dim headerOffset = dataOffset - chunkHeaderSize
+        Dim flagsAndAdjustment = rom(headerOffset)
+        Dim sizeAdjustment = CInt(flagsAndAdjustment And &HF)
+        Dim chunkSize = (CInt(rom(headerOffset + 1)) << 16) Or
+            (CInt(rom(headerOffset + 2)) << 8) Or
+            CInt(rom(headerOffset + 3))
+
+        ' ROM heaps contain nonmovable, allocated chunks. Requiring the ROM lock
+        ' nibble and zero handle offset avoids mistaking ordinary resource bytes
+        ' for a chunk header when reading flat PRC-style layouts.
+        Dim isAllocated = (flagsAndAdjustment And &H80) = 0
+        Dim isRomChunk = (rom(headerOffset + 4) And &HF0) = &HF0 AndAlso
+            rom(headerOffset + 5) = 0 AndAlso
+            rom(headerOffset + 6) = 0 AndAlso
+            rom(headerOffset + 7) = 0
+        Dim minimumSize = chunkHeaderSize + sizeAdjustment
+
+        If Not isAllocated OrElse Not isRomChunk OrElse chunkSize < minimumSize Then
+            Return False
+        End If
+
+        If CLng(headerOffset) + chunkSize > rom.Length Then
+            Return False
+        End If
+
+        dataLength = chunkSize - minimumSize
+        Return True
     End Function
 
     Private Function ReadUInt16BE(data As Byte(), offset As Integer) As UShort
@@ -481,7 +540,7 @@ Module Program
         Console.WriteLine()
         Console.WriteLine("Usage:")
         Console.WriteLine("  PalmRomExtractor list <rom-file> [--rom-base 0x10C00000]")
-        Console.WriteLine("  PalmRomExtractor export <rom-file> <output-dir> [--all] [--name ""Date Book""] [--creator date] [--rom-base 0x10C00000]")
+        Console.WriteLine("  PalmRomExtractor export <rom-file> <output-dir> [--all] [--name ""Date Book""] [--creator date] [--include-related] [--rom-base 0x10C00000]")
         Console.WriteLine()
         Console.WriteLine("Examples:")
         Console.WriteLine("  dotnet run --project PalmRomExtractor -- list Palm-m100-3.51-en.rom")
